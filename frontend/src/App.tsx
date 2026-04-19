@@ -118,6 +118,13 @@ const HOTKEY_ACTIONS = [
     defaultBindings: ['Delete', 'Backspace'],
   },
   {
+    id: 'autoAnnotateImage',
+    section: 'Annotation',
+    title: 'Auto-annotate image',
+    description: 'Run SAM auto-annotation for the current image',
+    defaultBindings: ['Space'],
+  },
+  {
     id: 'selectClass1',
     section: 'Classes',
     title: 'Select class 1',
@@ -226,6 +233,15 @@ type ApplyLocalSessionOptions = {
   preferredImageRelativePath?: string | null
 }
 
+type ToastTone = 'info' | 'success' | 'error'
+
+type ToastItem = {
+  id: string
+  message: string
+  tone: ToastTone
+  isClosing: boolean
+}
+
 function App() {
   const [images, setImages] = useState<ImageEntry[]>([])
   const [imageResources, setImageResources] = useState<
@@ -303,6 +319,8 @@ function App() {
   const [samMaxResultsDraft, setSamMaxResultsDraft] = useState('8')
   const [samActionError, setSamActionError] = useState<string | null>(null)
   const [samActionMessage, setSamActionMessage] = useState<string | null>(null)
+  const [samActionMessageTone, setSamActionMessageTone] =
+    useState<ToastTone>('success')
   const [isRunningSamAction, setIsRunningSamAction] = useState(false)
   const [viewportTool, setViewportTool] = useState<ViewportTool>('draw')
   const [isOpeningSession, setIsOpeningSession] = useState(false)
@@ -319,6 +337,7 @@ function App() {
     null,
   )
   const [dragInsertIndex, setDragInsertIndex] = useState<number | null>(null)
+  const [toasts, setToasts] = useState<ToastItem[]>([])
 
   const menuBarRef = useRef<HTMLElement | null>(null)
   const imageResourcesRef = useRef<Record<string, ImageResource>>({})
@@ -337,6 +356,9 @@ function App() {
   const pendingHfAuthRefreshRef = useRef(false)
   const callbackCopiedTimeoutRef = useRef<number | null>(null)
   const runtimeInstallLogRef = useRef<HTMLPreElement | null>(null)
+  const toastTimeoutsRef = useRef<Record<string, number>>({})
+  const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
+  const pluginToastKeysRef = useRef<Record<string, string>>({})
 
   const currentImageIndex =
     currentImageEntry !== null
@@ -436,6 +458,65 @@ function App() {
     plugins.some(
       (plugin) => getPluginRuntimeInstallState(plugin).status === 'running',
     )
+  const removeToast = (toastId: string) => {
+    const autoTimeoutId = toastTimeoutsRef.current[toastId]
+    if (autoTimeoutId !== undefined) {
+      window.clearTimeout(autoTimeoutId)
+      delete toastTimeoutsRef.current[toastId]
+    }
+
+    const removeTimeoutId = toastRemoveTimeoutsRef.current[toastId]
+    if (removeTimeoutId !== undefined) {
+      window.clearTimeout(removeTimeoutId)
+      delete toastRemoveTimeoutsRef.current[toastId]
+    }
+
+    setToasts((current) => current.filter((toast) => toast.id !== toastId))
+  }
+  const dismissToast = (toastId: string) => {
+    const autoTimeoutId = toastTimeoutsRef.current[toastId]
+    if (autoTimeoutId !== undefined) {
+      window.clearTimeout(autoTimeoutId)
+      delete toastTimeoutsRef.current[toastId]
+    }
+
+    setToasts((current) =>
+      current.map((toast) =>
+        toast.id === toastId && !toast.isClosing
+          ? { ...toast, isClosing: true }
+          : toast,
+      ),
+    )
+
+    if (toastRemoveTimeoutsRef.current[toastId] !== undefined) {
+      return
+    }
+
+    toastRemoveTimeoutsRef.current[toastId] = window.setTimeout(() => {
+      removeToast(toastId)
+    }, 180)
+  }
+  const pushToast = useEffectEvent((message: string, tone: ToastTone) => {
+    const trimmedMessage = message.trim()
+    if (!trimmedMessage) {
+      return
+    }
+
+    const toastId = crypto.randomUUID()
+    setToasts((current) => [
+      ...current.slice(-4),
+      {
+        id: toastId,
+        message: trimmedMessage,
+        tone,
+        isClosing: false,
+      },
+    ])
+
+    toastTimeoutsRef.current[toastId] = window.setTimeout(() => {
+      dismissToast(toastId)
+    }, 5000)
+  })
   const refreshPlugins = useEffectEvent(async (signal?: AbortSignal) => {
     try {
       const nextPlugins = await fetchPlugins(signal)
@@ -714,6 +795,19 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    return () => {
+      for (const timeoutId of Object.values(toastTimeoutsRef.current)) {
+        window.clearTimeout(timeoutId)
+      }
+      for (const timeoutId of Object.values(toastRemoveTimeoutsRef.current)) {
+        window.clearTimeout(timeoutId)
+      }
+      toastTimeoutsRef.current = {}
+      toastRemoveTimeoutsRef.current = {}
+    }
+  }, [])
+
   const ensureAnnotationsLoaded = useEffectEvent(async (entry: ImageEntry) => {
     if (!currentSessionId) {
       return
@@ -943,6 +1037,109 @@ function App() {
       isCancelled = true
     }
   }, [backendStatus, hasSession, isOpeningSession, persistedSessionState])
+
+  useEffect(() => {
+    if (!sessionError) {
+      return
+    }
+
+    pushToast(sessionError, 'error')
+  }, [sessionError])
+
+  useEffect(() => {
+    if (!pluginsError) {
+      return
+    }
+
+    pushToast(pluginsError, 'error')
+  }, [pluginsError])
+
+  useEffect(() => {
+    if (!hfAuthError) {
+      return
+    }
+
+    pushToast(hfAuthError, 'error')
+  }, [hfAuthError])
+
+  useEffect(() => {
+    if (!samActionError) {
+      return
+    }
+
+    pushToast(samActionError, 'error')
+  }, [samActionError])
+
+  useEffect(() => {
+    if (!samActionMessage) {
+      return
+    }
+
+    pushToast(samActionMessage, samActionMessageTone)
+  }, [samActionMessage, samActionMessageTone])
+
+  useEffect(() => {
+    if (!isPluginsOpen && sidebarView !== 'plugins') {
+      return
+    }
+
+    const nextToastKeys = { ...pluginToastKeysRef.current }
+    const maybePushPluginToast = (
+      notificationId: string,
+      key: string,
+      message: string,
+      tone: ToastTone,
+    ) => {
+      if (nextToastKeys[notificationId] === key) {
+        return
+      }
+
+      nextToastKeys[notificationId] = key
+      pushToast(message, tone)
+    }
+
+    for (const plugin of plugins) {
+      const download = getPluginDownloadState(plugin)
+      if (download.status === 'failed' && download.error) {
+        maybePushPluginToast(
+          `${plugin.id}:download`,
+          `${download.status}:${download.error}:${download.finishedAt ?? download.startedAt ?? ''}`,
+          download.error,
+          'error',
+        )
+      }
+
+      const runtimeInstall = getPluginRuntimeInstallState(plugin)
+      if (runtimeInstall.status === 'completed' && runtimeInstall.message) {
+        maybePushPluginToast(
+          `${plugin.id}:runtime-install`,
+          `${runtimeInstall.status}:${runtimeInstall.message}:${runtimeInstall.finishedAt ?? runtimeInstall.startedAt ?? ''}`,
+          runtimeInstall.message,
+          'success',
+        )
+      } else if (runtimeInstall.status === 'failed' && runtimeInstall.error) {
+        maybePushPluginToast(
+          `${plugin.id}:runtime-install`,
+          `${runtimeInstall.status}:${runtimeInstall.error}:${runtimeInstall.finishedAt ?? runtimeInstall.startedAt ?? ''}`,
+          runtimeInstall.error,
+          'error',
+        )
+      } else if (
+        runtimeInstall.status === 'idle' &&
+        plugin.runtime.status !== 'ready' &&
+        plugin.runtime.message
+      ) {
+        maybePushPluginToast(
+          `${plugin.id}:runtime-status`,
+          `${plugin.runtime.status}:${plugin.runtime.message}`,
+          plugin.runtime.message,
+          plugin.runtime.status === 'error' ? 'error' : 'info',
+        )
+      }
+    }
+
+    pluginToastKeysRef.current = nextToastKeys
+  }, [isPluginsOpen, plugins, pushToast, sidebarView])
 
   useEffect(() => {
     if (!openMenu) {
@@ -1518,6 +1715,7 @@ function App() {
         })
 
         if (result.annotations.length === 0) {
+          setSamActionMessageTone('info')
           setSamActionMessage(emptyMessage)
           return
         }
@@ -1543,6 +1741,7 @@ function App() {
             ),
           }))
           setSelectedId(replaceAnnotationId)
+          setSamActionMessageTone('success')
           setSamActionMessage(successMessage ?? 'SAM refined the selected box.')
           return
         }
@@ -1563,6 +1762,7 @@ function App() {
           [currentEntry.id]: [...(current[currentEntry.id] ?? []), ...nextAnnotations],
         }))
         setSelectedId(nextAnnotations[0]?.id ?? null)
+        setSamActionMessageTone('success')
         setSamActionMessage(
           successMessage ??
             `SAM added ${nextAnnotations.length} auto-annotation${nextAnnotations.length === 1 ? '' : 's'}.`,
@@ -2050,6 +2250,12 @@ function App() {
       return
     }
 
+    if (matchesHotkeyAction(event, 'autoAnnotateImage')) {
+      event.preventDefault()
+      void handleRunSamAutoAnnotate('full-image')
+      return
+    }
+
     if (matchesHotkeyAction(event, 'prevImage')) {
       event.preventDefault()
       goPrevImage()
@@ -2421,6 +2627,35 @@ function App() {
 
   return (
     <div className="app-shell">
+      {toasts.length > 0 ? (
+        <div className="toast-stack" aria-live="polite" aria-label="Notifications">
+          {toasts.map((toast) => (
+            <div
+              key={toast.id}
+              className={[
+                'toast-notification',
+                `is-${toast.tone}`,
+                toast.isClosing ? 'is-closing' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+              role={toast.tone === 'error' ? 'alert' : 'status'}
+            >
+              <div className="toast-notification-message">{toast.message}</div>
+              <button
+                type="button"
+                className="toast-notification-close"
+                onClick={() => dismissToast(toast.id)}
+                aria-label="Close notification"
+                title="Close notification"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       <header className="menubar" ref={menuBarRef}>
         <nav className="menubar-nav" aria-label="Main menu">
           <div className="menu-root">
@@ -2695,9 +2930,6 @@ function App() {
                       <strong className="meta-value">{currentImageSize}</strong>
                     </div>
                   </div>
-
-                  {sessionError ? <p className="path-note">{sessionError}</p> : null}
-
                   {images.length > 0 ? (
                     <VirtualFileList
                       images={images}
@@ -2919,18 +3151,6 @@ function App() {
                   </div>
                 ) : null}
 
-                {pluginsError ? (
-                  <p className="plugin-manager-note is-error">{pluginsError}</p>
-                ) : null}
-
-                {samActionError ? (
-                  <p className="plugin-manager-note is-error">{samActionError}</p>
-                ) : null}
-
-                {samActionMessage ? (
-                  <p className="plugin-manager-note is-success">{samActionMessage}</p>
-                ) : null}
-
                 {selectedPlugin ? (
                   <section className="plugin-card">
                     {selectedPlugin.id === 'sam-3-1' ? (
@@ -3034,12 +3254,6 @@ function App() {
                           </p>
                         )}
 
-                        {selectedPlugin.runtime.status !== 'ready' &&
-                        selectedPlugin.runtime.message ? (
-                          <p className="plugin-manager-note is-error">
-                            {selectedPlugin.runtime.message}
-                          </p>
-                        ) : null}
                         {!currentEntry ? (
                           <p className="plugin-manager-note">
                             Open an image before using SAM auto-annotation.
@@ -3467,15 +3681,6 @@ function App() {
                 ) : null}
               </div>
             </section>
-
-            {hfAuthError ? (
-              <p className="plugin-manager-note is-error">{hfAuthError}</p>
-            ) : null}
-
-            {pluginsError ? (
-              <p className="plugin-manager-note is-error">{pluginsError}</p>
-            ) : null}
-
             <div className="plugin-card-list" aria-label="Installed plugins">
               {plugins.length > 0 ? (
                 plugins.map((plugin) => {
@@ -3634,12 +3839,6 @@ function App() {
                           </div>
                         </div>
                       ) : null}
-                      {pluginDownload.status === 'failed' && pluginDownload.error ? (
-                        <p className="plugin-download-meta is-error">
-                          {pluginDownload.error}
-                        </p>
-                      ) : null}
-
                       {plugin.runtime.supportsAutoAnnotate ? (
                         <div className="plugin-runtime-panel">
                           <div className="plugin-card-title-row">
@@ -3768,24 +3967,6 @@ function App() {
                                 {runtimeTerminalOutput}
                               </pre>
                             </div>
-                          ) : null}
-                          {pluginRuntimeInstall.status === 'completed' &&
-                          pluginRuntimeInstall.message ? (
-                            <p className="plugin-manager-note is-success">
-                              {pluginRuntimeInstall.message}
-                            </p>
-                          ) : null}
-                          {pluginRuntimeInstall.status === 'failed' &&
-                          pluginRuntimeInstall.error ? (
-                            <p className="plugin-manager-note is-error">
-                              {pluginRuntimeInstall.error}
-                            </p>
-                          ) : null}
-                          {pluginRuntimeInstall.status === 'idle' &&
-                          plugin.runtime.message ? (
-                            <p className="plugin-manager-note">
-                              {plugin.runtime.message}
-                            </p>
                           ) : null}
                         </div>
                       ) : null}
