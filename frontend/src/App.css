@@ -2063,6 +2063,12 @@
   vector-effect: non-scaling-stroke;
 }
 
+.bbox-handle-hit {
+  fill: transparent;
+  stroke: transparent;
+  vector-effect: non-scaling-stroke;
+}
+
 .bbox-handle-nw,
 .bbox-handle-se {
   cursor: nwse-resize;

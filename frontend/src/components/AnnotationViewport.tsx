@@ -50,10 +50,22 @@ type AnnotationViewportProps = {
 
 type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se'
 
+type AnnotationLabelMetrics = {
+  fontSize: number
+  textStrokeWidth: number
+  characterWidth: number
+  tagHeight: number
+  tagPaddingX: number
+  tagRadius: number
+  labelGap: number
+  minTagWidth: number
+}
+
 type AnnotationGeometry = {
   annotation: Annotation
   stageRect: Rect
   labelRect: Rect
+  labelMetrics: AnnotationLabelMetrics
 }
 
 type AnnotationInteraction =
@@ -902,7 +914,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               onContextMenu={handleOverlayContextMenu}
             >
               {annotationGeometries.map((geometry) => {
-              const { annotation, stageRect, labelRect } = geometry
+              const { annotation, stageRect, labelRect, labelMetrics } = geometry
               const isSelected = annotation.id === selectedId
               const connector = getLabelConnector(labelRect, stageRect)
 
@@ -936,17 +948,17 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     <rect
                       className="bbox-tag"
                       width={labelRect.width}
-                      height={overlayMetrics.tagHeight}
-                      rx={overlayMetrics.tagRadius}
-                      ry={overlayMetrics.tagRadius}
+                      height={labelRect.height}
+                      rx={labelMetrics.tagRadius}
+                      ry={labelMetrics.tagRadius}
                       fill={annotation.color}
                     />
                     <text
                       className="bbox-text"
-                      x={overlayMetrics.tagPaddingX}
-                      y={overlayMetrics.tagHeight / 2}
-                      fontSize={overlayMetrics.fontSize}
-                      strokeWidth={overlayMetrics.textStrokeWidth}
+                      x={labelMetrics.tagPaddingX}
+                      y={labelRect.height / 2}
+                      fontSize={labelMetrics.fontSize}
+                      strokeWidth={labelMetrics.textStrokeWidth}
                       dominantBaseline="middle"
                       paintOrder="stroke fill"
                     >
@@ -954,63 +966,71 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     </text>
                   </g>
                   {isEditTool && isSelected
-                    ? buildResizeHandles(stageRect).map((handle) => (
-                        <circle
-                          key={handle.id}
-                          className={`bbox-handle bbox-handle-${handle.id}`}
-                          cx={handle.cx}
-                          cy={handle.cy}
-                          r={handle.radius}
-                          strokeWidth={handle.strokeWidth}
-                          pointerEvents="all"
-                          onPointerDown={(event) => {
-                            if (event.button !== 0) {
-                              return
-                            }
+                    ? buildResizeHandles(stageRect, overlayMetrics.effectiveScale).map((handle) => (
+                        <g key={handle.id}>
+                          <circle
+                            className={`bbox-handle-hit bbox-handle-${handle.id}`}
+                            cx={handle.cx}
+                            cy={handle.cy}
+                            r={handle.hitRadius}
+                            pointerEvents="all"
+                            onPointerDown={(event) => {
+                              if (event.button !== 0) {
+                                return
+                              }
 
-                            const point = pointFromEvent(
-                              event,
-                              image,
-                              stageImagePlacement,
-                              'clamp',
-                            )
-                            if (!point) {
-                              return
-                            }
+                              const point = pointFromEvent(
+                                event,
+                                image,
+                                stageImagePlacement,
+                                'clamp',
+                              )
+                              if (!point) {
+                                return
+                              }
 
-                            event.preventDefault()
-                            event.stopPropagation()
-                            setContextMenu(null)
-                            onSelectAnnotation(annotation.id)
-                            interactionRef.current = {
-                              kind: 'resize',
-                              annotationId: annotation.id,
-                              handle: handle.id,
-                              startPoint: point,
-                              originRect: {
-                                x: annotation.x,
-                                y: annotation.y,
-                                width: annotation.width,
-                                height: annotation.height,
-                              },
-                            }
-                          }}
-                          onContextMenu={(event) => {
-                            event.preventDefault()
-                            event.stopPropagation()
-                            const bounds =
-                              stageViewportRef.current?.getBoundingClientRect()
-                            if (!bounds) {
-                              return
-                            }
+                              event.preventDefault()
+                              event.stopPropagation()
+                              setContextMenu(null)
+                              onSelectAnnotation(annotation.id)
+                              interactionRef.current = {
+                                kind: 'resize',
+                                annotationId: annotation.id,
+                                handle: handle.id,
+                                startPoint: point,
+                                originRect: {
+                                  x: annotation.x,
+                                  y: annotation.y,
+                                  width: annotation.width,
+                                  height: annotation.height,
+                                },
+                              }
+                            }}
+                            onContextMenu={(event) => {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              const bounds =
+                                stageViewportRef.current?.getBoundingClientRect()
+                              if (!bounds) {
+                                return
+                              }
 
-                            setContextMenu({
-                              annotationId: annotation.id,
-                              x: event.clientX - bounds.left,
-                              y: event.clientY - bounds.top,
-                            })
-                          }}
-                        />
+                              setContextMenu({
+                                annotationId: annotation.id,
+                                x: event.clientX - bounds.left,
+                                y: event.clientY - bounds.top,
+                              })
+                            }}
+                          />
+                          <circle
+                            className={`bbox-handle bbox-handle-${handle.id}`}
+                            cx={handle.cx}
+                            cy={handle.cy}
+                            r={handle.radius}
+                            strokeWidth={handle.strokeWidth}
+                            pointerEvents="none"
+                          />
+                        </g>
                       ))
                     : null}
                 </g>
@@ -1362,18 +1382,27 @@ function resizeRectFromHandle(
   }
 }
 
-function buildResizeHandles(rect: Rect) {
-  const minSide = Math.min(rect.width, rect.height)
-  const radius = clamp(Math.round(minSide * 0.2), 3, 8)
-  const strokeWidth = clamp(Number((radius * 0.3).toFixed(2)), 1, 2)
+function buildResizeHandles(rect: Rect, effectiveScale: number) {
+  const toStageUnits = (screenPx: number) => screenPx / effectiveScale
+  const minSideScreenPx = Math.max(
+    Math.min(rect.width, rect.height) * effectiveScale,
+    0,
+  )
+  const radiusPx = clamp(minSideScreenPx * 0.1, 3.6, 7)
+  const hitRadiusPx = clamp(Math.max(radiusPx + 3.8, 9.5), 9.5, 12)
+  const strokeWidthPx = clamp(radiusPx * 0.34, 1.1, 1.9)
+  const radius = toStageUnits(radiusPx)
+  const hitRadius = toStageUnits(hitRadiusPx)
+  const strokeWidth = toStageUnits(strokeWidthPx)
 
   return [
-    { id: 'nw' as const, cx: rect.x, cy: rect.y, radius, strokeWidth },
+    { id: 'nw' as const, cx: rect.x, cy: rect.y, radius, hitRadius, strokeWidth },
     {
       id: 'ne' as const,
       cx: rect.x + rect.width,
       cy: rect.y,
       radius,
+      hitRadius,
       strokeWidth,
     },
     {
@@ -1381,6 +1410,7 @@ function buildResizeHandles(rect: Rect) {
       cx: rect.x,
       cy: rect.y + rect.height,
       radius,
+      hitRadius,
       strokeWidth,
     },
     {
@@ -1388,6 +1418,7 @@ function buildResizeHandles(rect: Rect) {
       cx: rect.x + rect.width,
       cy: rect.y + rect.height,
       radius,
+      hitRadius,
       strokeWidth,
     },
   ]
@@ -1542,11 +1573,12 @@ function buildAnnotationGeometry(
     mapAnnotationToStage(annotation, image, imagePlacement),
     overlayMetrics.effectiveScale,
   )
+  const labelMetrics = getAnnotationLabelMetrics(stageRect, overlayMetrics)
   const labelWidth = snapStageValue(
     Math.max(
-      overlayMetrics.minTagWidth,
-      Math.round(annotation.label.length * overlayMetrics.characterWidth) +
-        overlayMetrics.tagPaddingX * 2,
+      labelMetrics.minTagWidth,
+      Math.round(annotation.label.length * labelMetrics.characterWidth) +
+        labelMetrics.tagPaddingX * 2,
     ),
     overlayMetrics.effectiveScale,
   )
@@ -1564,7 +1596,7 @@ function buildAnnotationGeometry(
   const labelY = snapStageValue(
     Math.max(
       overlayMetrics.edgeInset,
-      stageRect.y - overlayMetrics.tagHeight - overlayMetrics.labelGap,
+      stageRect.y - labelMetrics.tagHeight - labelMetrics.labelGap,
     ),
     overlayMetrics.effectiveScale,
   )
@@ -1576,8 +1608,9 @@ function buildAnnotationGeometry(
       x: labelX,
       y: labelY,
       width: labelWidth,
-      height: overlayMetrics.tagHeight,
+      height: labelMetrics.tagHeight,
     },
+    labelMetrics,
   }
 }
 
@@ -1675,16 +1708,16 @@ function placeLabelRect(
   occupiedLabelRects: Rect[],
   overlayMetrics: OverlayMetrics,
 ) {
-  const slotStep = overlayMetrics.tagHeight + overlayMetrics.labelGap
+  const slotStep = geometry.labelRect.height + geometry.labelMetrics.labelGap
   const minY = overlayMetrics.edgeInset
   const maxY = STAGE_HEIGHT - overlayMetrics.edgeInset - geometry.labelRect.height
   const aboveY = clamp(
-    geometry.stageRect.y - geometry.labelRect.height - overlayMetrics.labelGap,
+    geometry.stageRect.y - geometry.labelRect.height - geometry.labelMetrics.labelGap,
     minY,
     maxY,
   )
   const belowY = clamp(
-    geometry.stageRect.y + overlayMetrics.labelGap,
+    geometry.stageRect.y + geometry.labelMetrics.labelGap,
     minY,
     maxY,
   )
@@ -1933,6 +1966,45 @@ type OverlayMetrics = {
   labelGap: number
   edgeInset: number
   minTagWidth: number
+}
+
+function getAnnotationLabelMetrics(
+  stageRect: Rect,
+  overlayMetrics: OverlayMetrics,
+): AnnotationLabelMetrics {
+  const minSideScreenPx = Math.max(
+    Math.min(stageRect.width, stageRect.height) * overlayMetrics.effectiveScale,
+    0,
+  )
+  const compactScale = clamp(0.54 + ((minSideScreenPx - 18) / 54) * 0.46, 0.54, 1)
+  const toStageUnits = (screenPx: number) => screenPx / overlayMetrics.effectiveScale
+  const minFontSize = toStageUnits(10)
+  const minTextStrokeWidth = toStageUnits(1.1)
+  const minTagHeight = toStageUnits(19)
+  const minTagPaddingX = toStageUnits(6)
+  const minTagRadius = toStageUnits(2.2)
+  const minLabelGap = toStageUnits(4)
+  const minTagWidth = toStageUnits(44)
+
+  return {
+    fontSize: Math.max(overlayMetrics.fontSize * compactScale, minFontSize),
+    textStrokeWidth: Math.max(
+      overlayMetrics.textStrokeWidth * compactScale,
+      minTextStrokeWidth,
+    ),
+    characterWidth: Math.max(
+      overlayMetrics.characterWidth * compactScale,
+      minFontSize * 0.62,
+    ),
+    tagHeight: Math.max(overlayMetrics.tagHeight * compactScale, minTagHeight),
+    tagPaddingX: Math.max(
+      overlayMetrics.tagPaddingX * compactScale,
+      minTagPaddingX,
+    ),
+    tagRadius: Math.max(overlayMetrics.tagRadius * compactScale, minTagRadius),
+    labelGap: Math.max(overlayMetrics.labelGap * compactScale, minLabelGap),
+    minTagWidth: Math.max(overlayMetrics.minTagWidth * compactScale, minTagWidth),
+  }
 }
 
 function getOverlayMetrics(
