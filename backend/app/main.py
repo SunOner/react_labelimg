@@ -4,6 +4,7 @@ import html
 import importlib.util
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -244,6 +245,20 @@ class AppStatePayload(BaseModel):
     hotkeys: dict[str, list[str]] | None = None
     projectClassesByRootPath: dict[str, list[str]] | None = None
     samSettings: SamSettingsPayload | None = None
+
+
+class LocalAnnotationPayload(BaseModel):
+    label: str | None = None
+    difficult: bool = False
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class SaveLocalAnnotationsPayload(BaseModel):
+    annotations: list[LocalAnnotationPayload]
+    projectClasses: list[str] | None = None
 
 
 class PluginDownloadRequest(BaseModel):
@@ -737,6 +752,35 @@ def read_local_session_annotations(session_id: str, image_id: str):
         "format": image.annotation_format,
         "count": image.annotation_count,
         "annotations": annotations,
+    }
+
+
+@app.put("/api/local/sessions/{session_id}/annotations/{image_id}")
+def save_local_session_annotations(
+    session_id: str,
+    image_id: str,
+    payload: SaveLocalAnnotationsPayload,
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    image = session.images_by_id.get(image_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    annotations = normalize_annotation_payloads(payload.annotations)
+    save_image_annotations(
+        session,
+        image,
+        annotations,
+        preferred_classes=payload.projectClasses or [],
+    )
+
+    return {
+        "format": image.annotation_format,
+        "count": image.annotation_count,
+        "savedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
 
@@ -2793,6 +2837,343 @@ def load_image_annotations(session: LocalSession, image: SessionImage):
         return annotations
 
     return []
+
+
+def normalize_annotation_payloads(
+    annotations: list[LocalAnnotationPayload],
+) -> list[dict[str, Any]]:
+    normalized_annotations: list[dict[str, Any]] = []
+
+    for annotation in annotations:
+        coordinates = (
+            float(annotation.x),
+            float(annotation.y),
+            float(annotation.width),
+            float(annotation.height),
+        )
+        if not all(math.isfinite(value) for value in coordinates):
+            continue
+
+        label = (annotation.label or "object").strip() or "object"
+        normalized_annotations.append(
+            {
+                "id": uuid4().hex,
+                "label": label,
+                "difficult": bool(annotation.difficult),
+                "x": max(coordinates[0], 0.0),
+                "y": max(coordinates[1], 0.0),
+                "width": max(coordinates[2], 0.0),
+                "height": max(coordinates[3], 0.0),
+            }
+        )
+
+    return normalized_annotations
+
+
+def save_image_annotations(
+    session: LocalSession,
+    image: SessionImage,
+    annotations: list[dict[str, Any]],
+    *,
+    preferred_classes: list[str],
+):
+    annotation_format = image.annotation_format or infer_session_annotation_format(session)
+    annotation_path = resolve_annotation_output_path(session, image, annotation_format)
+
+    if annotation_format == "voc":
+        write_pascal_voc_annotations(annotation_path, image, annotations)
+        class_source_path = None
+        class_source_mtime_ns = None
+    else:
+        existing_class_source = (
+            load_yolo_classes(image.annotation_path.parent, session.root_path)
+            if image.annotation_path is not None
+            else YoloClassSource(names=[])
+        )
+        class_names = build_yolo_class_list(
+            annotations,
+            preferred_classes=preferred_classes,
+            existing_class_source=existing_class_source,
+        )
+        classes_path = resolve_yolo_classes_output_path(
+            session,
+            annotation_path,
+            existing_class_source,
+        )
+        write_yolo_classes(classes_path, class_names)
+        write_yolo_annotations(annotation_path, image.full_path, annotations, class_names)
+        class_source_path = classes_path
+        class_source_mtime_ns = classes_path.stat().st_mtime_ns
+
+    annotation_mtime_ns = annotation_path.stat().st_mtime_ns
+    image.annotation_path = annotation_path
+    image.annotation_format = annotation_format
+    image.annotation_count = len(annotations)
+
+    CACHE_STORE.save_annotation_cache(
+        annotation_path=annotation_path,
+        annotation_format=annotation_format,
+        annotation_mtime_ns=annotation_mtime_ns,
+        image_path=image.full_path,
+        image_mtime_ns=image.mtime_ns,
+        class_source_path=class_source_path,
+        class_source_mtime_ns=class_source_mtime_ns,
+        payload=annotations,
+    )
+    CACHE_STORE.save_dataset_manifest(
+        session.root_path,
+        session.label,
+        serialize_manifest_images(session.images),
+    )
+
+
+def infer_session_annotation_format(session: LocalSession):
+    format_counts = {"yolo": 0, "voc": 0}
+
+    for image in session.images:
+        if image.annotation_format in format_counts:
+            format_counts[image.annotation_format] += 1
+
+    if format_counts["voc"] > format_counts["yolo"]:
+        return "voc"
+
+    return "yolo"
+
+
+def infer_annotation_base_index(session: LocalSession, annotation_format: str):
+    extension = ".xml" if annotation_format == "voc" else ".txt"
+    index_counts: dict[int, int] = {}
+
+    for image in session.images:
+        if image.annotation_format != annotation_format or image.annotation_path is None:
+            continue
+
+        expected_path = image.annotation_path.with_suffix(extension)
+        for index, annotation_base in enumerate(
+            iter_annotation_bases(image.full_path, session.root_path)
+        ):
+            candidate_path = annotation_base.parent / f"{annotation_base.name}{extension}"
+            if candidate_path == expected_path:
+                index_counts[index] = index_counts.get(index, 0) + 1
+                break
+
+    if not index_counts:
+        return None
+
+    return min(
+        index_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[0]
+
+
+def resolve_annotation_output_path(
+    session: LocalSession,
+    image: SessionImage,
+    annotation_format: str,
+):
+    if image.annotation_path is not None and image.annotation_format == annotation_format:
+        return image.annotation_path
+
+    extension = ".xml" if annotation_format == "voc" else ".txt"
+    annotation_bases = list(iter_annotation_bases(image.full_path, session.root_path))
+    preferred_index = infer_annotation_base_index(session, annotation_format)
+
+    if preferred_index is None and annotation_format == "yolo":
+        preferred_index = next(
+            (
+                index
+                for index, annotation_base in enumerate(annotation_bases)
+                if annotation_base.parent.name.lower() in LABEL_DIRECTORY_NAMES
+            ),
+            None,
+        )
+
+    if preferred_index is None or preferred_index >= len(annotation_bases):
+        preferred_index = 0
+
+    annotation_base = annotation_bases[preferred_index]
+    return annotation_base.parent / f"{annotation_base.name}{extension}"
+
+
+def resolve_yolo_classes_output_path(
+    session: LocalSession,
+    annotation_path: Path,
+    existing_class_source: YoloClassSource,
+):
+    if (
+        existing_class_source.source_path is not None
+        and existing_class_source.source_path != PREDEFINED_CLASSES_FILE
+    ):
+        return existing_class_source.source_path
+
+    annotation_parent = annotation_path.parent
+    if annotation_parent.name.lower() in LABEL_DIRECTORY_NAMES:
+        return annotation_parent / "classes.txt"
+
+    if session.root_path.name.lower() in IMAGE_DIRECTORY_NAMES:
+        return session.root_path.parent / "classes.txt"
+
+    return session.root_path / "classes.txt"
+
+
+def build_yolo_class_list(
+    annotations: list[dict[str, Any]],
+    *,
+    preferred_classes: list[str],
+    existing_class_source: YoloClassSource,
+):
+    class_names: list[str] = []
+    seen: set[str] = set()
+
+    def add_class(label: str):
+        normalized = label.strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        class_names.append(normalized)
+
+    if (
+        existing_class_source.source_path is not None
+        and existing_class_source.source_path != PREDEFINED_CLASSES_FILE
+    ):
+        for label in existing_class_source.names:
+            add_class(label)
+
+        for label in preferred_classes:
+            add_class(label)
+    else:
+        for label in preferred_classes:
+            add_class(label)
+
+    for annotation in annotations:
+        add_class(str(annotation.get("label") or "object"))
+
+    return class_names
+
+
+def write_pascal_voc_annotations(
+    annotation_path: Path,
+    image: SessionImage,
+    annotations: list[dict[str, Any]],
+):
+    image_width, image_height = read_image_size(image.full_path)
+    annotation_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<annotation verified="no">',
+        '\t<folder>browser</folder>',
+        f'\t<filename>{html.escape(image.name)}</filename>',
+        '\t<source>',
+        '\t\t<database>Unknown</database>',
+        '\t</source>',
+        '\t<size>',
+        f'\t\t<width>{image_width}</width>',
+        f'\t\t<height>{image_height}</height>',
+        '\t\t<depth>3</depth>',
+        '\t</size>',
+        '\t<segmented>0</segmented>',
+    ]
+
+    for annotation in annotations:
+        box = annotation_to_pascal_voc_box(annotation, image_width, image_height)
+        lines.extend(
+            [
+                '\t<object>',
+                f'\t\t<name>{html.escape(str(annotation["label"]))}</name>',
+                '\t\t<pose>Unspecified</pose>',
+                f'\t\t<truncated>{1 if box["truncated"] else 0}</truncated>',
+                f'\t\t<difficult>{1 if annotation.get("difficult") else 0}</difficult>',
+                '\t\t<bndbox>',
+                f'\t\t\t<xmin>{box["x_min"]}</xmin>',
+                f'\t\t\t<ymin>{box["y_min"]}</ymin>',
+                f'\t\t\t<xmax>{box["x_max"]}</xmax>',
+                f'\t\t\t<ymax>{box["y_max"]}</ymax>',
+                '\t\t</bndbox>',
+                '\t</object>',
+            ]
+        )
+
+    lines.append('</annotation>')
+    annotation_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def annotation_to_pascal_voc_box(
+    annotation: dict[str, Any],
+    image_width: int,
+    image_height: int,
+):
+    x_min = clamp_int(round(float(annotation["x"])), 1, image_width)
+    y_min = clamp_int(round(float(annotation["y"])), 1, image_height)
+    x_max = clamp_int(
+        round(float(annotation["x"]) + float(annotation["width"])),
+        1,
+        image_width,
+    )
+    y_max = clamp_int(
+        round(float(annotation["y"]) + float(annotation["height"])),
+        1,
+        image_height,
+    )
+
+    return {
+        "x_min": x_min,
+        "y_min": y_min,
+        "x_max": x_max,
+        "y_max": y_max,
+        "truncated": (
+            x_min == 1
+            or y_min == 1
+            or x_max == image_width
+            or y_max == image_height
+        ),
+    }
+
+
+def write_yolo_classes(classes_path: Path, class_names: list[str]):
+    classes_path.parent.mkdir(parents=True, exist_ok=True)
+    contents = "\n".join(class_names)
+    classes_path.write_text(f"{contents}\n" if contents else "", encoding="utf-8")
+
+
+def write_yolo_annotations(
+    annotation_path: Path,
+    image_path: Path,
+    annotations: list[dict[str, Any]],
+    class_names: list[str],
+):
+    image_width, image_height = read_image_size(image_path)
+    annotation_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    for annotation in annotations:
+        label = str(annotation.get("label") or "object").strip() or "object"
+        if label not in class_names:
+            continue
+
+        class_index = class_names.index(label)
+        x_center = (float(annotation["x"]) + float(annotation["width"]) / 2) / image_width
+        y_center = (float(annotation["y"]) + float(annotation["height"]) / 2) / image_height
+        width = float(annotation["width"]) / image_width
+        height = float(annotation["height"]) / image_height
+        lines.append(
+            " ".join(
+                [
+                    str(class_index),
+                    f"{x_center:.6f}",
+                    f"{y_center:.6f}",
+                    f"{width:.6f}",
+                    f"{height:.6f}",
+                ]
+            )
+        )
+
+    contents = "\n".join(lines)
+    annotation_path.write_text(f"{contents}\n" if contents else "", encoding="utf-8")
+
+
+def clamp_int(value: int, minimum: int, maximum: int):
+    return min(max(value, minimum), maximum)
 
 
 def load_pascal_voc_annotations(annotation_path: Path):

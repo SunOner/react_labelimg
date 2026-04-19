@@ -44,6 +44,12 @@ export type LocalImageAnnotationsResponse = {
   annotations: LocalAnnotation[]
 }
 
+export type SaveLocalAnnotationsResponse = {
+  format?: string | null
+  count: number
+  savedAt?: string | null
+}
+
 export type LocalSessionJobResponse = {
   jobId: string
   status: 'running' | 'completed' | 'failed'
@@ -452,6 +458,27 @@ export async function fetchLocalSessionJob(jobId: string, afterRevision = 0) {
 export async function fetchLocalAnnotations(sessionId: string, imageId: string) {
   return requestJson<LocalImageAnnotationsResponse>(
     `/api/local/sessions/${sessionId}/annotations/${imageId}`,
+  )
+}
+
+export async function saveLocalAnnotations(
+  sessionId: string,
+  imageId: string,
+  annotations: LocalAnnotation[],
+  projectClasses: string[] = [],
+) {
+  return requestJson<SaveLocalAnnotationsResponse>(
+    `/api/local/sessions/${sessionId}/annotations/${imageId}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        annotations,
+        projectClasses,
+      }),
+    },
   )
 }
 

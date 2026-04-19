@@ -29,6 +29,7 @@ import {
   openLocalImagePath,
   openLocalDirectoryPathJob,
   runPluginAutoAnnotate,
+  saveLocalAnnotations,
   startHuggingFaceAuth,
   updateHuggingFaceAuthConfig,
   updateAppState,
@@ -65,6 +66,7 @@ type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
 
 const PRELOAD_RADIUS = 1
 const DELETE_IMAGE_ARM_DURATION_MS = 3000
+const ANNOTATION_SAVE_DEBOUNCE_MS = 350
 const SIDEBAR_VISIBILITY_STORAGE_KEY = 'labelimg.sidebarVisible'
 const RECENT_DATASETS_STORAGE_KEY = 'labelimg.recentDatasets'
 const SESSION_STATE_STORAGE_KEY = 'labelimg.sessionState'
@@ -372,6 +374,7 @@ function App() {
 
   const menuBarRef = useRef<HTMLElement | null>(null)
   const imageResourcesRef = useRef<Record<string, ImageResource>>({})
+  const annotationsByImageRef = useRef<Record<string, Annotation[]>>({})
   const imageIdSetRef = useRef<Set<string>>(new Set())
   const pendingLoadsRef = useRef<Record<string, Promise<void>>>({})
   const pendingAnnotationLoadsRef = useRef<Record<string, Promise<void>>>({})
@@ -390,6 +393,8 @@ function App() {
   const callbackCopiedTimeoutRef = useRef<number | null>(null)
   const runtimeInstallLogRef = useRef<HTMLPreElement | null>(null)
   const deleteImageArmTimeoutRef = useRef<number | null>(null)
+  const annotationSaveTimeoutsRef = useRef<Record<string, number>>({})
+  const annotationSaveRevisionRef = useRef<Record<string, number>>({})
   const toastTimeoutsRef = useRef<Record<string, number>>({})
   const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
   const pluginToastKeysRef = useRef<Record<string, string>>({})
@@ -686,7 +691,7 @@ function App() {
     updater: (current: string[]) => string[],
   ) => {
     if (!currentSessionRootPath) {
-      return
+      return null
     }
 
     const nextProjectClasses = sanitizeClassList(updater(projectClasses))
@@ -695,9 +700,11 @@ function App() {
       ...current,
       [currentSessionRootPath]: nextProjectClasses,
     }))
-    setAnnotationsByImage((current) =>
+    commitAnnotationsByImage((current) =>
       remapProjectClassAliasesInImageMap(current, nextProjectClasses),
     )
+
+    return nextProjectClasses
   }
 
   useEffect(() => {
@@ -789,6 +796,134 @@ function App() {
     })
   }
 
+  const commitAnnotationsByImage = (
+    updater: (current: Record<string, Annotation[]>) => Record<string, Annotation[]>,
+  ) => {
+    const next = updater(annotationsByImageRef.current)
+    annotationsByImageRef.current = next
+    setAnnotationsByImage(next)
+    return next
+  }
+
+  const clearScheduledAnnotationSave = (imageId?: string) => {
+    if (imageId) {
+      const timeoutId = annotationSaveTimeoutsRef.current[imageId]
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId)
+        delete annotationSaveTimeoutsRef.current[imageId]
+      }
+      delete annotationSaveRevisionRef.current[imageId]
+      return
+    }
+
+    for (const timeoutId of Object.values(annotationSaveTimeoutsRef.current)) {
+      window.clearTimeout(timeoutId)
+    }
+    annotationSaveTimeoutsRef.current = {}
+    annotationSaveRevisionRef.current = {}
+  }
+
+  const updateImageAnnotationMetadata = useEffectEvent((
+    imageId: string,
+    count: number,
+    format?: string | null,
+  ) => {
+    setImages((current) =>
+      current.map((entry) =>
+        entry.id === imageId
+          ? {
+              ...entry,
+              annotationCount: count,
+              annotationFormat:
+                format === undefined
+                  ? entry.annotationFormat ?? null
+                  : (format ?? null),
+            }
+          : entry,
+      ),
+    )
+  })
+
+  const scheduleAnnotationSave = useEffectEvent((
+    imageId: string,
+    nextAnnotations: Annotation[],
+    projectClassesOverride?: string[],
+  ) => {
+    if (!currentSessionId) {
+      return
+    }
+
+    const sessionId = currentSessionId
+    const preferredClasses = [...(projectClassesOverride ?? projectClasses)]
+    const nextRevision = (annotationSaveRevisionRef.current[imageId] ?? 0) + 1
+    annotationSaveRevisionRef.current[imageId] = nextRevision
+
+    const existingTimeoutId = annotationSaveTimeoutsRef.current[imageId]
+    if (existingTimeoutId !== undefined) {
+      window.clearTimeout(existingTimeoutId)
+    }
+
+    annotationSaveTimeoutsRef.current[imageId] = window.setTimeout(() => {
+      delete annotationSaveTimeoutsRef.current[imageId]
+
+      void saveLocalAnnotations(
+        sessionId,
+        imageId,
+        nextAnnotations,
+        preferredClasses,
+      )
+        .then((payload) => {
+          if (annotationSaveRevisionRef.current[imageId] !== nextRevision) {
+            return
+          }
+
+          updateImageAnnotationMetadata(
+            imageId,
+            payload.count,
+            payload.format ?? undefined,
+          )
+        })
+        .catch((error) => {
+          if (annotationSaveRevisionRef.current[imageId] !== nextRevision) {
+            return
+          }
+
+          pushToast(
+            error instanceof Error
+              ? error.message
+              : 'Failed to save annotations',
+            'error',
+          )
+        })
+    }, ANNOTATION_SAVE_DEBOUNCE_MS)
+  })
+
+  const replaceImageAnnotations = useEffectEvent((
+    imageId: string,
+    nextAnnotations: Annotation[],
+    options: {
+      projectClassesOverride?: string[]
+      selectedAnnotationId?: string | null
+    } = {},
+  ) => {
+    annotationLoadStateRef.current[imageId] = 'ready'
+    commitAnnotationsByImage((current) => ({
+      ...current,
+      [imageId]: nextAnnotations,
+    }))
+    updateImageAnnotationMetadata(imageId, nextAnnotations.length)
+
+    if (options.selectedAnnotationId !== undefined && currentEntry?.id === imageId) {
+      setSelectedId(options.selectedAnnotationId)
+    }
+
+    scheduleAnnotationSave(
+      imageId,
+      nextAnnotations,
+      options.projectClassesOverride,
+    )
+  })
+
   const resetSessionState = (nextImages: ImageEntry[], nextSessionLabel: string) => {
     sessionVersionRef.current += 1
     imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
@@ -796,12 +931,13 @@ function App() {
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
     imageResourcesRef.current = {}
+    clearScheduledAnnotationSave()
     pendingPreferredImageRelativePathRef.current = null
 
     startTransition(() => {
       setImageResources({})
       setImages(nextImages)
-      setAnnotationsByImage({})
+      commitAnnotationsByImage(() => ({}))
       setCurrentSessionId(null)
       setCurrentSessionRootPath(null)
       setCurrentImageEntry(nextImages[0] ?? null)
@@ -892,6 +1028,7 @@ function App() {
       pendingLoadsRef.current = {}
       pendingAnnotationLoadsRef.current = {}
       annotationLoadStateRef.current = {}
+      clearScheduledAnnotationSave()
     }
   }, [])
 
@@ -991,7 +1128,7 @@ function App() {
           ),
         )
 
-        setAnnotationsByImage((current) => {
+        commitAnnotationsByImage((current) => {
           if (current[entry.id] !== undefined) {
             return current
           }
@@ -1870,7 +2007,6 @@ function App() {
       )
 
       try {
-        annotationLoadStateRef.current[currentEntry.id] = 'ready'
         const emptyResultMessage =
           pairsToRun.length > 1
             ? 'SAM found no matching objects for the configured prompt list.'
@@ -1896,9 +2032,11 @@ function App() {
           }
 
           const bestMatch = result.annotations[0]!
-          setAnnotationsByImage((current) => ({
-            ...current,
-            [currentEntry.id]: (current[currentEntry.id] ?? []).map((annotation) =>
+          const currentAnnotations =
+            annotationsByImageRef.current[currentEntry.id] ?? []
+          replaceImageAnnotations(
+            currentEntry.id,
+            currentAnnotations.map((annotation) =>
               annotation.id === replaceAnnotationId
                 ? {
                     ...annotation,
@@ -1911,8 +2049,8 @@ function App() {
                   }
                 : annotation,
             ),
-          }))
-          setSelectedId(replaceAnnotationId)
+            { selectedAnnotationId: replaceAnnotationId },
+          )
           setSamActionMessageTone('success')
           setSamActionMessage(successMessage ?? 'SAM refined the selected box.')
           return
@@ -1954,11 +2092,13 @@ function App() {
           height: annotation.height,
         }))
 
-        setAnnotationsByImage((current) => ({
-          ...current,
-          [currentEntry.id]: [...(current[currentEntry.id] ?? []), ...nextAnnotations],
-        }))
-        setSelectedId(nextAnnotations[0]?.id ?? null)
+        const currentAnnotations =
+          annotationsByImageRef.current[currentEntry.id] ?? []
+        replaceImageAnnotations(
+          currentEntry.id,
+          [...currentAnnotations, ...nextAnnotations],
+          { selectedAnnotationId: nextAnnotations[0]?.id ?? null },
+        )
         setSamActionMessageTone('success')
         setSamActionMessage(
           successMessage ??
@@ -2213,7 +2353,7 @@ function App() {
       return
     }
 
-    updateCurrentProjectClasses((current) => {
+    const nextProjectClasses = updateCurrentProjectClasses((current) => {
       const next = current.filter(
         (label) => label !== sourceLabel && label !== nextLabel,
       )
@@ -2221,22 +2361,42 @@ function App() {
       return next
     })
 
-    setAnnotationsByImage((current) =>
+    const changedImageIds: string[] = []
+    const nextAnnotationsByImage = commitAnnotationsByImage((current) =>
       Object.fromEntries(
         Object.entries(current).map(([imageId, imageAnnotations]) => [
           imageId,
-          imageAnnotations.map((annotation) =>
-            annotation.label === sourceLabel
-              ? {
-                  ...annotation,
-                  label: nextLabel,
-                  color: labelToColor(nextLabel),
-                }
-              : annotation,
-          ),
+          imageAnnotations.map((annotation) => {
+            if (annotation.label !== sourceLabel) {
+              return annotation
+            }
+
+            if (!changedImageIds.includes(imageId)) {
+              changedImageIds.push(imageId)
+            }
+
+            return {
+              ...annotation,
+              label: nextLabel,
+              color: labelToColor(nextLabel),
+            }
+          }),
         ]),
       ),
     )
+
+    for (const imageId of changedImageIds) {
+      annotationLoadStateRef.current[imageId] = 'ready'
+      updateImageAnnotationMetadata(
+        imageId,
+        nextAnnotationsByImage[imageId]?.length ?? 0,
+      )
+      scheduleAnnotationSave(
+        imageId,
+        nextAnnotationsByImage[imageId] ?? [],
+        nextProjectClasses ?? undefined,
+      )
+    }
 
     setActiveLabel((current) =>
       current === sourceLabel ? nextLabel : current,
@@ -2265,15 +2425,13 @@ function App() {
       return
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
-
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [currentEntry.id]: (current[currentEntry.id] ?? []).filter(
-        (annotation) => annotation.id !== annotationId,
-      ),
-    }))
-    setSelectedId((current) => (current === annotationId ? null : current))
+    replaceImageAnnotations(
+      currentEntry.id,
+      annotations.filter((annotation) => annotation.id !== annotationId),
+      {
+        selectedAnnotationId: selectedId === annotationId ? null : undefined,
+      },
+    )
   })
 
   const duplicateAnnotation = useEffectEvent((annotationId: string) => {
@@ -2304,13 +2462,11 @@ function App() {
           : Math.min(Math.max(sourceAnnotation.y + offset, 0), maxY),
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
-
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [currentEntry.id]: [...(current[currentEntry.id] ?? []), nextAnnotation],
-    }))
-    setSelectedId(nextAnnotation.id)
+    replaceImageAnnotations(
+      currentEntry.id,
+      [...annotations, nextAnnotation],
+      { selectedAnnotationId: nextAnnotation.id },
+    )
   })
 
   const deleteSelectedAnnotation = () => {
@@ -2327,11 +2483,9 @@ function App() {
       return
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
-
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [currentEntry.id]: (current[currentEntry.id] ?? []).map((annotation) =>
+    replaceImageAnnotations(
+      currentEntry.id,
+      annotations.map((annotation) =>
         annotation.id === annotationId
           ? {
               ...annotation,
@@ -2339,7 +2493,7 @@ function App() {
             }
           : annotation,
       ),
-    }))
+    )
   })
 
   const changeAnnotationLabel = useEffectEvent((
@@ -2355,11 +2509,9 @@ function App() {
       return
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
-
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [currentEntry.id]: (current[currentEntry.id] ?? []).map((annotation) =>
+    replaceImageAnnotations(
+      currentEntry.id,
+      annotations.map((annotation) =>
         annotation.id === annotationId
           ? {
               ...annotation,
@@ -2368,8 +2520,8 @@ function App() {
             }
           : annotation,
       ),
-    }))
-    setSelectedId(annotationId)
+      { selectedAnnotationId: annotationId },
+    )
     setActiveLabel(trimmedLabel)
   })
 
@@ -2381,41 +2533,30 @@ function App() {
       return
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
+    const sourceIndex = annotations.findIndex(
+      (annotation) => annotation.id === annotationId,
+    )
+    if (sourceIndex < 0) {
+      return
+    }
 
-    setAnnotationsByImage((current) => {
-      const currentAnnotations = current[currentEntry.id] ?? []
-      const sourceIndex = currentAnnotations.findIndex(
-        (annotation) => annotation.id === annotationId,
-      )
-      if (sourceIndex < 0) {
-        return current
-      }
+    const boundedInsertIndex = Math.max(0, Math.min(insertIndex, annotations.length))
+    if (
+      boundedInsertIndex === sourceIndex ||
+      boundedInsertIndex === sourceIndex + 1
+    ) {
+      return
+    }
 
-      const boundedInsertIndex = Math.max(
-        0,
-        Math.min(insertIndex, currentAnnotations.length),
-      )
-      if (
-        boundedInsertIndex === sourceIndex ||
-        boundedInsertIndex === sourceIndex + 1
-      ) {
-        return current
-      }
+    const nextAnnotations = [...annotations]
+    const [movedAnnotation] = nextAnnotations.splice(sourceIndex, 1)
+    const adjustedInsertIndex =
+      sourceIndex < boundedInsertIndex
+        ? boundedInsertIndex - 1
+        : boundedInsertIndex
+    nextAnnotations.splice(adjustedInsertIndex, 0, movedAnnotation)
 
-      const nextAnnotations = [...currentAnnotations]
-      const [movedAnnotation] = nextAnnotations.splice(sourceIndex, 1)
-      const adjustedInsertIndex =
-        sourceIndex < boundedInsertIndex
-          ? boundedInsertIndex - 1
-          : boundedInsertIndex
-      nextAnnotations.splice(adjustedInsertIndex, 0, movedAnnotation)
-
-      return {
-        ...current,
-        [currentEntry.id]: nextAnnotations,
-      }
-    })
+    replaceImageAnnotations(currentEntry.id, nextAnnotations)
   }
 
   const clearCurrentImageAnnotations = () => {
@@ -2423,13 +2564,7 @@ function App() {
       return
     }
 
-    annotationLoadStateRef.current[currentEntry.id] = 'ready'
-
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [currentEntry.id]: [],
-    }))
-    setSelectedId(null)
+    replaceImageAnnotations(currentEntry.id, [], { selectedAnnotationId: null })
   }
 
   const handleDeleteCurrentImage = useEffectEvent(async () => {
@@ -2654,6 +2789,14 @@ function App() {
     const initialEntry = nextImages[initialImageIndex] ?? nextImages[0] ?? null
 
     if (currentSessionId === sessionId) {
+      const removedImageIds = [...imageIdSetRef.current].filter(
+        (imageId) => !nextImageIdSet.has(imageId),
+      )
+
+      for (const imageId of removedImageIds) {
+        clearScheduledAnnotationSave(imageId)
+      }
+
       imageIdSetRef.current = nextImageIdSet
       setCurrentSessionRootPath(session.rootPath ?? null)
 
@@ -2707,7 +2850,7 @@ function App() {
             Object.entries(current).filter(([imageId]) => nextImageIdSet.has(imageId)),
           ),
         )
-        setAnnotationsByImage((current) =>
+        commitAnnotationsByImage((current) =>
           Object.fromEntries(
             Object.entries(current).filter(([imageId]) => nextImageIdSet.has(imageId)),
           ),
@@ -2724,6 +2867,7 @@ function App() {
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
     imageResourcesRef.current = {}
+    clearScheduledAnnotationSave()
     pendingPreferredImageRelativePathRef.current =
       preferredImageRelativePath && preferredImageIndex < 0
         ? preferredImageRelativePath
@@ -2739,7 +2883,7 @@ function App() {
     startTransition(() => {
       setImageResources({})
       setImages(nextImages)
-      setAnnotationsByImage({})
+      commitAnnotationsByImage(() => ({}))
       setCurrentSessionId(sessionId)
       setCurrentSessionRootPath(session.rootPath ?? null)
       setCurrentImageEntry(initialEntry)
@@ -2958,12 +3102,11 @@ function App() {
       ...nextRect,
     }
 
-    setAnnotationsByImage((current) => ({
-      ...current,
-      [image.id]: [...(current[image.id] ?? []), nextAnnotation],
-    }))
-    annotationLoadStateRef.current[image.id] = 'ready'
-    setSelectedId(nextAnnotation.id)
+    replaceImageAnnotations(
+      image.id,
+      [...annotations, nextAnnotation],
+      { selectedAnnotationId: nextAnnotation.id },
+    )
 
     if (shouldResetNewBoxMode) {
       setViewportTool('draw')
