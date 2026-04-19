@@ -2620,7 +2620,7 @@ function App() {
     }
   })
 
-  const startNewBoxDrawing = useEffectEvent((source: 'button' | 'hotkey' = 'button') => {
+  const startNewBoxDrawing = useEffectEvent(() => {
     if (!currentEntry) {
       return
     }
@@ -2640,13 +2640,6 @@ function App() {
     setSelectedId(null)
     updateDrawStart(startPoint)
     setDraftRect({ x: startPoint.x, y: startPoint.y, width: 0, height: 0 })
-
-    pushToast(
-      source === 'hotkey'
-        ? 'New box started. Move the mouse and click to place it.'
-        : 'Move the mouse and click to place the new box.',
-      'info',
-    )
   })
 
   const handleSelectViewportTool = useEffectEvent((tool: ViewportTool) => {
@@ -2718,7 +2711,7 @@ function App() {
       }
 
       event.preventDefault()
-      startNewBoxDrawing('hotkey')
+      startNewBoxDrawing()
       return
     }
 
@@ -3681,7 +3674,24 @@ function App() {
                                 duplicateAnnotation(annotation.id)
                               }}
                             >
-                              Dup
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <rect
+                                  x="5.25"
+                                  y="5.25"
+                                  width="7"
+                                  height="7"
+                                  rx="1.25"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                />
+                                <path
+                                  d="M3.75 10.75h-.5c-.55 0-1-.45-1-1v-6.5c0-.55.45-1 1-1h6.5c.55 0 1 .45 1 1v.5"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              </svg>
                             </AppButton>
                             <AppButton
                               variant="ghost"
@@ -3693,7 +3703,39 @@ function App() {
                                 removeAnnotation(annotation.id)
                               }}
                             >
-                              Del
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path
+                                  d="M3.5 4.5h9"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M6 2.75h4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="M6.75 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M9.25 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
                             </AppButton>
                           </div>
                         </div>
@@ -4053,15 +4095,29 @@ function App() {
                           <>
                             <AppButton
                               variant="ghost"
-                              className="class-manager-action"
+                              className="class-manager-action is-icon"
                               onClick={() => startEditingClass(label)}
                               title="Rename class"
+                              aria-label={`Rename class ${label}`}
                             >
-                              Rename
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path
+                                  d="M3.25 11.5 11.7 3.05a1.5 1.5 0 0 1 2.12 0l.13.13a1.5 1.5 0 0 1 0 2.12L5.5 13.75l-2.75.5.5-2.75Z"
+                                  stroke="currentColor"
+                                  strokeWidth="1.3"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="m10.75 4 1.25 1.25"
+                                  stroke="currentColor"
+                                  strokeWidth="1.3"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
                             </AppButton>
                             <AppButton
                               variant="ghost"
-                              className="class-manager-action is-danger"
+                              className="class-manager-action is-danger is-icon"
                               onClick={() => removeClass(label)}
                               disabled={!canDelete}
                               title={
@@ -4069,8 +4125,41 @@ function App() {
                                   ? 'Reassign or delete boxes before removing this class'
                                   : 'Delete class'
                               }
+                              aria-label={`Delete class ${label}`}
                             >
-                              Delete
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path
+                                  d="M3.5 4.5h9"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M6 2.75h4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="M6.75 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M9.25 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
                             </AppButton>
                           </>
                         )}
@@ -4731,24 +4820,90 @@ function App() {
                                   <div className="hotkeys-binding-actions">
                                     <AppButton
                                       variant="ghost"
-                                      className="hotkeys-binding-action"
+                                      className={
+                                        isCapturing &&
+                                        hotkeyCaptureTarget?.bindingIndex === index
+                                          ? 'hotkeys-binding-action'
+                                          : 'hotkeys-binding-action is-icon'
+                                      }
                                       onClick={() =>
                                         beginHotkeyCapture(item.id, index)
+                                      }
+                                      title={
+                                        isCapturing &&
+                                        hotkeyCaptureTarget?.bindingIndex === index
+                                          ? 'Press the new keys'
+                                          : 'Edit shortcut'
+                                      }
+                                      aria-label={
+                                        isCapturing &&
+                                        hotkeyCaptureTarget?.bindingIndex === index
+                                          ? 'Press the new keys'
+                                          : `Edit shortcut for ${item.title}`
                                       }
                                     >
                                       {isCapturing &&
                                       hotkeyCaptureTarget?.bindingIndex === index
                                         ? 'Press keys…'
-                                        : 'Edit'}
+                                        : (
+                                            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                              <path
+                                                d="M3.25 11.5 11.7 3.05a1.5 1.5 0 0 1 2.12 0l.13.13a1.5 1.5 0 0 1 0 2.12L5.5 13.75l-2.75.5.5-2.75Z"
+                                                stroke="currentColor"
+                                                strokeWidth="1.3"
+                                                strokeLinejoin="round"
+                                              />
+                                              <path
+                                                d="m10.75 4 1.25 1.25"
+                                                stroke="currentColor"
+                                                strokeWidth="1.3"
+                                                strokeLinecap="round"
+                                              />
+                                            </svg>
+                                          )}
                                     </AppButton>
                                     <AppButton
                                       variant="ghost"
-                                      className="hotkeys-binding-action is-danger"
+                                      className="hotkeys-binding-action is-danger is-icon"
                                       onClick={() =>
                                         removeHotkeyBinding(item.id, index)
                                       }
+                                      title="Remove shortcut"
+                                      aria-label={`Remove shortcut ${binding} for ${item.title}`}
                                     >
-                                      Remove
+                                      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                        <path
+                                          d="M3.5 4.5h9"
+                                          stroke="currentColor"
+                                          strokeWidth="1.35"
+                                          strokeLinecap="round"
+                                        />
+                                        <path
+                                          d="M6 2.75h4"
+                                          stroke="currentColor"
+                                          strokeWidth="1.35"
+                                          strokeLinecap="round"
+                                        />
+                                        <path
+                                          d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                          stroke="currentColor"
+                                          strokeWidth="1.35"
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                        />
+                                        <path
+                                          d="M6.75 6.5v4"
+                                          stroke="currentColor"
+                                          strokeWidth="1.2"
+                                          strokeLinecap="round"
+                                        />
+                                        <path
+                                          d="M9.25 6.5v4"
+                                          stroke="currentColor"
+                                          strokeWidth="1.2"
+                                          strokeLinecap="round"
+                                        />
+                                      </svg>
                                     </AppButton>
                                   </div>
                                 </div>
@@ -4762,13 +4917,39 @@ function App() {
                             <div className="hotkeys-row-actions">
                               <AppButton
                                 variant="ghost"
-                                className="hotkeys-binding-action"
+                                className={
+                                  isCapturing &&
+                                  hotkeyCaptureTarget?.bindingIndex === null
+                                    ? 'hotkeys-binding-action'
+                                    : 'hotkeys-binding-action is-icon'
+                                }
                                 onClick={() => beginHotkeyCapture(item.id, null)}
+                                title={
+                                  isCapturing &&
+                                  hotkeyCaptureTarget?.bindingIndex === null
+                                    ? 'Press the new keys'
+                                    : 'Add shortcut'
+                                }
+                                aria-label={
+                                  isCapturing &&
+                                  hotkeyCaptureTarget?.bindingIndex === null
+                                    ? 'Press the new keys'
+                                    : `Add shortcut for ${item.title}`
+                                }
                               >
                                 {isCapturing &&
                                 hotkeyCaptureTarget?.bindingIndex === null
                                   ? 'Press keys…'
-                                  : 'Add shortcut'}
+                                  : (
+                                      <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                        <path
+                                          d="M8 3v10M3 8h10"
+                                          stroke="currentColor"
+                                          strokeWidth="1.35"
+                                          strokeLinecap="round"
+                                        />
+                                      </svg>
+                                    )}
                               </AppButton>
                               {isCapturing ? (
                                 <>

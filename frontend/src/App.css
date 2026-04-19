@@ -1384,6 +1384,20 @@
   font-family: var(--font-mono);
 }
 
+.hotkeys-binding-action.is-icon {
+  width: 36px;
+  min-width: 36px;
+  padding: 0;
+  justify-content: center;
+  font-size: 0;
+}
+
+.hotkeys-binding-action svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
 .hotkeys-binding-action:hover:not(:disabled) {
   color: var(--ink-strong);
   border-color: rgba(77, 208, 166, 0.28);
@@ -1498,6 +1512,20 @@
   font-family: var(--font-mono);
 }
 
+.class-manager-action.is-icon {
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+  justify-content: center;
+  font-size: 0;
+}
+
+.class-manager-action svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
 .class-manager-action:hover:not(:disabled) {
   color: var(--ink-strong);
   border-color: rgba(77, 208, 166, 0.28);
@@ -1610,18 +1638,26 @@
 }
 
 .current-box-action {
-  min-width: 0;
-  padding: 7px 8px;
+  min-width: 30px;
+  width: 30px;
+  padding: 0;
   border: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.03);
   color: var(--ink-soft);
-  font-size: 0.72rem;
-  font-family: var(--font-mono);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .current-box-action:hover {
   color: var(--ink-strong);
   border-color: rgba(77, 208, 166, 0.28);
+}
+
+.current-box-action svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
 }
 
 .current-box-action.is-danger:hover {

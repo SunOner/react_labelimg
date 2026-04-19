@@ -143,7 +143,12 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   } | null>(null)
   const [isContextSubmenuOpen, setIsContextSubmenuOpen] = useState(false)
   const autoFitZoom = image
-    ? getAutoFitZoom(image.width, image.height)
+    ? getAutoFitZoom(
+        image.width,
+        image.height,
+        viewportSize.width || 1,
+        viewportSize.height || 1,
+      )
     : MIN_ZOOM
 
   const setStageViewportNode = useCallback((node: HTMLDivElement | null) => {
@@ -671,7 +676,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const handleOverlayPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
     const hoverPoint = pointFromEvent(event, image, stageImagePlacement, 'strict')
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
-    onHoverPointChange?.(hoverPoint)
+    onHoverPointChange?.(clampedPoint ?? hoverPoint)
 
     const interaction = interactionRef.current
 
@@ -755,8 +760,9 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     handlePointerUp(event, image, stageImagePlacement, onFinishDrawing)
   }
 
-  const handleOverlayPointerLeave = () => {
-    onHoverPointChange?.(null)
+  const handleOverlayPointerLeave = (event: ReactPointerEvent<SVGSVGElement>) => {
+    const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
+    onHoverPointChange?.(clampedPoint)
   }
 
   const handleOverlayContextMenu = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -1569,18 +1575,33 @@ function fitContainRect(
   }
 }
 
-function getAutoFitZoom(imageWidth: number, imageHeight: number) {
-  const placement = fitContainRect(
+function getAutoFitZoom(
+  imageWidth: number,
+  imageHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+) {
+  const imagePlacement = fitContainRect(
     imageWidth,
     imageHeight,
     STAGE_WIDTH,
     STAGE_HEIGHT,
   )
+  const renderedStageRect = fitContainRect(
+    STAGE_WIDTH,
+    STAGE_HEIGHT,
+    Math.max(viewportWidth, 1),
+    Math.max(viewportHeight, 1),
+  )
+  const renderedImageWidth =
+    (imagePlacement.width / STAGE_WIDTH) * renderedStageRect.width
+  const renderedImageHeight =
+    (imagePlacement.height / STAGE_HEIGHT) * renderedStageRect.height
 
   return clampZoom(
-    Math.max(
-      STAGE_WIDTH / placement.width,
-      STAGE_HEIGHT / placement.height,
+    Math.min(
+      Math.max(viewportWidth, 1) / Math.max(renderedImageWidth, 0.0001),
+      Math.max(viewportHeight, 1) / Math.max(renderedImageHeight, 0.0001),
     ),
   )
 }
