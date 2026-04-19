@@ -66,12 +66,24 @@ export type PersistedSessionStatePayload = {
   currentImageRelativePath?: string | null
 }
 
+export type SamPromptPairPayload = {
+  prompt?: string | null
+  label?: string | null
+}
+
+export type SamSettingsPayload = {
+  entries?: SamPromptPairPayload[] | null
+  scoreThreshold?: string | null
+  maxResults?: string | null
+}
+
 export type AppStateResponse = {
   sidebarVisible: boolean
   recentDatasets: RecentDatasetEntry[]
   sessionState?: PersistedSessionStatePayload | null
   hotkeys?: Record<string, string[]> | null
   projectClassesByRootPath?: Record<string, string[]> | null
+  samSettings?: SamSettingsPayload | null
 }
 
 export type PluginModelState = {
@@ -440,6 +452,18 @@ export async function fetchLocalSessionJob(jobId: string, afterRevision = 0) {
 export async function fetchLocalAnnotations(sessionId: string, imageId: string) {
   return requestJson<LocalImageAnnotationsResponse>(
     `/api/local/sessions/${sessionId}/annotations/${imageId}`,
+  )
+}
+
+export async function deleteLocalSessionImage(
+  sessionId: string,
+  imageId: string,
+) {
+  return requestJson<LocalSessionResponse>(
+    `/api/local/sessions/${sessionId}/images/${imageId}`,
+    {
+      method: 'DELETE',
+    },
   )
 }
 

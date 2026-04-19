@@ -226,12 +226,24 @@ class PersistedSessionStatePayload(BaseModel):
     currentImageRelativePath: str | None = None
 
 
+class SamPromptPairPayload(BaseModel):
+    prompt: str | None = None
+    label: str | None = None
+
+
+class SamSettingsPayload(BaseModel):
+    entries: list[SamPromptPairPayload] | None = None
+    scoreThreshold: str | None = None
+    maxResults: str | None = None
+
+
 class AppStatePayload(BaseModel):
     sidebarVisible: bool | None = None
     recentDatasets: list[RecentDatasetEntry] | None = None
     sessionState: PersistedSessionStatePayload | None = None
     hotkeys: dict[str, list[str]] | None = None
     projectClassesByRootPath: dict[str, list[str]] | None = None
+    samSettings: SamSettingsPayload | None = None
 
 
 class PluginDownloadRequest(BaseModel):
@@ -726,6 +738,26 @@ def read_local_session_annotations(session_id: str, image_id: str):
         "count": image.annotation_count,
         "annotations": annotations,
     }
+
+
+@app.delete("/api/local/sessions/{session_id}/images/{image_id}")
+def delete_local_session_image(session_id: str, image_id: str):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    image = session.images_by_id.get(image_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    delete_session_image_files(image)
+    remove_image_from_matching_sessions(session.root_path, image.id)
+    CACHE_STORE.save_dataset_manifest(
+        session.root_path,
+        session.label,
+        serialize_manifest_images(session.images),
+    )
+    return serialize_session(session)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2345,6 +2377,31 @@ def create_local_session(root_path: Path, label: str):
     return session
 
 
+def delete_session_image_files(image: SessionImage):
+    try:
+        if image.full_path.exists():
+            image.full_path.unlink()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete image file: {image.full_path.name}",
+        ) from exc
+
+    if image.annotation_path is None:
+        return
+
+    try:
+        if image.annotation_path.exists():
+            image.annotation_path.unlink()
+    except OSError:
+        LOGGER.warning(
+            "Failed to delete annotation sidecar for %s at %s",
+            image.full_path,
+            image.annotation_path,
+            exc_info=True,
+        )
+
+
 def register_session_image(image: SessionImage):
     LOCAL_IMAGE_PATHS[image.id] = image.full_path
 
@@ -2352,6 +2409,26 @@ def register_session_image(image: SessionImage):
 def register_session_images(images: list[SessionImage]):
     for image in images:
         register_session_image(image)
+
+
+def remove_image_from_matching_sessions(root_path: Path, image_id: str):
+    normalized_root_path = root_path.expanduser().resolve()
+
+    for session in LOCAL_SESSIONS.values():
+        if session.root_path != normalized_root_path:
+            continue
+
+        if image_id not in session.images_by_id:
+            continue
+
+        session.images = [
+            current_image
+            for current_image in session.images
+            if current_image.id != image_id
+        ]
+        session.images_by_id.pop(image_id, None)
+
+    LOCAL_IMAGE_PATHS.pop(image_id, None)
 
 
 def build_cached_directory_session(root_path: Path):

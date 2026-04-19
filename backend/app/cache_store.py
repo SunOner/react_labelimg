@@ -15,6 +15,11 @@ DEFAULT_APP_STATE = {
     "sessionState": None,
     "hotkeys": None,
     "projectClassesByRootPath": {},
+    "samSettings": {
+        "entries": [{"prompt": "", "label": ""}],
+        "scoreThreshold": "0.25",
+        "maxResults": "8",
+    },
 }
 
 

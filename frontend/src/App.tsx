@@ -13,6 +13,7 @@ import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { MenuItemButton } from './components/ui/MenuItemButton'
 import {
   buildLocalImageUrl,
+  deleteLocalSessionImage,
   downloadPluginModel,
   fetchAppState,
   fetchApiHealth,
@@ -34,6 +35,7 @@ import {
   type HuggingFaceAuthStatus,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
+  type PluginAutoAnnotateResult,
   type PluginDownloadState,
   type PluginInfo,
   type PluginRuntimeInstallState,
@@ -61,10 +63,14 @@ import type {
 type ViewportTool = 'draw' | 'sam-click' | 'sam-box'
 
 const PRELOAD_RADIUS = 1
+const DELETE_IMAGE_ARM_DURATION_MS = 3000
 const SIDEBAR_VISIBILITY_STORAGE_KEY = 'labelimg.sidebarVisible'
 const RECENT_DATASETS_STORAGE_KEY = 'labelimg.recentDatasets'
 const SESSION_STATE_STORAGE_KEY = 'labelimg.sessionState'
 const HOTKEY_BINDINGS_STORAGE_KEY = 'labelimg.hotkeys'
+const SAM_SETTINGS_STORAGE_KEY = 'labelimg.samSettings'
+const DEFAULT_SAM_SCORE_THRESHOLD = '0.25'
+const DEFAULT_SAM_MAX_RESULTS = '8'
 const MAX_RECENT_DATASETS = 6
 const HUGGING_FACE_OAUTH_APP_URL =
   'https://huggingface.co/settings/applications/new'
@@ -233,6 +239,17 @@ type ApplyLocalSessionOptions = {
   preferredImageRelativePath?: string | null
 }
 
+type SamPromptPairDraft = {
+  prompt: string
+  label: string
+}
+
+type SamSettingsDraft = {
+  entries: SamPromptPairDraft[]
+  scoreThreshold: string
+  maxResults: string
+}
+
 type ToastTone = 'info' | 'success' | 'error'
 
 type ToastItem = {
@@ -313,10 +330,15 @@ function App() {
   const [installingPluginRuntimeId, setInstallingPluginRuntimeId] = useState<
     string | null
   >(null)
-  const [samPromptDraft, setSamPromptDraft] = useState('')
-  const [samLabelDraft, setSamLabelDraft] = useState('')
-  const [samScoreThresholdDraft, setSamScoreThresholdDraft] = useState('0.25')
-  const [samMaxResultsDraft, setSamMaxResultsDraft] = useState('8')
+  const [samPromptPairs, setSamPromptPairs] = useState<SamPromptPairDraft[]>(
+    () => readStoredSamSettings().entries,
+  )
+  const [samScoreThresholdDraft, setSamScoreThresholdDraft] = useState(
+    () => readStoredSamSettings().scoreThreshold,
+  )
+  const [samMaxResultsDraft, setSamMaxResultsDraft] = useState(
+    () => readStoredSamSettings().maxResults,
+  )
   const [samActionError, setSamActionError] = useState<string | null>(null)
   const [samActionMessage, setSamActionMessage] = useState<string | null>(null)
   const [samActionMessageTone, setSamActionMessageTone] =
@@ -333,6 +355,8 @@ function App() {
     total: number
   } | null>(null)
   const [sessionError, setSessionError] = useState<string | null>(null)
+  const [armedDeleteImageId, setArmedDeleteImageId] = useState<string | null>(null)
+  const [isDeletingCurrentImage, setIsDeletingCurrentImage] = useState(false)
   const [draggedAnnotationId, setDraggedAnnotationId] = useState<string | null>(
     null,
   )
@@ -356,6 +380,7 @@ function App() {
   const pendingHfAuthRefreshRef = useRef(false)
   const callbackCopiedTimeoutRef = useRef<number | null>(null)
   const runtimeInstallLogRef = useRef<HTMLPreElement | null>(null)
+  const deleteImageArmTimeoutRef = useRef<number | null>(null)
   const toastTimeoutsRef = useRef<Record<string, number>>({})
   const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
   const pluginToastKeysRef = useRef<Record<string, string>>({})
@@ -405,13 +430,13 @@ function App() {
   const effectiveActiveLabel = classList.includes(activeLabel)
     ? activeLabel
     : (classList[0] ?? activeLabel)
-  const samSelectedLabel =
-    classList.find((label) => label === samLabelDraft.trim()) ??
-    effectiveActiveLabel
   const samScoreThresholdValue = clampNumericInput(samScoreThresholdDraft, 0.25, {
     min: 0,
     max: 1,
   })
+  const isDatasetSession = persistedSessionState?.sourceKind === 'dataset'
+  const isDeleteImageArmed =
+    currentEntry !== null && armedDeleteImageId === currentEntry.id
   const classUsageCounts = sessionAnnotations.reduce<Record<string, number>>(
     (current, annotation) => {
       current[annotation.label] = (current[annotation.label] ?? 0) + 1
@@ -574,6 +599,7 @@ function App() {
       sessionState?: PersistedSessionState | null
       hotkeys?: HotkeyBindings
       projectClassesByRootPath?: Record<string, string[]>
+      samSettings?: SamSettingsDraft
     },
   ) => {
     if (!appStateSyncReadyRef.current || backendStatus !== 'online') {
@@ -598,6 +624,40 @@ function App() {
       }
 
       return next
+    })
+  }
+
+  const clearDeleteImageArm = () => {
+    if (deleteImageArmTimeoutRef.current !== null) {
+      window.clearTimeout(deleteImageArmTimeoutRef.current)
+      deleteImageArmTimeoutRef.current = null
+    }
+
+    setArmedDeleteImageId(null)
+  }
+
+  const updateSamPromptPair = (
+    index: number,
+    updater: (current: SamPromptPairDraft) => SamPromptPairDraft,
+  ) => {
+    setSamPromptPairs((current) =>
+      current.map((entry, entryIndex) =>
+        entryIndex === index ? updater(entry) : entry,
+      ),
+    )
+  }
+
+  const addSamPromptPair = () => {
+    setSamPromptPairs((current) => [...current, createEmptySamPromptPair()])
+  }
+
+  const removeSamPromptPair = (index: number) => {
+    setSamPromptPairs((current) => {
+      if (current.length <= 1) {
+        return [createEmptySamPromptPair()]
+      }
+
+      return current.filter((_, entryIndex) => entryIndex !== index)
     })
   }
 
@@ -678,6 +738,25 @@ function App() {
   useEffect(() => {
     persistAppStatePatch({ projectClassesByRootPath })
   }, [backendStatus, projectClassesByRootPath])
+
+  useEffect(() => {
+    const nextSamSettings = sanitizeSamSettings({
+      entries: samPromptPairs,
+      scoreThreshold: samScoreThresholdDraft,
+      maxResults: samMaxResultsDraft,
+    })
+
+    try {
+      window.localStorage.setItem(
+        SAM_SETTINGS_STORAGE_KEY,
+        JSON.stringify(nextSamSettings),
+      )
+    } catch {
+      // Ignore storage failures and keep the in-memory state.
+    }
+
+    persistAppStatePatch({ samSettings: nextSamSettings })
+  }, [backendStatus, samMaxResultsDraft, samPromptPairs, samScoreThresholdDraft])
 
   const commitImageResources = (
     updater: (current: Record<string, ImageResource>) => Record<string, ImageResource>,
@@ -808,6 +887,39 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    return () => {
+      if (deleteImageArmTimeoutRef.current !== null) {
+        window.clearTimeout(deleteImageArmTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!armedDeleteImageId) {
+      return
+    }
+
+    if (!currentEntry || currentEntry.id !== armedDeleteImageId) {
+      clearDeleteImageArm()
+      return
+    }
+
+    deleteImageArmTimeoutRef.current = window.setTimeout(() => {
+      deleteImageArmTimeoutRef.current = null
+      setArmedDeleteImageId((current) =>
+        current === armedDeleteImageId ? null : current,
+      )
+    }, DELETE_IMAGE_ARM_DURATION_MS)
+
+    return () => {
+      if (deleteImageArmTimeoutRef.current !== null) {
+        window.clearTimeout(deleteImageArmTimeoutRef.current)
+        deleteImageArmTimeoutRef.current = null
+      }
+    }
+  }, [armedDeleteImageId, currentEntry])
+
   const ensureAnnotationsLoaded = useEffectEvent(async (entry: ImageEntry) => {
     if (!currentSessionId) {
       return
@@ -923,6 +1035,12 @@ function App() {
           setProjectClassesByRootPath(
             coerceProjectClassesByRootPath(appState.projectClassesByRootPath),
           )
+          if (appState.samSettings !== undefined) {
+            const nextSamSettings = coerceSamSettings(appState.samSettings)
+            setSamPromptPairs(nextSamSettings.entries)
+            setSamScoreThresholdDraft(nextSamSettings.scoreThreshold)
+            setSamMaxResultsDraft(nextSamSettings.maxResults)
+          }
         }
 
         setBackendClasses(classes)
@@ -1673,15 +1791,42 @@ function App() {
         return
       }
 
-      const rawPrompt = samPromptDraft.trim()
-      const prompt =
-        rawPrompt ||
-        samLabelDraft.trim() ||
-        effectiveActiveLabel.trim() ||
-        'object'
+      const fallbackTerm = effectiveActiveLabel.trim() || 'object'
+      const configuredPairs = samPromptPairs
+        .map((entry) => {
+          const prompt = entry.prompt.trim()
+          const label = entry.label.trim()
 
-      if (requirePrompt && !rawPrompt) {
-        setSamActionError('Enter a prompt before running SAM auto-annotation.')
+          if (!prompt && !label) {
+            return null
+          }
+
+          return {
+            prompt: prompt || label || fallbackTerm,
+            label: label || fallbackTerm || prompt || 'object',
+          }
+        })
+        .filter(
+          (
+            entry,
+          ): entry is {
+            prompt: string
+            label: string
+          } => entry !== null,
+        )
+      const activePairs =
+        mode === 'selected-box' ? configuredPairs.slice(0, 1) : configuredPairs
+      const pairsToRun =
+        activePairs.length > 0 || requirePrompt
+          ? activePairs
+          : [{ prompt: fallbackTerm, label: fallbackTerm }]
+
+      if (pairsToRun.length === 0) {
+        setSamActionError(
+          mode === 'selected-box'
+            ? 'Add at least one Prompt / Label pair before refining with SAM.'
+            : 'Add at least one Prompt / Label pair before running SAM auto-annotation.',
+        )
         return
       }
 
@@ -1689,8 +1834,6 @@ function App() {
       setSamActionMessage(null)
       setIsRunningSamAction(true)
 
-      const nextLabel =
-        samLabelDraft.trim() || effectiveActiveLabel.trim() || prompt || 'object'
       const scoreThreshold = clampNumericInput(samScoreThresholdDraft, 0.25, {
         min: 0,
         max: 1,
@@ -1703,26 +1846,31 @@ function App() {
       )
 
       try {
-        const result = await runPluginAutoAnnotate('sam-3-1', {
-          sessionId: currentSessionId,
-          imageId: currentEntry.id,
-          prompt,
-          label: nextLabel,
-          mode,
-          region,
-          scoreThreshold,
-          maxResults,
-        })
-
-        if (result.annotations.length === 0) {
-          setSamActionMessageTone('info')
-          setSamActionMessage(emptyMessage)
-          return
-        }
-
         annotationLoadStateRef.current[currentEntry.id] = 'ready'
+        const emptyResultMessage =
+          pairsToRun.length > 1
+            ? 'SAM found no matching objects for the configured prompt list.'
+            : emptyMessage
 
         if (replaceAnnotationId) {
+          const primaryPair = pairsToRun[0]!
+          const result = await runPluginAutoAnnotate('sam-3-1', {
+            sessionId: currentSessionId,
+            imageId: currentEntry.id,
+            prompt: primaryPair.prompt,
+            label: primaryPair.label,
+            mode,
+            region,
+            scoreThreshold,
+            maxResults,
+          })
+
+          if (result.annotations.length === 0) {
+            setSamActionMessageTone('info')
+            setSamActionMessage(emptyResultMessage)
+            return
+          }
+
           const bestMatch = result.annotations[0]!
           setAnnotationsByImage((current) => ({
             ...current,
@@ -1746,7 +1894,32 @@ function App() {
           return
         }
 
-        const nextAnnotations = result.annotations.map((annotation) => ({
+        const collectedAnnotations: PluginAutoAnnotateResult['annotations'] = []
+
+        for (const pair of pairsToRun) {
+          const result = await runPluginAutoAnnotate('sam-3-1', {
+            sessionId: currentSessionId,
+            imageId: currentEntry.id,
+            prompt: pair.prompt,
+            label: pair.label,
+            mode,
+            region,
+            scoreThreshold,
+            maxResults,
+          })
+
+          if (result.annotations.length > 0) {
+            collectedAnnotations.push(...result.annotations)
+          }
+        }
+
+        if (collectedAnnotations.length === 0) {
+          setSamActionMessageTone('info')
+          setSamActionMessage(emptyResultMessage)
+          return
+        }
+
+        const nextAnnotations = collectedAnnotations.map((annotation) => ({
           id: crypto.randomUUID(),
           label: annotation.label,
           color: labelToColor(annotation.label),
@@ -1765,7 +1938,9 @@ function App() {
         setSamActionMessageTone('success')
         setSamActionMessage(
           successMessage ??
-            `SAM added ${nextAnnotations.length} auto-annotation${nextAnnotations.length === 1 ? '' : 's'}.`,
+            (pairsToRun.length > 1
+              ? `SAM added ${nextAnnotations.length} auto-annotation${nextAnnotations.length === 1 ? '' : 's'} from ${pairsToRun.length} prompt/label pair${pairsToRun.length === 1 ? '' : 's'}.`
+              : `SAM added ${nextAnnotations.length} auto-annotation${nextAnnotations.length === 1 ? '' : 's'}.`),
         )
       } catch (error) {
         setSamActionError(
@@ -2202,6 +2377,59 @@ function App() {
     setSelectedId(null)
   }
 
+  const handleDeleteCurrentImage = useEffectEvent(async () => {
+    if (
+      !currentSessionId ||
+      !currentEntry ||
+      !currentSessionRootPath ||
+      !isDatasetSession
+    ) {
+      return
+    }
+
+    if (armedDeleteImageId !== currentEntry.id) {
+      clearDeleteImageArm()
+      setArmedDeleteImageId(currentEntry.id)
+      return
+    }
+
+    const imageToDelete = currentEntry
+    const preferredImageRelativePath =
+      images[currentImageIndex + 1]?.relativePath ??
+      images[currentImageIndex - 1]?.relativePath ??
+      null
+
+    clearDeleteImageArm()
+    setIsDeletingCurrentImage(true)
+    setSessionError(null)
+
+    try {
+      const session = await deleteLocalSessionImage(
+        currentSessionId,
+        imageToDelete.id,
+      )
+
+      applyLocalSession(session, {
+        preferredImageRelativePath,
+      })
+
+      if (!preferredImageRelativePath && isDatasetSession && persistedSessionState) {
+        commitPersistedSessionState({
+          ...persistedSessionState,
+          currentImageRelativePath: null,
+        })
+      }
+
+      pushToast(`Deleted ${imageToDelete.relativePath}.`, 'success')
+    } catch (error) {
+      setSessionError(
+        error instanceof Error ? error.message : 'Failed to delete image',
+      )
+    } finally {
+      setIsDeletingCurrentImage(false)
+    }
+  })
+
   const onGlobalKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (
       hotkeyCaptureTarget ||
@@ -2295,6 +2523,7 @@ function App() {
       annotationFormat: entry.annotationFormat ?? null,
       url: buildLocalImageUrl(sessionId, entry.id),
     }))
+    const nextImageIdSet = new Set(nextImages.map((entry) => entry.id))
     const preferredImageRelativePath =
       options.preferredImageRelativePath ??
       pendingPreferredImageRelativePathRef.current
@@ -2316,17 +2545,31 @@ function App() {
     const initialEntry = nextImages[initialImageIndex] ?? nextImages[0] ?? null
 
     if (currentSessionId === sessionId) {
-      imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
+      imageIdSetRef.current = nextImageIdSet
       setCurrentSessionRootPath(session.rootPath ?? null)
 
       if (
         preferredImageRelativePath &&
-        preferredImageIndex >= 0 &&
-        pendingPreferredImageRelativePathRef.current === preferredImageRelativePath
+        preferredImageIndex >= 0
       ) {
-        pendingPreferredImageRelativePathRef.current = null
+        if (
+          pendingPreferredImageRelativePathRef.current === preferredImageRelativePath
+        ) {
+          pendingPreferredImageRelativePathRef.current = null
+        }
         setCurrentImageEntry(nextImages[preferredImageIndex] ?? null)
       }
+
+      annotationLoadStateRef.current = Object.fromEntries(
+        Object.entries(annotationLoadStateRef.current).filter(([imageId]) =>
+          nextImageIdSet.has(imageId),
+        ),
+      )
+      imageResourcesRef.current = Object.fromEntries(
+        Object.entries(imageResourcesRef.current).filter(([imageId]) =>
+          nextImageIdSet.has(imageId),
+        ),
+      )
 
       startTransition(() => {
         setImages((current) => {
@@ -2350,6 +2593,16 @@ function App() {
             null
           )
         })
+        setImageResources((current) =>
+          Object.fromEntries(
+            Object.entries(current).filter(([imageId]) => nextImageIdSet.has(imageId)),
+          ),
+        )
+        setAnnotationsByImage((current) =>
+          Object.fromEntries(
+            Object.entries(current).filter(([imageId]) => nextImageIdSet.has(imageId)),
+          ),
+        )
         setSessionLabel(nextSessionLabel)
         setSessionError(null)
       })
@@ -2357,7 +2610,7 @@ function App() {
     }
 
     sessionVersionRef.current += 1
-    imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
+    imageIdSetRef.current = nextImageIdSet
     pendingLoadsRef.current = {}
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
@@ -2937,6 +3190,57 @@ function App() {
                       onSelectIndex={selectImageIndex}
                     />
                   ) : null}
+                  {isDatasetSession && currentEntry ? (
+                    <AppButton
+                      variant="menu-trigger"
+                      className={[
+                        'dataset-delete-image-button',
+                        isDeleteImageArmed ? 'is-armed' : '',
+                        isDeletingCurrentImage ? 'is-working' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')}
+                      onClick={() => void handleDeleteCurrentImage()}
+                      disabled={isDeletingCurrentImage || isOpeningSession}
+                      title={
+                        isDeletingCurrentImage
+                          ? `Deleting ${currentEntry.relativePath}`
+                          : isDeleteImageArmed
+                          ? `Delete ${currentEntry.relativePath}`
+                          : `Arm delete for ${currentEntry.relativePath}`
+                      }
+                    >
+                      <span className="dataset-delete-image-copy">
+                        <span className="dataset-delete-image-title">
+                          {isDeletingCurrentImage
+                            ? 'Deleting image...'
+                            : isDeleteImageArmed
+                              ? 'Click again to delete'
+                              : 'Delete current image'}
+                        </span>
+                        <span className="dataset-delete-image-subtitle">
+                          {isDeleteImageArmed
+                            ? 'Armed for 3 seconds'
+                            : 'Two-step delete confirmation'}
+                        </span>
+                      </span>
+                      <span className="dataset-delete-image-indicator" aria-hidden="true">
+                        {isDeleteImageArmed ? (
+                          <svg viewBox="0 0 24 24" className="dataset-delete-image-ring">
+                            <circle cx="12" cy="12" r="9" />
+                            <circle
+                              cx="12"
+                              cy="12"
+                              r="9"
+                              className="dataset-delete-image-ring-progress"
+                            />
+                          </svg>
+                        ) : (
+                          <span className="dataset-delete-image-dot" />
+                        )}
+                      </span>
+                    </AppButton>
+                  ) : null}
                 </section>
 
                 <section className="panel-section">
@@ -3118,17 +3422,6 @@ function App() {
               <div className="sidebar-plugins-view">
                 <div className="sidebar-plugins-toolbar">
                   <p className="section-kicker">Plugins</p>
-                  <AppButton
-                    variant="ghost"
-                    className="class-manager-close"
-                    onClick={() => {
-                      void refreshPlugins()
-                      void refreshHfAuthStatus()
-                    }}
-                    disabled={backendStatus !== 'online' || downloadingPluginId !== null}
-                  >
-                    Refresh
-                  </AppButton>
                 </div>
 
                 {plugins.length > 0 ? (
@@ -3161,48 +3454,98 @@ function App() {
                           </div>
                         </div>
 
-                        <label className="hf-auth-field">
-                          <span className="plugin-detail-label">Prompt</span>
-                          <input
-                            className="class-manager-input"
-                            type="text"
-                            value={samPromptDraft}
-                            onChange={(event) => setSamPromptDraft(event.target.value)}
-                            placeholder="person, red car, traffic light"
-                            autoComplete="off"
-                          />
-                        </label>
+                        <div className="sam-prompt-list" aria-label="SAM prompt and label pairs">
+                          {samPromptPairs.map((entry, index) => {
+                            const trimmedLabel = entry.label.trim()
+                            const usesClassSelect =
+                              classList.length > 0 &&
+                              (trimmedLabel === '' || classList.includes(trimmedLabel))
+
+                            return (
+                              <div
+                                key={`sam-prompt-pair-${index}`}
+                                className="sam-prompt-row"
+                              >
+                                <label className="hf-auth-field sam-prompt-field">
+                                  <span className="plugin-detail-label">
+                                    Prompt {index + 1}
+                                  </span>
+                                  <input
+                                    className="class-manager-input"
+                                    type="text"
+                                    value={entry.prompt}
+                                    onChange={(event) =>
+                                      updateSamPromptPair(index, (current) => ({
+                                        ...current,
+                                        prompt: event.target.value,
+                                      }))
+                                    }
+                                    placeholder="person, red car, traffic light"
+                                    autoComplete="off"
+                                  />
+                                </label>
+                                <label className="hf-auth-field sam-prompt-field">
+                                  <span className="plugin-detail-label">Label</span>
+                                  {usesClassSelect ? (
+                                    <select
+                                      className="class-manager-input sam-label-select"
+                                      value={trimmedLabel}
+                                      onChange={(event) =>
+                                        updateSamPromptPair(index, (current) => ({
+                                          ...current,
+                                          label: event.target.value,
+                                        }))
+                                      }
+                                    >
+                                      <option value="">Use prompt / active class</option>
+                                      {classList.map((label) => (
+                                        <option key={label} value={label}>
+                                          {label}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <input
+                                      className="class-manager-input"
+                                      type="text"
+                                      value={entry.label}
+                                      onChange={(event) =>
+                                        updateSamPromptPair(index, (current) => ({
+                                          ...current,
+                                          label: event.target.value,
+                                        }))
+                                      }
+                                      placeholder={effectiveActiveLabel || 'object'}
+                                      autoComplete="off"
+                                    />
+                                  )}
+                                </label>
+                                <AppButton
+                                  variant="ghost"
+                                  className="sam-prompt-row-remove"
+                                  onClick={() => removeSamPromptPair(index)}
+                                  title={
+                                    samPromptPairs.length > 1
+                                      ? `Remove prompt ${index + 1}`
+                                      : 'Clear prompt and label'
+                                  }
+                                >
+                                  {samPromptPairs.length > 1 ? 'Remove' : 'Clear'}
+                                </AppButton>
+                              </div>
+                            )
+                          })}
+                        </div>
+
+                        <AppButton
+                          variant="menu-trigger"
+                          className="sam-prompt-add-button"
+                          onClick={addSamPromptPair}
+                        >
+                          Add prompt
+                        </AppButton>
 
                         <div className="hf-auth-config-grid">
-                          <label className="hf-auth-field">
-                            <span className="plugin-detail-label">Label</span>
-                            {classList.length > 0 ? (
-                              <select
-                                className="class-manager-input sam-label-select"
-                                value={samSelectedLabel}
-                                onChange={(event) =>
-                                  setSamLabelDraft(event.target.value)
-                                }
-                              >
-                                {classList.map((label) => (
-                                  <option key={label} value={label}>
-                                    {label}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : (
-                              <input
-                                className="class-manager-input"
-                                type="text"
-                                value={samLabelDraft}
-                                onChange={(event) =>
-                                  setSamLabelDraft(event.target.value)
-                                }
-                                placeholder={effectiveActiveLabel || 'object'}
-                                autoComplete="off"
-                              />
-                            )}
-                          </label>
                           <label className="hf-auth-field">
                             <span className="plugin-field-header">
                               <span className="plugin-detail-label">
@@ -3250,7 +3593,9 @@ function App() {
                           </p>
                         ) : (
                           <p className="plugin-manager-note">
-                            Select a box to enable box-guided refinement.
+                            Select a box to enable box-guided refinement. Image
+                            auto-annotation uses every filled Prompt / Label pair,
+                            while box refinement uses the first filled pair.
                           </p>
                         )}
 
@@ -4528,6 +4873,75 @@ function formatPluginInstallDate(value?: string | null) {
   return parsed.toLocaleString()
 }
 
+function createEmptySamPromptPair(): SamPromptPairDraft {
+  return {
+    prompt: '',
+    label: '',
+  }
+}
+
+function buildDefaultSamSettings(): SamSettingsDraft {
+  return {
+    entries: [createEmptySamPromptPair()],
+    scoreThreshold: DEFAULT_SAM_SCORE_THRESHOLD,
+    maxResults: DEFAULT_SAM_MAX_RESULTS,
+  }
+}
+
+function normalizeSamPromptPairs(value: unknown): SamPromptPairDraft[] {
+  if (!Array.isArray(value)) {
+    return [createEmptySamPromptPair()]
+  }
+
+  const normalized = value
+    .filter((entry): entry is Record<string, unknown> => {
+      return typeof entry === 'object' && entry !== null
+    })
+    .map((entry) => ({
+      prompt: typeof entry.prompt === 'string' ? entry.prompt : '',
+      label: typeof entry.label === 'string' ? entry.label : '',
+    }))
+
+  return normalized.length > 0 ? normalized : [createEmptySamPromptPair()]
+}
+
+function coerceSamSettings(value: unknown): SamSettingsDraft {
+  const defaults = buildDefaultSamSettings()
+
+  if (typeof value !== 'object' || value === null) {
+    return defaults
+  }
+
+  const record = value as Record<string, unknown>
+  return {
+    entries: normalizeSamPromptPairs(record.entries),
+    scoreThreshold:
+      typeof record.scoreThreshold === 'string' &&
+      record.scoreThreshold.trim() !== ''
+        ? record.scoreThreshold
+        : defaults.scoreThreshold,
+    maxResults:
+      typeof record.maxResults === 'string' && record.maxResults.trim() !== ''
+        ? record.maxResults
+        : defaults.maxResults,
+  }
+}
+
+function sanitizeSamSettings(value: SamSettingsDraft): SamSettingsDraft {
+  return {
+    entries: normalizeSamPromptPairs(value.entries),
+    scoreThreshold:
+      typeof value.scoreThreshold === 'string' &&
+      value.scoreThreshold.trim() !== ''
+        ? value.scoreThreshold
+        : DEFAULT_SAM_SCORE_THRESHOLD,
+    maxResults:
+      typeof value.maxResults === 'string' && value.maxResults.trim() !== ''
+        ? value.maxResults
+        : DEFAULT_SAM_MAX_RESULTS,
+  }
+}
+
 function readStoredSidebarVisibility() {
   if (typeof window === 'undefined') {
     return true
@@ -4590,6 +5004,23 @@ function readStoredHotkeyBindings(): HotkeyBindings {
     return coerceHotkeyBindings(JSON.parse(raw) as unknown)
   } catch {
     return buildDefaultHotkeyBindings()
+  }
+}
+
+function readStoredSamSettings(): SamSettingsDraft {
+  if (typeof window === 'undefined') {
+    return buildDefaultSamSettings()
+  }
+
+  try {
+    const raw = window.localStorage.getItem(SAM_SETTINGS_STORAGE_KEY)
+    if (!raw) {
+      return buildDefaultSamSettings()
+    }
+
+    return coerceSamSettings(JSON.parse(raw) as unknown)
+  } catch {
+    return buildDefaultSamSettings()
   }
 }
 
