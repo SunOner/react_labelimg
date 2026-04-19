@@ -26,6 +26,10 @@ type AnnotationViewportProps = {
   annotations: Annotation[]
   selectedId: string | null
   draftRect: Rect | null
+  tool: 'draw' | 'sam-click' | 'sam-box'
+  showSamTools: boolean
+  isSamBusy: boolean
+  onSelectTool: (tool: 'draw' | 'sam-click' | 'sam-box') => void
   onOpenDataset: () => void
   recentDatasets: Array<{ path: string; label: string }>
   onOpenRecentDataset: (path: string) => void
@@ -76,6 +80,10 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   annotations,
   selectedId,
   draftRect,
+  tool,
+  showSamTools,
+  isSamBusy,
+  onSelectTool,
   onOpenDataset,
   recentDatasets,
   onOpenRecentDataset,
@@ -266,6 +274,16 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const canZoomOut = zoom > MIN_ZOOM
   const canZoomIn = zoom < MAX_ZOOM
   const zoomLabel = `${Math.round(zoom * 100)}%`
+  const isDrawTool = tool === 'draw'
+  const canUseSamBox = tool === 'sam-box' && !isSamBusy
+  const overlayClassName = [
+    'viewport-overlay',
+    isPanning ? 'is-panning' : '',
+    tool === 'sam-click' ? 'is-sam-click' : '',
+    tool === 'sam-box' ? 'is-sam-box' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
 
   if (!image) {
     const emptyStateLabel = isLoading
@@ -411,6 +429,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const handleOverlayPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     const stagePoint = stagePointFromEvent(event)
     const point = pointFromEvent(event, image, stageImagePlacement, 'strict')
+    const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
     const hitCandidates =
       stagePoint
         ? getAnnotationCandidatesAtStagePoint(
@@ -450,20 +469,47 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       return
     }
 
-    if (!point) {
-      selectionCycleRef.current = null
-      return
-    }
-
     event.preventDefault()
     setContextMenu(null)
 
+    if (!isDrawTool) {
+      selectionCycleRef.current = null
+
+      if (tool === 'sam-click') {
+        if (!point) {
+          return
+        }
+
+        onStartDrawing(point)
+        return
+      }
+
+      if (canUseSamBox) {
+        if (!clampedPoint) {
+          return
+        }
+
+        event.currentTarget.setPointerCapture(event.pointerId)
+        onStartDrawing(point ?? clampedPoint)
+      }
+      return
+    }
+
     if (hitAnnotation) {
+      if (!stagePoint) {
+        return
+      }
+
       selectionCycleRef.current = {
-        point: stagePoint ?? point,
+        point: stagePoint,
         candidateIds: hitCandidates.map((candidate) => candidate.id),
       }
       onSelectAnnotation(hitAnnotation.id)
+
+      if (!point) {
+        return
+      }
+
       interactionRef.current = {
         kind: 'move',
         annotationId: hitAnnotation.id,
@@ -478,13 +524,22 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       return
     }
 
+    if (!clampedPoint) {
+      selectionCycleRef.current = null
+      return
+    }
+
     selectionCycleRef.current = null
     event.currentTarget.setPointerCapture(event.pointerId)
-    onStartDrawing(point)
+    onStartDrawing(point ?? clampedPoint)
   }
 
   const handleOverlayPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (interactionRef.current?.kind === 'pan') {
+      return
+    }
+
+    if (tool === 'sam-click') {
       return
     }
 
@@ -498,6 +553,10 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       }
       interactionRef.current = null
       setIsPanning(false)
+      return
+    }
+
+    if (tool === 'sam-click') {
       return
     }
 
@@ -579,57 +638,107 @@ export const AnnotationViewport = memo(function AnnotationViewport({
         </div>
       </div>
 
-      <div
-        ref={setStageViewportNode}
-        className="viewport-scroll"
-        onWheel={handleViewportWheel}
-        onContextMenu={(event) => event.preventDefault()}
-      >
-        <div
-          className="viewport-stage-shell"
-          style={{
-            width: `${shellWidth}px`,
-            height: `${shellHeight}px`,
-            transform: `translate3d(${shellTranslateX}px, ${shellTranslateY}px, 0)`,
-          }}
-        >
-          <svg
-            className="viewport-stage"
-            viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
-            preserveAspectRatio="xMidYMid meet"
+      <div className="viewport-body">
+        <div className="viewport-tools" aria-label="Viewport tools">
+          <button
+            type="button"
+            className={tool === 'draw' ? 'viewport-tool is-active' : 'viewport-tool'}
+            onClick={() => onSelectTool('draw')}
+            title="Draw new box"
+            aria-label="Draw new box"
           >
-            <rect
-              className="viewport-image-frame"
-              x={stageImagePlacement.x}
-              y={stageImagePlacement.y}
-              width={stageImagePlacement.width}
-              height={stageImagePlacement.height}
-            />
-            <image
-              className="viewport-image"
-              href={image.url}
-              x={stageImagePlacement.x}
-              y={stageImagePlacement.y}
-              width={stageImagePlacement.width}
-              height={stageImagePlacement.height}
-              preserveAspectRatio="none"
-            />
-          </svg>
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <rect x="4" y="4" width="12" height="12" rx="1.5" />
+              <path d="M10 2.5v3M10 14.5v3M2.5 10h3M14.5 10h3" />
+            </svg>
+          </button>
+          {showSamTools ? (
+            <>
+              <button
+                type="button"
+                className={
+                  tool === 'sam-click' ? 'viewport-tool is-active' : 'viewport-tool'
+                }
+                onClick={() => onSelectTool('sam-click')}
+                title="SAM click select"
+                aria-label="SAM click select"
+                disabled={isSamBusy}
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <circle cx="10" cy="10" r="4.25" />
+                  <path d="M10 2.5v3M10 14.5v3M2.5 10h3M14.5 10h3" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                className={
+                  tool === 'sam-box' ? 'viewport-tool is-active' : 'viewport-tool'
+                }
+                onClick={() => onSelectTool('sam-box')}
+                title="SAM box select"
+                aria-label="SAM box select"
+                disabled={isSamBusy}
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true">
+                  <rect x="4.25" y="4.25" width="11.5" height="11.5" rx="1.5" />
+                  <path d="M2.5 6.5h3M14.5 13.5h3M6.5 2.5v3M13.5 14.5v3" />
+                </svg>
+              </button>
+            </>
+          ) : null}
+        </div>
 
-          <svg
-            ref={overlayRef}
-            className={isPanning ? 'viewport-overlay is-panning' : 'viewport-overlay'}
-            viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
-            preserveAspectRatio="xMidYMid meet"
-            shapeRendering="geometricPrecision"
-            textRendering="geometricPrecision"
-            onPointerDown={handleOverlayPointerDown}
-            onPointerMove={handleOverlayPointerMove}
-            onPointerUp={handleOverlayPointerUp}
-            onPointerCancel={handleOverlayPointerUp}
-            onContextMenu={handleOverlayContextMenu}
+        <div
+          ref={setStageViewportNode}
+          className="viewport-scroll"
+          onWheel={handleViewportWheel}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div
+            className="viewport-stage-shell"
+            style={{
+              width: `${shellWidth}px`,
+              height: `${shellHeight}px`,
+              transform: `translate3d(${shellTranslateX}px, ${shellTranslateY}px, 0)`,
+            }}
           >
-            {annotationGeometries.map((geometry) => {
+            <svg
+              className="viewport-stage"
+              viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
+              preserveAspectRatio="xMidYMid meet"
+            >
+              <rect
+                className="viewport-image-frame"
+                x={stageImagePlacement.x}
+                y={stageImagePlacement.y}
+                width={stageImagePlacement.width}
+                height={stageImagePlacement.height}
+              />
+              <image
+                className="viewport-image"
+                href={image.url}
+                x={stageImagePlacement.x}
+                y={stageImagePlacement.y}
+                width={stageImagePlacement.width}
+                height={stageImagePlacement.height}
+                preserveAspectRatio="none"
+              />
+            </svg>
+
+            <svg
+              ref={overlayRef}
+              className={overlayClassName}
+              viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
+              preserveAspectRatio="xMidYMid meet"
+              shapeRendering="geometricPrecision"
+              textRendering="geometricPrecision"
+              onPointerDown={handleOverlayPointerDown}
+              onPointerMove={handleOverlayPointerMove}
+              onPointerUp={handleOverlayPointerUp}
+              onPointerCancel={handleOverlayPointerUp}
+              onContextMenu={handleOverlayContextMenu}
+            >
+              {annotationGeometries.map((geometry) => {
               const { annotation, stageRect, labelRect } = geometry
               const isSelected = annotation.id === selectedId
               const connector = getLabelConnector(labelRect, stageRect)
@@ -681,7 +790,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                       {annotation.label || 'object'}
                     </text>
                   </g>
-                  {isSelected
+                  {isDrawTool && isSelected
                     ? buildResizeHandles(stageRect).map((handle) => (
                         <circle
                           key={handle.id}
@@ -745,106 +854,107 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               )
             })}
 
-            {draftRect ? (
-              <rect
-                className="bbox-rect is-draft"
-                x={stageImagePlacement.x + draftRect.x * stageImagePlacement.scale}
-                y={stageImagePlacement.y + draftRect.y * stageImagePlacement.scale}
-                width={draftRect.width * stageImagePlacement.scale}
-                height={draftRect.height * stageImagePlacement.scale}
-                stroke="var(--accent)"
-                fill="rgba(54, 95, 72, 0.12)"
-                pointerEvents="none"
-              />
-            ) : null}
-          </svg>
-        </div>
-        {contextMenu && contextMenuPosition ? (
-          <div
-            ref={contextMenuRef}
-            className="annotation-context-menu"
-            style={contextMenuPosition}
-            role="menu"
-            aria-label="Annotation options"
-          >
-            <div className="annotation-context-title">Options</div>
-            <button
-              type="button"
-              className="annotation-context-action"
-              onClick={() => {
-                onDeleteAnnotation(contextMenu.annotationId)
-                setContextMenu(null)
-              }}
-            >
-              <span className="annotation-context-icon" aria-hidden="true">
-                <svg viewBox="0 0 16 16" fill="none">
-                  <path
-                    d="M3.5 4.5h9"
-                    stroke="currentColor"
-                    strokeWidth="1.35"
-                    strokeLinecap="round"
-                  />
-                  <path
-                    d="M6 2.75h4"
-                    stroke="currentColor"
-                    strokeWidth="1.35"
-                    strokeLinecap="round"
-                  />
-                  <path
-                    d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
-                    stroke="currentColor"
-                    strokeWidth="1.35"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                  <path
-                    d="M6.75 6.5v4"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeLinecap="round"
-                  />
-                  <path
-                    d="M9.25 6.5v4"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeLinecap="round"
-                  />
-                </svg>
-              </span>
-              <span>Delete box</span>
-            </button>
-            <button
-              type="button"
-              className="annotation-context-action"
-              onClick={() => {
-                onDuplicateAnnotation(contextMenu.annotationId)
-                setContextMenu(null)
-              }}
-            >
-              <span className="annotation-context-icon" aria-hidden="true">
-                <svg viewBox="0 0 16 16" fill="none">
-                  <rect
-                    x="5.25"
-                    y="5.25"
-                    width="7"
-                    height="7"
-                    rx="1.25"
-                    stroke="currentColor"
-                    strokeWidth="1.35"
-                  />
-                  <path
-                    d="M3.75 10.75h-.5c-.55 0-1-.45-1-1v-6.5c0-.55.45-1 1-1h6.5c.55 0 1 .45 1 1v.5"
-                    stroke="currentColor"
-                    strokeWidth="1.35"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </span>
-              <span>Duplicate box</span>
-            </button>
+              {draftRect ? (
+                <rect
+                  className="bbox-rect is-draft"
+                  x={stageImagePlacement.x + draftRect.x * stageImagePlacement.scale}
+                  y={stageImagePlacement.y + draftRect.y * stageImagePlacement.scale}
+                  width={draftRect.width * stageImagePlacement.scale}
+                  height={draftRect.height * stageImagePlacement.scale}
+                  stroke="var(--accent)"
+                  fill="rgba(54, 95, 72, 0.12)"
+                  pointerEvents="none"
+                />
+              ) : null}
+            </svg>
           </div>
-        ) : null}
+          {contextMenu && contextMenuPosition ? (
+            <div
+              ref={contextMenuRef}
+              className="annotation-context-menu"
+              style={contextMenuPosition}
+              role="menu"
+              aria-label="Annotation options"
+            >
+              <div className="annotation-context-title">Options</div>
+              <button
+                type="button"
+                className="annotation-context-action"
+                onClick={() => {
+                  onDeleteAnnotation(contextMenu.annotationId)
+                  setContextMenu(null)
+                }}
+              >
+                <span className="annotation-context-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none">
+                    <path
+                      d="M3.5 4.5h9"
+                      stroke="currentColor"
+                      strokeWidth="1.35"
+                      strokeLinecap="round"
+                    />
+                    <path
+                      d="M6 2.75h4"
+                      stroke="currentColor"
+                      strokeWidth="1.35"
+                      strokeLinecap="round"
+                    />
+                    <path
+                      d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                      stroke="currentColor"
+                      strokeWidth="1.35"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M6.75 6.5v4"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                      strokeLinecap="round"
+                    />
+                    <path
+                      d="M9.25 6.5v4"
+                      stroke="currentColor"
+                      strokeWidth="1.2"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </span>
+                <span>Delete box</span>
+              </button>
+              <button
+                type="button"
+                className="annotation-context-action"
+                onClick={() => {
+                  onDuplicateAnnotation(contextMenu.annotationId)
+                  setContextMenu(null)
+                }}
+              >
+                <span className="annotation-context-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none">
+                    <rect
+                      x="5.25"
+                      y="5.25"
+                      width="7"
+                      height="7"
+                      rx="1.25"
+                      stroke="currentColor"
+                      strokeWidth="1.35"
+                    />
+                    <path
+                      d="M3.75 10.75h-.5c-.55 0-1-.45-1-1v-6.5c0-.55.45-1 1-1h6.5c.55 0 1 .45 1 1v.5"
+                      stroke="currentColor"
+                      strokeWidth="1.35"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </span>
+                <span>Duplicate box</span>
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
     </section>
   )
@@ -1651,8 +1761,12 @@ function areAnnotationViewportPropsEqual(
     previousProps.annotations === nextProps.annotations &&
     previousProps.selectedId === nextProps.selectedId &&
     areRectsEqual(previousProps.draftRect, nextProps.draftRect) &&
+    previousProps.tool === nextProps.tool &&
+    previousProps.showSamTools === nextProps.showSamTools &&
+    previousProps.isSamBusy === nextProps.isSamBusy &&
     previousProps.recentDatasets === nextProps.recentDatasets &&
     previousProps.openDatasetDisabled === nextProps.openDatasetDisabled &&
+    previousProps.onSelectTool === nextProps.onSelectTool &&
     previousProps.onOpenDataset === nextProps.onOpenDataset &&
     previousProps.onOpenRecentDataset === nextProps.onOpenRecentDataset &&
     previousProps.onRemoveRecentDataset === nextProps.onRemoveRecentDataset &&

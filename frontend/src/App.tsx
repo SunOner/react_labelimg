@@ -13,18 +13,31 @@ import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { MenuItemButton } from './components/ui/MenuItemButton'
 import {
   buildLocalImageUrl,
+  downloadPluginModel,
   fetchAppState,
   fetchApiHealth,
+  fetchHuggingFaceAuthStatus,
   fetchLocalAnnotations,
   fetchLocalSessionJob,
-  openLocalDirectoryPathJob,
+  fetchPlugins,
   fetchPredefinedClasses,
+  installPluginRuntime,
+  logoutHuggingFaceAuth,
   openLocalDirectory,
   openLocalImage,
   openLocalImagePath,
+  openLocalDirectoryPathJob,
+  runPluginAutoAnnotate,
+  startHuggingFaceAuth,
+  updateHuggingFaceAuthConfig,
   updateAppState,
+  type HuggingFaceAuthStatus,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
+  type PluginDownloadState,
+  type PluginInfo,
+  type PluginRuntimeInstallState,
+  type PluginRuntimeInstallProfile,
 } from './lib/api'
 import {
   MIN_BOX_SIZE,
@@ -45,12 +58,16 @@ import type {
   Rect,
 } from './types'
 
+type ViewportTool = 'draw' | 'sam-click' | 'sam-box'
+
 const PRELOAD_RADIUS = 1
 const SIDEBAR_VISIBILITY_STORAGE_KEY = 'labelimg.sidebarVisible'
 const RECENT_DATASETS_STORAGE_KEY = 'labelimg.recentDatasets'
 const SESSION_STATE_STORAGE_KEY = 'labelimg.sessionState'
 const HOTKEY_BINDINGS_STORAGE_KEY = 'labelimg.hotkeys'
 const MAX_RECENT_DATASETS = 6
+const HUGGING_FACE_OAUTH_APP_URL =
+  'https://huggingface.co/settings/applications/new'
 const HOTKEY_SECTION_ORDER = [
   'Session',
   'Navigation',
@@ -225,6 +242,7 @@ function App() {
   const [isSidebarVisible, setIsSidebarVisible] = useState(
     readStoredSidebarVisibility,
   )
+  const [sidebarView, setSidebarView] = useState<'main' | 'plugins'>('main')
   const [recentDatasets, setRecentDatasets] = useState(readStoredRecentDatasets)
   const [persistedSessionState, setPersistedSessionState] = useState<
     PersistedSessionState | null
@@ -234,13 +252,18 @@ function App() {
   const [drawStart, setDrawStart] = useState<Point | null>(null)
   const [activeLabel, setActiveLabel] = useState('object')
   const [openMenu, setOpenMenu] = useState<
-    'file' | 'annotation' | 'export' | 'settings' | null
+    'file' | 'annotation' | 'export' | 'plugins' | 'settings' | null
   >(null)
   const [backendStatus, setBackendStatus] = useState<
     'checking' | 'online' | 'offline'
   >('checking')
   const [backendClasses, setBackendClasses] = useState<string[]>([])
-  const [customClasses, setCustomClasses] = useState<string[]>([])
+  const [currentSessionRootPath, setCurrentSessionRootPath] = useState<
+    string | null
+  >(null)
+  const [projectClassesByRootPath, setProjectClassesByRootPath] = useState<
+    Record<string, string[]>
+  >({})
   const [hotkeyBindings, setHotkeyBindings] = useState<HotkeyBindings>(
     readStoredHotkeyBindings,
   )
@@ -250,9 +273,38 @@ function App() {
     useState<ConfirmDialogState | null>(null)
   const [isClassManagerOpen, setIsClassManagerOpen] = useState(false)
   const [isHotkeysOpen, setIsHotkeysOpen] = useState(false)
+  const [isPluginsOpen, setIsPluginsOpen] = useState(false)
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
+  const [plugins, setPlugins] = useState<PluginInfo[]>([])
+  const [pluginsError, setPluginsError] = useState<string | null>(null)
+  const [selectedPluginTabId, setSelectedPluginTabId] = useState<string | null>(
+    null,
+  )
+  const [hfAuthStatus, setHfAuthStatus] = useState<HuggingFaceAuthStatus | null>(
+    null,
+  )
+  const [hfClientIdDraft, setHfClientIdDraft] = useState('')
+  const [isHfClientIdVisible, setIsHfClientIdVisible] = useState(false)
+  const [hfAuthError, setHfAuthError] = useState<string | null>(null)
+  const [isStartingHfAuth, setIsStartingHfAuth] = useState(false)
+  const [isSavingHfConfig, setIsSavingHfConfig] = useState(false)
+  const [isCallbackCopied, setIsCallbackCopied] = useState(false)
+  const [downloadingPluginId, setDownloadingPluginId] = useState<string | null>(
+    null,
+  )
+  const [installingPluginRuntimeId, setInstallingPluginRuntimeId] = useState<
+    string | null
+  >(null)
+  const [samPromptDraft, setSamPromptDraft] = useState('')
+  const [samLabelDraft, setSamLabelDraft] = useState('')
+  const [samScoreThresholdDraft, setSamScoreThresholdDraft] = useState('0.25')
+  const [samMaxResultsDraft, setSamMaxResultsDraft] = useState('8')
+  const [samActionError, setSamActionError] = useState<string | null>(null)
+  const [samActionMessage, setSamActionMessage] = useState<string | null>(null)
+  const [isRunningSamAction, setIsRunningSamAction] = useState(false)
+  const [viewportTool, setViewportTool] = useState<ViewportTool>('draw')
   const [isOpeningSession, setIsOpeningSession] = useState(false)
   const [openingTarget, setOpeningTarget] = useState<'image' | 'dataset' | null>(
     null,
@@ -281,6 +333,10 @@ function App() {
   const sessionVersionRef = useRef(0)
   const restoreAttemptedRef = useRef(false)
   const isMountedRef = useRef(true)
+  const hfAuthPopupRef = useRef<Window | null>(null)
+  const pendingHfAuthRefreshRef = useRef(false)
+  const callbackCopiedTimeoutRef = useRef<number | null>(null)
+  const runtimeInstallLogRef = useRef<HTMLPreElement | null>(null)
 
   const currentImageIndex =
     currentImageEntry !== null
@@ -307,10 +363,33 @@ function App() {
     ? annotationsByImage[currentEntry.id] ?? []
     : []
   const sessionAnnotations = Object.values(annotationsByImage).flat()
+  const selectedAnnotation =
+    selectedId !== null
+      ? annotations.find((annotation) => annotation.id === selectedId) ?? null
+      : null
+  const hasStoredProjectClasses =
+    currentSessionRootPath !== null
+      ? Object.prototype.hasOwnProperty.call(
+          projectClassesByRootPath,
+          currentSessionRootPath,
+        )
+      : false
+  const projectClasses =
+    currentSessionRootPath !== null && hasStoredProjectClasses
+      ? (projectClassesByRootPath[currentSessionRootPath] ?? [])
+      : backendClasses
   const annotationClassList = buildClassList(sessionAnnotations)
-  const classList = [
-    ...new Set([...backendClasses, ...customClasses, ...annotationClassList]),
-  ]
+  const classList = [...new Set([...projectClasses, ...annotationClassList])]
+  const effectiveActiveLabel = classList.includes(activeLabel)
+    ? activeLabel
+    : (classList[0] ?? activeLabel)
+  const samSelectedLabel =
+    classList.find((label) => label === samLabelDraft.trim()) ??
+    effectiveActiveLabel
+  const samScoreThresholdValue = clampNumericInput(samScoreThresholdDraft, 0.25, {
+    min: 0,
+    max: 1,
+  })
   const classUsageCounts = sessionAnnotations.reduce<Record<string, number>>(
     (current, annotation) => {
       current[annotation.label] = (current[annotation.label] ?? 0) + 1
@@ -343,6 +422,58 @@ function App() {
     title: sectionTitle,
     items: HOTKEY_ACTIONS.filter((action) => action.section === sectionTitle),
   }))
+  const selectedPlugin =
+    plugins.find((plugin) => plugin.id === selectedPluginTabId) ??
+    plugins[0] ??
+    null
+  const samPlugin = plugins.find((plugin) => plugin.id === 'sam-3-1') ?? null
+  const isSamInteractiveReady =
+    samPlugin !== null &&
+    samPlugin.model.isInstalled &&
+    samPlugin.runtime.status === 'ready'
+  const isAnyPluginRuntimeInstallRunning =
+    installingPluginRuntimeId !== null ||
+    plugins.some(
+      (plugin) => getPluginRuntimeInstallState(plugin).status === 'running',
+    )
+  const refreshPlugins = useEffectEvent(async (signal?: AbortSignal) => {
+    try {
+      const nextPlugins = await fetchPlugins(signal)
+      setPlugins(nextPlugins)
+      setPluginsError(null)
+    } catch (error) {
+      if (signal?.aborted) {
+        return
+      }
+
+      setPluginsError(
+        error instanceof Error ? error.message : 'Failed to load plugins',
+      )
+    }
+  })
+  const refreshHfAuthStatus = useEffectEvent(async (signal?: AbortSignal) => {
+    try {
+      const nextStatus = await fetchHuggingFaceAuthStatus(signal)
+      setHfAuthStatus(nextStatus)
+      setHfClientIdDraft(nextStatus.clientId ?? '')
+      setHfAuthError(null)
+    } catch (error) {
+      if (signal?.aborted) {
+        return
+      }
+
+      setHfAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to load Hugging Face auth status',
+      )
+    }
+  })
+  const refreshAfterHfConnect = useEffectEvent(() => {
+    setHfAuthError(null)
+    void refreshHfAuthStatus()
+    void refreshPlugins()
+  })
   const matchesHotkeyAction = useEffectEvent((
     event: KeyboardEvent,
     actionId: HotkeyActionId,
@@ -361,6 +492,7 @@ function App() {
       recentDatasets?: RecentDataset[]
       sessionState?: PersistedSessionState | null
       hotkeys?: HotkeyBindings
+      projectClassesByRootPath?: Record<string, string[]>
     },
   ) => {
     if (!appStateSyncReadyRef.current || backendStatus !== 'online') {
@@ -386,6 +518,24 @@ function App() {
 
       return next
     })
+  }
+
+  const updateCurrentProjectClasses = (
+    updater: (current: string[]) => string[],
+  ) => {
+    if (!currentSessionRootPath) {
+      return
+    }
+
+    const nextProjectClasses = sanitizeClassList(updater(projectClasses))
+
+    setProjectClassesByRootPath((current) => ({
+      ...current,
+      [currentSessionRootPath]: nextProjectClasses,
+    }))
+    setAnnotationsByImage((current) =>
+      remapProjectClassAliasesInImageMap(current, nextProjectClasses),
+    )
   }
 
   useEffect(() => {
@@ -444,6 +594,10 @@ function App() {
     persistAppStatePatch({ hotkeys: hotkeyBindings })
   }, [backendStatus, hotkeyBindings])
 
+  useEffect(() => {
+    persistAppStatePatch({ projectClassesByRootPath })
+  }, [backendStatus, projectClassesByRootPath])
+
   const commitImageResources = (
     updater: (current: Record<string, ImageResource>) => Record<string, ImageResource>,
   ) => {
@@ -468,13 +622,13 @@ function App() {
       setImages(nextImages)
       setAnnotationsByImage({})
       setCurrentSessionId(null)
+      setCurrentSessionRootPath(null)
       setCurrentImageEntry(nextImages[0] ?? null)
       setSessionLabel(nextSessionLabel)
       setSessionError(null)
       setSelectedId(null)
       setDrawStart(null)
       setDraftRect(null)
-      setCustomClasses([])
       setIsClassManagerOpen(false)
       setNewClassName('')
       setEditingClassLabel(null)
@@ -590,10 +744,14 @@ function App() {
           return
         }
 
-        const nextAnnotations = payload.annotations.map((annotation) => ({
-          ...annotation,
-          color: labelToColor(annotation.label),
-        }))
+        const nextAnnotations = payload.annotations.map((annotation) => {
+          const label = resolveProjectClassAlias(annotation.label, projectClasses)
+          return {
+            ...annotation,
+            label,
+            color: labelToColor(label),
+          }
+        })
 
         setImages((current) =>
           current.map((imageEntry) =>
@@ -645,9 +803,11 @@ function App() {
     const bootstrapApi = async () => {
       try {
         await fetchApiHealth(controller.signal)
-        const [classes, appState] = await Promise.all([
+        const [classes, appState, pluginList, hfAuth] = await Promise.all([
           fetchPredefinedClasses(controller.signal),
           fetchAppState(controller.signal).catch(() => null),
+          fetchPlugins(controller.signal).catch(() => null),
+          fetchHuggingFaceAuthStatus(controller.signal).catch(() => null),
         ])
         if (controller.signal.aborted) {
           return
@@ -666,9 +826,17 @@ function App() {
             coercePersistedSessionState(appState.sessionState),
           )
           setHotkeyBindings(coerceHotkeyBindings(appState.hotkeys))
+          setProjectClassesByRootPath(
+            coerceProjectClassesByRootPath(appState.projectClassesByRootPath),
+          )
         }
 
         setBackendClasses(classes)
+        setPlugins(pluginList ?? [])
+        setPluginsError(pluginList === null ? 'Failed to load plugins' : null)
+        setHfAuthStatus(hfAuth)
+        setHfClientIdDraft(hfAuth?.clientId ?? '')
+        setHfAuthError(hfAuth === null ? 'Failed to load Hugging Face auth status' : null)
         setActiveLabel((current) =>
           current === 'object' && classes.length > 0 ? classes[0] : current,
         )
@@ -839,6 +1007,201 @@ function App() {
   }, [isHotkeysOpen])
 
   useEffect(() => {
+    if (!isPluginsOpen) {
+      return
+    }
+
+    const handleCloseHotkey = (event: KeyboardEvent) => {
+      if (matchesHotkeyAction(event, 'closeOverlay')) {
+        event.preventDefault()
+        closePluginsManager()
+      }
+    }
+
+    window.addEventListener('keydown', handleCloseHotkey)
+    return () => window.removeEventListener('keydown', handleCloseHotkey)
+  }, [isPluginsOpen])
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) {
+        return
+      }
+
+      const payload = event.data as
+        | { type?: string; success?: boolean; message?: string }
+        | null
+        | undefined
+      if (payload?.type !== 'hf-oauth-complete') {
+        return
+      }
+
+      hfAuthPopupRef.current?.close()
+      hfAuthPopupRef.current = null
+      pendingHfAuthRefreshRef.current = false
+      setIsStartingHfAuth(false)
+
+      if (payload.success) {
+        refreshAfterHfConnect()
+      } else {
+        setHfAuthError(payload.message ?? 'Hugging Face authorization failed')
+      }
+    }
+
+    window.addEventListener('message', handleMessage)
+    return () => window.removeEventListener('message', handleMessage)
+  }, [])
+
+  useEffect(() => {
+    if (!isStartingHfAuth) {
+      return
+    }
+
+    const intervalId = window.setInterval(() => {
+      const popup = hfAuthPopupRef.current
+      if (!popup || popup.closed) {
+        hfAuthPopupRef.current = null
+        if (pendingHfAuthRefreshRef.current) {
+          pendingHfAuthRefreshRef.current = false
+          refreshAfterHfConnect()
+        }
+        setIsStartingHfAuth(false)
+        window.clearInterval(intervalId)
+      }
+    }, 350)
+
+    return () => window.clearInterval(intervalId)
+  }, [isStartingHfAuth])
+
+  useEffect(() => {
+    return () => {
+      if (callbackCopiedTimeoutRef.current !== null) {
+        window.clearTimeout(callbackCopiedTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (plugins.length === 0) {
+      if (selectedPluginTabId !== null) {
+        setSelectedPluginTabId(null)
+      }
+      return
+    }
+
+    if (!selectedPluginTabId || !plugins.some((plugin) => plugin.id === selectedPluginTabId)) {
+      setSelectedPluginTabId(plugins[0]?.id ?? null)
+    }
+  }, [plugins, selectedPluginTabId])
+
+  useEffect(() => {
+    if (sidebarView !== 'plugins') {
+      return
+    }
+
+    const controller = new AbortController()
+    void refreshPlugins(controller.signal)
+    void refreshHfAuthStatus(controller.signal)
+    return () => controller.abort()
+  }, [sidebarView])
+
+  useEffect(() => {
+    if (!downloadingPluginId) {
+      return
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshPlugins()
+    }, 500)
+
+    return () => window.clearInterval(intervalId)
+  }, [downloadingPluginId])
+
+  useEffect(() => {
+    if (!downloadingPluginId) {
+      return
+    }
+
+    const activePlugin = plugins.find((plugin) => plugin.id === downloadingPluginId)
+    if (!activePlugin) {
+      return
+    }
+    const activeDownload = getPluginDownloadState(activePlugin)
+
+    if (activeDownload.status === 'failed') {
+      setPluginsError(activeDownload.error || 'Failed to download plugin model')
+      setDownloadingPluginId(null)
+      return
+    }
+
+    if (activeDownload.status === 'completed' || activePlugin.model.isInstalled) {
+      setDownloadingPluginId(null)
+    }
+  }, [plugins, downloadingPluginId])
+
+  useEffect(() => {
+    if (!installingPluginRuntimeId) {
+      return
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshPlugins()
+    }, 1000)
+
+    return () => window.clearInterval(intervalId)
+  }, [installingPluginRuntimeId])
+
+  useEffect(() => {
+    if (!installingPluginRuntimeId) {
+      return
+    }
+
+    const activePlugin =
+      plugins.find((plugin) => plugin.id === installingPluginRuntimeId) ?? null
+    if (!activePlugin) {
+      return
+    }
+
+    const activeInstall = getPluginRuntimeInstallState(activePlugin)
+    if (activeInstall.status === 'failed') {
+      setPluginsError(activeInstall.error || 'Failed to install plugin runtime')
+      setInstallingPluginRuntimeId(null)
+      return
+    }
+
+    if (activeInstall.status === 'completed') {
+      setInstallingPluginRuntimeId(null)
+    }
+  }, [plugins, installingPluginRuntimeId])
+
+  useEffect(() => {
+    if (!installingPluginRuntimeId) {
+      return
+    }
+
+    const activePlugin =
+      plugins.find((plugin) => plugin.id === installingPluginRuntimeId) ?? null
+    if (!activePlugin) {
+      return
+    }
+
+    const activeInstall = getPluginRuntimeInstallState(activePlugin)
+    if (!activeInstall.log) {
+      return
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      const terminalNode = runtimeInstallLogRef.current
+      if (!terminalNode) {
+        return
+      }
+      terminalNode.scrollTop = terminalNode.scrollHeight
+    })
+
+    return () => window.cancelAnimationFrame(frameId)
+  }, [plugins, installingPluginRuntimeId])
+
+  useEffect(() => {
     if (!confirmDialogState) {
       return
     }
@@ -853,6 +1216,12 @@ function App() {
     window.addEventListener('keydown', handleCloseHotkey)
     return () => window.removeEventListener('keydown', handleCloseHotkey)
   }, [confirmDialogState])
+
+  useEffect(() => {
+    if (!isSamInteractiveReady && viewportTool !== 'draw') {
+      setViewportTool('draw')
+    }
+  }, [isSamInteractiveReady, viewportTool])
 
   useEffect(() => {
     if (!hotkeyCaptureTarget) {
@@ -973,6 +1342,10 @@ function App() {
   }
 
   const openClassManager = () => {
+    if (!currentSessionRootPath) {
+      return
+    }
+
     setOpenMenu(null)
     setIsClassManagerOpen(true)
     setNewClassName('')
@@ -996,6 +1369,364 @@ function App() {
     setHotkeyCaptureTarget(null)
     setIsHotkeysOpen(false)
   }
+
+  const selectSidebarView = (nextView: 'main' | 'plugins') => {
+    setSidebarView(nextView)
+    if (nextView === 'plugins') {
+      setPluginsError(null)
+      setHfAuthError(null)
+      void refreshPlugins()
+      void refreshHfAuthStatus()
+    }
+  }
+
+  const openPluginsManager = () => {
+    setOpenMenu(null)
+    setPluginsError(null)
+    setHfAuthError(null)
+    setIsPluginsOpen(true)
+    void refreshPlugins()
+    void refreshHfAuthStatus()
+  }
+
+  const closePluginsManager = () => {
+    setIsPluginsOpen(false)
+    setDownloadingPluginId(null)
+  }
+
+  const handleDownloadPlugin = useEffectEvent(async (pluginId: string) => {
+    setPluginsError(null)
+    setDownloadingPluginId(pluginId)
+
+    try {
+      const updatedPlugin = await downloadPluginModel(pluginId)
+      setPlugins((current) =>
+        current.map((plugin) =>
+          plugin.id === updatedPlugin.id ? updatedPlugin : plugin,
+        ),
+      )
+      if (updatedPlugin.download.status !== 'running') {
+        setDownloadingPluginId(null)
+      }
+    } catch (error) {
+      setPluginsError(
+        error instanceof Error ? error.message : 'Failed to download plugin model',
+      )
+      void refreshPlugins()
+    } finally {
+      setDownloadingPluginId((current) =>
+        current === pluginId ? null : current,
+      )
+    }
+  })
+
+  const handleInstallPluginRuntime = useEffectEvent(
+    async (pluginId: string, profile: PluginRuntimeInstallProfile) => {
+      setPluginsError(null)
+      setInstallingPluginRuntimeId(pluginId)
+
+      try {
+        const updatedPlugin = await installPluginRuntime(pluginId, profile)
+        setPlugins((current) =>
+          current.map((plugin) =>
+            plugin.id === updatedPlugin.id ? updatedPlugin : plugin,
+          ),
+        )
+
+        if (getPluginRuntimeInstallState(updatedPlugin).status !== 'running') {
+          setInstallingPluginRuntimeId(null)
+        }
+      } catch (error) {
+        setPluginsError(
+          error instanceof Error ? error.message : 'Failed to install plugin runtime',
+        )
+        void refreshPlugins()
+      }
+    },
+  )
+
+  const runSamAutoAnnotate = useEffectEvent(
+    async ({
+      mode,
+      region = null,
+      replaceAnnotationId = null,
+      successMessage,
+      emptyMessage = 'SAM found no matching objects for this prompt.',
+      requirePrompt = true,
+    }: {
+      mode: 'full-image' | 'selected-box'
+      region?: Rect | null
+      replaceAnnotationId?: string | null
+      successMessage?: string
+      emptyMessage?: string
+      requirePrompt?: boolean
+    }) => {
+      if (!samPlugin) {
+        setSamActionError('SAM 3.1 plugin is not registered.')
+        return
+      }
+
+      if (!currentEntry) {
+        setSamActionError('Open an image or dataset before using SAM auto-annotation.')
+        return
+      }
+
+      if (mode === 'selected-box' && !region) {
+        setSamActionError('Select a box or draw a region before running box-guided SAM.')
+        return
+      }
+
+      const rawPrompt = samPromptDraft.trim()
+      const prompt =
+        rawPrompt ||
+        samLabelDraft.trim() ||
+        effectiveActiveLabel.trim() ||
+        'object'
+
+      if (requirePrompt && !rawPrompt) {
+        setSamActionError('Enter a prompt before running SAM auto-annotation.')
+        return
+      }
+
+      setSamActionError(null)
+      setSamActionMessage(null)
+      setIsRunningSamAction(true)
+
+      const nextLabel =
+        samLabelDraft.trim() || effectiveActiveLabel.trim() || prompt || 'object'
+      const scoreThreshold = clampNumericInput(samScoreThresholdDraft, 0.25, {
+        min: 0,
+        max: 1,
+      })
+      const maxResults = Math.round(
+        clampNumericInput(samMaxResultsDraft, 8, {
+          min: 1,
+          max: 64,
+        }),
+      )
+
+      try {
+        const result = await runPluginAutoAnnotate('sam-3-1', {
+          sessionId: currentSessionId,
+          imageId: currentEntry.id,
+          prompt,
+          label: nextLabel,
+          mode,
+          region,
+          scoreThreshold,
+          maxResults,
+        })
+
+        if (result.annotations.length === 0) {
+          setSamActionMessage(emptyMessage)
+          return
+        }
+
+        annotationLoadStateRef.current[currentEntry.id] = 'ready'
+
+        if (replaceAnnotationId) {
+          const bestMatch = result.annotations[0]!
+          setAnnotationsByImage((current) => ({
+            ...current,
+            [currentEntry.id]: (current[currentEntry.id] ?? []).map((annotation) =>
+              annotation.id === replaceAnnotationId
+                ? {
+                    ...annotation,
+                    label: bestMatch.label,
+                    color: labelToColor(bestMatch.label),
+                    x: bestMatch.x,
+                    y: bestMatch.y,
+                    width: bestMatch.width,
+                    height: bestMatch.height,
+                  }
+                : annotation,
+            ),
+          }))
+          setSelectedId(replaceAnnotationId)
+          setSamActionMessage(successMessage ?? 'SAM refined the selected box.')
+          return
+        }
+
+        const nextAnnotations = result.annotations.map((annotation) => ({
+          id: crypto.randomUUID(),
+          label: annotation.label,
+          color: labelToColor(annotation.label),
+          difficult: false,
+          x: annotation.x,
+          y: annotation.y,
+          width: annotation.width,
+          height: annotation.height,
+        }))
+
+        setAnnotationsByImage((current) => ({
+          ...current,
+          [currentEntry.id]: [...(current[currentEntry.id] ?? []), ...nextAnnotations],
+        }))
+        setSelectedId(nextAnnotations[0]?.id ?? null)
+        setSamActionMessage(
+          successMessage ??
+            `SAM added ${nextAnnotations.length} auto-annotation${nextAnnotations.length === 1 ? '' : 's'}.`,
+        )
+      } catch (error) {
+        setSamActionError(
+          error instanceof Error ? error.message : 'SAM auto-annotation failed',
+        )
+        void refreshPlugins()
+      } finally {
+        setIsRunningSamAction(false)
+      }
+    },
+  )
+
+  const handleRunSamAutoAnnotate = useEffectEvent(
+    async (mode: 'full-image' | 'selected-box') => {
+      if (mode === 'selected-box') {
+        if (!selectedAnnotation) {
+          setSamActionError('Select a box before running box-guided SAM refinement.')
+          return
+        }
+
+        await runSamAutoAnnotate({
+          mode,
+          region: {
+            x: selectedAnnotation.x,
+            y: selectedAnnotation.y,
+            width: selectedAnnotation.width,
+            height: selectedAnnotation.height,
+          },
+          replaceAnnotationId: selectedAnnotation.id,
+        })
+        return
+      }
+
+      await runSamAutoAnnotate({
+        mode,
+        requirePrompt: true,
+      })
+    },
+  )
+
+  const handleStartHuggingFaceAuth = useEffectEvent(async () => {
+    setHfAuthError(null)
+    setIsStartingHfAuth(true)
+    pendingHfAuthRefreshRef.current = true
+
+    const popup = window.open(
+      '',
+      'huggingface-oauth',
+      'popup,width=640,height=760,resizable=yes,scrollbars=yes',
+    )
+    hfAuthPopupRef.current = popup
+
+    try {
+      const response = await startHuggingFaceAuth()
+      if (popup) {
+        popup.location.href = response.authorizationUrl
+        popup.focus()
+      } else {
+        window.location.href = response.authorizationUrl
+      }
+    } catch (error) {
+      popup?.close()
+      hfAuthPopupRef.current = null
+      pendingHfAuthRefreshRef.current = false
+      setHfAuthError(
+        error instanceof Error ? error.message : 'Failed to start Hugging Face login',
+      )
+      setIsStartingHfAuth(false)
+    }
+  })
+
+  const handleCopyHfCallbackUrl = useEffectEvent(async () => {
+    const callbackUrl = hfAuthStatus?.callbackUrl?.trim()
+    if (!callbackUrl) {
+      return
+    }
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(callbackUrl)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = callbackUrl
+        textarea.setAttribute('readonly', 'true')
+        textarea.style.position = 'absolute'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setIsCallbackCopied(true)
+      if (callbackCopiedTimeoutRef.current !== null) {
+        window.clearTimeout(callbackCopiedTimeoutRef.current)
+      }
+      callbackCopiedTimeoutRef.current = window.setTimeout(() => {
+        setIsCallbackCopied(false)
+        callbackCopiedTimeoutRef.current = null
+      }, 1800)
+    } catch (error) {
+      setHfAuthError(
+        error instanceof Error ? error.message : 'Failed to copy callback URL',
+      )
+    }
+  })
+
+  const handleSaveHuggingFaceAuthConfig = useEffectEvent(async () => {
+    setHfAuthError(null)
+    setIsSavingHfConfig(true)
+
+    try {
+      const nextStatus = await updateHuggingFaceAuthConfig(
+        hfClientIdDraft.trim() || null,
+      )
+      setHfAuthStatus(nextStatus)
+      setHfClientIdDraft(nextStatus.clientId ?? '')
+      setIsHfClientIdVisible(false)
+    } catch (error) {
+      setHfAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to save Hugging Face OAuth config',
+      )
+    } finally {
+      setIsSavingHfConfig(false)
+    }
+  })
+
+  const handleClearHuggingFaceAuthConfig = useEffectEvent(async () => {
+    setHfAuthError(null)
+    setIsSavingHfConfig(true)
+
+    try {
+      const nextStatus = await updateHuggingFaceAuthConfig(null)
+      setHfAuthStatus(nextStatus)
+      setHfClientIdDraft('')
+      setIsHfClientIdVisible(false)
+    } catch (error) {
+      setHfAuthError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to clear Hugging Face OAuth config',
+      )
+    } finally {
+      setIsSavingHfConfig(false)
+    }
+  })
+
+  const handleLogoutHuggingFaceAuth = useEffectEvent(async () => {
+    setHfAuthError(null)
+
+    try {
+      const nextStatus = await logoutHuggingFaceAuth()
+      setHfAuthStatus(nextStatus)
+      void refreshPlugins()
+    } catch (error) {
+      setHfAuthError(
+        error instanceof Error ? error.message : 'Failed to disconnect Hugging Face',
+      )
+    }
+  })
 
   const beginHotkeyCapture = (
     actionId: HotkeyActionId,
@@ -1048,7 +1779,7 @@ function App() {
     }
 
     if (!classList.includes(nextLabel)) {
-      setCustomClasses((current) => [...current, nextLabel])
+      updateCurrentProjectClasses((current) => [...current, nextLabel])
     }
 
     setActiveLabel(nextLabel)
@@ -1076,10 +1807,6 @@ function App() {
       return
     }
 
-    if (backendClasses.includes(sourceLabel)) {
-      return
-    }
-
     const hasConflict = classList.some(
       (label) => label === nextLabel && label !== sourceLabel,
     )
@@ -1087,15 +1814,11 @@ function App() {
       return
     }
 
-    const sourceAnnotationCount = classUsageCounts[sourceLabel] ?? 0
-
-    setCustomClasses((current) => {
+    updateCurrentProjectClasses((current) => {
       const next = current.filter(
         (label) => label !== sourceLabel && label !== nextLabel,
       )
-      if (current.includes(sourceLabel) || sourceAnnotationCount === 0) {
-        next.push(nextLabel)
-      }
+      next.push(nextLabel)
       return next
     })
 
@@ -1123,11 +1846,13 @@ function App() {
   }
 
   const removeClass = (label: string) => {
-    if (backendClasses.includes(label) || (classUsageCounts[label] ?? 0) > 0) {
+    if ((classUsageCounts[label] ?? 0) > 0) {
       return
     }
 
-    setCustomClasses((current) => current.filter((entry) => entry !== label))
+    updateCurrentProjectClasses((current) =>
+      current.filter((entry) => entry !== label),
+    )
     setActiveLabel((current) =>
       current === label ? classList.find((entry) => entry !== label) ?? 'object' : current,
     )
@@ -1282,7 +2007,8 @@ function App() {
       hotkeyCaptureTarget ||
       confirmDialogState ||
       isClassManagerOpen ||
-      isHotkeysOpen
+      isHotkeysOpen ||
+      isPluginsOpen
     ) {
       return
     }
@@ -1385,6 +2111,7 @@ function App() {
 
     if (currentSessionId === sessionId) {
       imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
+      setCurrentSessionRootPath(session.rootPath ?? null)
 
       if (
         preferredImageRelativePath &&
@@ -1446,6 +2173,7 @@ function App() {
       setImages(nextImages)
       setAnnotationsByImage({})
       setCurrentSessionId(sessionId)
+      setCurrentSessionRootPath(session.rootPath ?? null)
       setCurrentImageEntry(initialEntry)
       setSessionLabel(nextSessionLabel)
       setSessionLoadProgress(null)
@@ -1453,7 +2181,6 @@ function App() {
       setSelectedId(null)
       setDrawStart(null)
       setDraftRect(null)
-      setCustomClasses([])
       setIsClassManagerOpen(false)
       setNewClassName('')
       setEditingClassLabel(null)
@@ -1577,6 +2304,33 @@ function App() {
   })
 
   const handleCanvasPointerDown = useEffectEvent((point: Point) => {
+    if (viewportTool === 'sam-click') {
+      if (!image || !isSamInteractiveReady || isRunningSamAction) {
+        return
+      }
+
+      const clickRegionSize = Math.max(
+        MIN_BOX_SIZE * 4,
+        Math.round(Math.min(image.width, image.height) * 0.04),
+      )
+      const halfSize = clickRegionSize / 2
+      const region = {
+        x: Math.max(0, point.x - halfSize),
+        y: Math.max(0, point.y - halfSize),
+        width: Math.min(clickRegionSize, image.width),
+        height: Math.min(clickRegionSize, image.height),
+      }
+
+      void runSamAutoAnnotate({
+        mode: 'selected-box',
+        region,
+        successMessage: 'SAM selected an object near the click.',
+        emptyMessage: 'SAM could not find a matching object near this click.',
+        requirePrompt: false,
+      })
+      return
+    }
+
     setSelectedId(null)
     setDrawStart(point)
     setDraftRect({ x: point.x, y: point.y, width: 0, height: 0 })
@@ -1603,7 +2357,18 @@ function App() {
       return
     }
 
-    const label = activeLabel.trim() || 'object'
+    if (viewportTool === 'sam-box') {
+      void runSamAutoAnnotate({
+        mode: 'selected-box',
+        region: nextRect,
+        successMessage: 'SAM selected an object inside the drawn region.',
+        emptyMessage: 'SAM could not find a matching object inside this region.',
+        requirePrompt: false,
+      })
+      return
+    }
+
+    const label = effectiveActiveLabel.trim() || 'object'
     const nextAnnotation: Annotation = {
       id: crypto.randomUUID(),
       label,
@@ -1621,7 +2386,11 @@ function App() {
   })
 
   const handleLabelExport = (format: 'json' | 'voc' | 'yolo') => {
-    if (!image || annotations.length === 0) {
+    if (!image) {
+      return
+    }
+
+    if (format !== 'yolo' && annotations.length === 0) {
       return
     }
 
@@ -1645,7 +2414,7 @@ function App() {
       return
     }
 
-    const yolo = serializeYolo(image, annotations)
+    const yolo = serializeYolo(image, annotations, projectClasses)
     downloadTextFile(`${baseName}.txt`, yolo.annotationText)
     downloadTextFile('classes.txt', yolo.classesText)
   }
@@ -1763,7 +2532,29 @@ function App() {
                     handleLabelExport('yolo')
                     setOpenMenu(null)
                   }}
-                  disabled={!image || annotations.length === 0}
+                  disabled={!image}
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="menu-root">
+            <AppButton
+              variant="menu-trigger"
+              isActive={openMenu === 'plugins'}
+              onClick={() =>
+                setOpenMenu((current) => (current === 'plugins' ? null : 'plugins'))
+              }
+            >
+              Plugins
+            </AppButton>
+            {openMenu === 'plugins' ? (
+              <div className="menu-popover" role="menu" aria-label="Plugins">
+                <MenuItemButton
+                  title="Manage Plugins"
+                  description="Install plugin models and review their status"
+                  onClick={openPluginsManager}
+                  disabled={backendStatus !== 'online'}
                 />
               </div>
             ) : null}
@@ -1783,6 +2574,12 @@ function App() {
             </AppButton>
             {openMenu === 'settings' ? (
               <div className="menu-popover" role="menu" aria-label="Settings">
+                <MenuItemButton
+                  title="Project Classes"
+                  description="Edit the YOLO classes used for the current project"
+                  onClick={openClassManager}
+                  disabled={!hasSession}
+                />
                 <MenuItemButton
                   title="Hotkeys"
                   description="View and edit keyboard shortcuts"
@@ -1812,6 +2609,10 @@ function App() {
               annotations={annotations}
               selectedId={selectedId}
               draftRect={draftRect}
+              tool={viewportTool}
+              showSamTools={isSamInteractiveReady}
+              isSamBusy={isRunningSamAction}
+              onSelectTool={setViewportTool}
               onOpenDataset={handleOpenLocalDirectory}
               recentDatasets={recentDatasets}
               onOpenRecentDataset={handleOpenRecentDataset}
@@ -1828,250 +2629,464 @@ function App() {
           </div>
         </main>
 
-        {!isSidebarVisible ? (
-          <AppButton
-            variant="menu-trigger"
-            className="workspace-sidebar-reveal"
-            onClick={() => setIsSidebarVisible(true)}
-            aria-label="Show sidebar"
-            title="Show sidebar"
-          >
-            Open Menu
-          </AppButton>
-        ) : null}
-
-        <aside
-          className={
-            isSidebarVisible ? 'panel panel-sidebar' : 'panel panel-sidebar is-hidden'
-          }
+        <AppButton
+          variant="menu-trigger"
+          className="workspace-sidebar-toggle"
+          onClick={() => setIsSidebarVisible((current) => !current)}
+          aria-label={isSidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
+          title={isSidebarVisible ? 'Hide sidebar' : 'Show sidebar'}
         >
-          <div className="panel-sidebar-toggle-row">
-            <AppButton
-              variant="menu-trigger"
-              className="panel-sidebar-toggle"
-              onClick={() => setIsSidebarVisible(false)}
-              aria-label="Hide sidebar"
-              title="Hide sidebar"
-            >
-              {'>'}
-            </AppButton>
-          </div>
+          {isSidebarVisible ? 'Close Menu' : 'Open Menu'}
+        </AppButton>
 
-          <section className="panel-section">
-            <h2>Dataset</h2>
-            <div className="meta-list">
-              <div className="meta-line meta-line-value-only">
-                <strong className="meta-value" title={sessionLabel}>
-                  {sessionLabel}
-                </strong>
-              </div>
-              <div className="meta-line">
-                <span>Progress</span>
-                <div className="dataset-progress-meta" aria-live="polite">
-                  <strong className="meta-value">
-                    {images.length > 0 ? `${currentImageIndex + 1}/${images.length}` : '0/0'}
-                  </strong>
-                  {isOpeningSession ? (
-                    <span
-                      className="dataset-progress-spinner"
-                      role="status"
-                      aria-label={openingLabel}
-                      title={openingLabel}
-                    >
-                      <span className="visually-hidden">{openingLabel}</span>
-                    </span>
-                  ) : null}
-                </div>
-              </div>
-              <div className="meta-line">
-                <span>Size</span>
-                <strong className="meta-value">{currentImageSize}</strong>
-              </div>
-            </div>
-
-            {sessionError ? <p className="path-note">{sessionError}</p> : null}
-
-            {images.length > 0 ? (
-              <VirtualFileList
-                images={images}
-                currentIndex={currentImageIndex}
-                onSelectIndex={selectImageIndex}
-              />
-            ) : null}
-          </section>
-
-          <section className="panel-section">
-            <div className="section-heading-row section-heading-row-kicker">
-              <p className="section-kicker section-kicker-inline">Labeling</p>
+        {isSidebarVisible ? (
+          <aside className="panel panel-sidebar">
+            <div className="panel-sidebar-tabs" role="tablist" aria-label="Sidebar views">
               <AppButton
-                variant="ghost"
-                className="class-add-button"
-                onClick={openClassManager}
+                variant="chip"
+                isActive={sidebarView === 'main'}
+                className="panel-sidebar-tab"
+                onClick={() => selectSidebarView('main')}
               >
-                Manage
+                Main Menu
+              </AppButton>
+              <AppButton
+                variant="chip"
+                isActive={sidebarView === 'plugins'}
+                className="panel-sidebar-tab"
+                onClick={() => selectSidebarView('plugins')}
+              >
+                Plugins
               </AppButton>
             </div>
-            <div className="chip-list" aria-label="Known classes">
-              {classList.length > 0 ? (
-                classList.map((label) => (
-                  <AppButton
-                    key={label}
-                    variant="chip"
-                    isActive={label === activeLabel}
-                    onClick={() => setActiveLabel(label)}
-                  >
-                    {label}
-                  </AppButton>
-                ))
-              ) : (
-                <span className="muted">Classes appear here after annotation.</span>
-              )}
-            </div>
-          </section>
 
-          <section className="panel-section">
-            <p className="section-kicker">Current image</p>
-            {annotations.length > 0 ? (
-              <div
-                className="current-box-list"
-                aria-label="Current image box labels"
-                onDragOver={(event) => {
-                  if (
-                    !draggedAnnotationId ||
-                    event.target !== event.currentTarget
-                  ) {
-                    return
-                  }
-
-                  event.preventDefault()
-                  if (dragInsertIndex !== annotations.length) {
-                    setDragInsertIndex(annotations.length)
-                  }
-                }}
-                onDrop={(event) => {
-                  if (
-                    !draggedAnnotationId ||
-                    dragInsertIndex === null ||
-                    event.target !== event.currentTarget
-                  ) {
-                    return
-                  }
-
-                  event.preventDefault()
-                  moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
-                  setDraggedAnnotationId(null)
-                  setDragInsertIndex(null)
-                }}
-              >
-                {annotations.map((annotation, index) => (
-                  <div
-                    key={annotation.id}
-                    className={[
-                      'current-box-row',
-                      draggedAnnotationId === annotation.id
-                        ? 'is-dragging'
-                        : '',
-                      draggedAnnotationId !== annotation.id &&
-                      dragInsertIndex === index
-                        ? 'drop-before'
-                        : '',
-                      draggedAnnotationId !== annotation.id &&
-                      dragInsertIndex === index + 1
-                        ? 'drop-after'
-                        : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                    draggable
-                    onDragStart={(event) => {
-                      event.dataTransfer.effectAllowed = 'move'
-                      event.dataTransfer.setData('text/plain', annotation.id)
-                      setSelectedId(annotation.id)
-                      setDraggedAnnotationId(annotation.id)
-                      setDragInsertIndex(index)
-                    }}
-                    onDragOver={(event) => {
-                      if (!draggedAnnotationId) {
-                        return
-                      }
-
-                      event.preventDefault()
-                      const bounds = event.currentTarget.getBoundingClientRect()
-                      const nextInsertIndex =
-                        event.clientY < bounds.top + bounds.height / 2
-                          ? index
-                          : index + 1
-
-                      if (dragInsertIndex !== nextInsertIndex) {
-                        setDragInsertIndex(nextInsertIndex)
-                      }
-                    }}
-                    onDrop={(event) => {
-                      if (!draggedAnnotationId || dragInsertIndex === null) {
-                        return
-                      }
-
-                      event.preventDefault()
-                      moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
-                      setDraggedAnnotationId(null)
-                      setDragInsertIndex(null)
-                    }}
-                    onDragEnd={() => {
-                      setDraggedAnnotationId(null)
-                      setDragInsertIndex(null)
-                    }}
-                  >
-                    <AppButton
-                      variant="list-row"
-                      isActive={annotation.id === selectedId}
-                      className="current-box-item"
-                      onClick={() => setSelectedId(annotation.id)}
-                      title={annotation.label || 'object'}
-                    >
-                      <span className="current-box-index">{index + 1}</span>
-                      <span
-                        className="current-box-swatch"
-                        style={{ backgroundColor: annotation.color }}
-                        aria-hidden="true"
-                      />
-                      <span className="current-box-name">
-                        {annotation.label || 'object'}
-                      </span>
-                    </AppButton>
-                    <div className="current-box-actions">
-                      <AppButton
-                        variant="ghost"
-                        className="current-box-action"
-                        title="Duplicate box"
-                        aria-label={`Duplicate ${annotation.label || 'object'}`}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          duplicateAnnotation(annotation.id)
-                        }}
-                      >
-                        Dup
-                      </AppButton>
-                      <AppButton
-                        variant="ghost"
-                        className="current-box-action is-danger"
-                        title="Delete box"
-                        aria-label={`Delete ${annotation.label || 'object'}`}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          removeAnnotation(annotation.id)
-                        }}
-                      >
-                        Del
-                      </AppButton>
+            {sidebarView === 'main' ? (
+              <>
+                <section className="panel-section">
+                  <h2>Dataset</h2>
+                  <div className="meta-list">
+                    <div className="meta-line meta-line-value-only">
+                      <strong className="meta-value" title={sessionLabel}>
+                        {sessionLabel}
+                      </strong>
+                    </div>
+                    <div className="meta-line">
+                      <span>Progress</span>
+                      <div className="dataset-progress-meta" aria-live="polite">
+                        <strong className="meta-value">
+                          {images.length > 0
+                            ? `${currentImageIndex + 1}/${images.length}`
+                            : '0/0'}
+                        </strong>
+                        {isOpeningSession ? (
+                          <span
+                            className="dataset-progress-spinner"
+                            role="status"
+                            aria-label={openingLabel}
+                            title={openingLabel}
+                          >
+                            <span className="visually-hidden">{openingLabel}</span>
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="meta-line">
+                      <span>Size</span>
+                      <strong className="meta-value">{currentImageSize}</strong>
                     </div>
                   </div>
-                ))}
-              </div>
+
+                  {sessionError ? <p className="path-note">{sessionError}</p> : null}
+
+                  {images.length > 0 ? (
+                    <VirtualFileList
+                      images={images}
+                      currentIndex={currentImageIndex}
+                      onSelectIndex={selectImageIndex}
+                    />
+                  ) : null}
+                </section>
+
+                <section className="panel-section">
+                  <div className="section-heading-row section-heading-row-kicker">
+                    <p className="section-kicker section-kicker-inline">Labeling</p>
+                    <AppButton
+                      variant="ghost"
+                      className="class-add-button"
+                      onClick={openClassManager}
+                      disabled={!hasSession}
+                    >
+                      Project classes
+                    </AppButton>
+                  </div>
+                  <div className="chip-list" aria-label="Known classes">
+                    {classList.length > 0 ? (
+                      classList.map((label) => (
+                        <AppButton
+                          key={label}
+                          variant="chip"
+                          isActive={label === effectiveActiveLabel}
+                          onClick={() => setActiveLabel(label)}
+                        >
+                          {label}
+                        </AppButton>
+                      ))
+                    ) : (
+                      <span className="muted">
+                        Add project classes in Settings or create annotations.
+                      </span>
+                    )}
+                  </div>
+                </section>
+
+                <section className="panel-section">
+                  <p className="section-kicker">Current image</p>
+                  {annotations.length > 0 ? (
+                    <div
+                      className="current-box-list"
+                      aria-label="Current image box labels"
+                      onDragOver={(event) => {
+                        if (
+                          !draggedAnnotationId ||
+                          event.target !== event.currentTarget
+                        ) {
+                          return
+                        }
+
+                        event.preventDefault()
+                        if (dragInsertIndex !== annotations.length) {
+                          setDragInsertIndex(annotations.length)
+                        }
+                      }}
+                      onDrop={(event) => {
+                        if (
+                          !draggedAnnotationId ||
+                          dragInsertIndex === null ||
+                          event.target !== event.currentTarget
+                        ) {
+                          return
+                        }
+
+                        event.preventDefault()
+                        moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
+                        setDraggedAnnotationId(null)
+                        setDragInsertIndex(null)
+                      }}
+                    >
+                      {annotations.map((annotation, index) => (
+                        <div
+                          key={annotation.id}
+                          className={[
+                            'current-box-row',
+                            draggedAnnotationId === annotation.id
+                              ? 'is-dragging'
+                              : '',
+                            draggedAnnotationId !== annotation.id &&
+                            dragInsertIndex === index
+                              ? 'drop-before'
+                              : '',
+                            draggedAnnotationId !== annotation.id &&
+                            dragInsertIndex === index + 1
+                              ? 'drop-after'
+                              : '',
+                          ]
+                            .filter(Boolean)
+                            .join(' ')}
+                          draggable
+                          onDragStart={(event) => {
+                            event.dataTransfer.effectAllowed = 'move'
+                            event.dataTransfer.setData('text/plain', annotation.id)
+                            setSelectedId(annotation.id)
+                            setDraggedAnnotationId(annotation.id)
+                            setDragInsertIndex(index)
+                          }}
+                          onDragOver={(event) => {
+                            if (!draggedAnnotationId) {
+                              return
+                            }
+
+                            event.preventDefault()
+                            const bounds = event.currentTarget.getBoundingClientRect()
+                            const nextInsertIndex =
+                              event.clientY < bounds.top + bounds.height / 2
+                                ? index
+                                : index + 1
+
+                            if (dragInsertIndex !== nextInsertIndex) {
+                              setDragInsertIndex(nextInsertIndex)
+                            }
+                          }}
+                          onDrop={(event) => {
+                            if (!draggedAnnotationId || dragInsertIndex === null) {
+                              return
+                            }
+
+                            event.preventDefault()
+                            moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
+                            setDraggedAnnotationId(null)
+                            setDragInsertIndex(null)
+                          }}
+                          onDragEnd={() => {
+                            setDraggedAnnotationId(null)
+                            setDragInsertIndex(null)
+                          }}
+                        >
+                          <AppButton
+                            variant="list-row"
+                            isActive={annotation.id === selectedId}
+                            className="current-box-item"
+                            onClick={() => setSelectedId(annotation.id)}
+                            title={annotation.label || 'object'}
+                          >
+                            <span className="current-box-index">{index + 1}</span>
+                            <span
+                              className="current-box-swatch"
+                              style={{ backgroundColor: annotation.color }}
+                              aria-hidden="true"
+                            />
+                            <span className="current-box-name">
+                              {annotation.label || 'object'}
+                            </span>
+                          </AppButton>
+                          <div className="current-box-actions">
+                            <AppButton
+                              variant="ghost"
+                              className="current-box-action"
+                              title="Duplicate box"
+                              aria-label={`Duplicate ${annotation.label || 'object'}`}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                duplicateAnnotation(annotation.id)
+                              }}
+                            >
+                              Dup
+                            </AppButton>
+                            <AppButton
+                              variant="ghost"
+                              className="current-box-action is-danger"
+                              title="Delete box"
+                              aria-label={`Delete ${annotation.label || 'object'}`}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                removeAnnotation(annotation.id)
+                              }}
+                            >
+                              Del
+                            </AppButton>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="muted">No boxes on this image.</span>
+                  )}
+                </section>
+              </>
             ) : (
-              <span className="muted">No boxes on this image.</span>
+              <div className="sidebar-plugins-view">
+                <div className="sidebar-plugins-toolbar">
+                  <p className="section-kicker">Plugins</p>
+                  <AppButton
+                    variant="ghost"
+                    className="class-manager-close"
+                    onClick={() => {
+                      void refreshPlugins()
+                      void refreshHfAuthStatus()
+                    }}
+                    disabled={backendStatus !== 'online' || downloadingPluginId !== null}
+                  >
+                    Refresh
+                  </AppButton>
+                </div>
+
+                {plugins.length > 0 ? (
+                  <div className="plugin-sidebar-tabs" role="tablist" aria-label="Plugin tabs">
+                    {plugins.map((plugin) => (
+                      <AppButton
+                        key={plugin.id}
+                        variant="chip"
+                        isActive={selectedPlugin?.id === plugin.id}
+                        className="plugin-sidebar-tab"
+                        onClick={() => {
+                          setSelectedPluginTabId(plugin.id)
+                          setSamActionError(null)
+                          setSamActionMessage(null)
+                        }}
+                      >
+                        {plugin.name}
+                      </AppButton>
+                    ))}
+                  </div>
+                ) : null}
+
+                {pluginsError ? (
+                  <p className="plugin-manager-note is-error">{pluginsError}</p>
+                ) : null}
+
+                {samActionError ? (
+                  <p className="plugin-manager-note is-error">{samActionError}</p>
+                ) : null}
+
+                {samActionMessage ? (
+                  <p className="plugin-manager-note is-success">{samActionMessage}</p>
+                ) : null}
+
+                {selectedPlugin ? (
+                  <section className="plugin-card">
+                    {selectedPlugin.id === 'sam-3-1' ? (
+                      <div className="sam-plugin-panel">
+                        <div className="sam-plugin-copy">
+                          <div className="plugin-card-title-row">
+                            <h3>SAM auto-annotation</h3>
+                          </div>
+                        </div>
+
+                        <label className="hf-auth-field">
+                          <span className="plugin-detail-label">Prompt</span>
+                          <input
+                            className="class-manager-input"
+                            type="text"
+                            value={samPromptDraft}
+                            onChange={(event) => setSamPromptDraft(event.target.value)}
+                            placeholder="person, red car, traffic light"
+                            autoComplete="off"
+                          />
+                        </label>
+
+                        <div className="hf-auth-config-grid">
+                          <label className="hf-auth-field">
+                            <span className="plugin-detail-label">Label</span>
+                            {classList.length > 0 ? (
+                              <select
+                                className="class-manager-input sam-label-select"
+                                value={samSelectedLabel}
+                                onChange={(event) =>
+                                  setSamLabelDraft(event.target.value)
+                                }
+                              >
+                                {classList.map((label) => (
+                                  <option key={label} value={label}>
+                                    {label}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                className="class-manager-input"
+                                type="text"
+                                value={samLabelDraft}
+                                onChange={(event) =>
+                                  setSamLabelDraft(event.target.value)
+                                }
+                                placeholder={effectiveActiveLabel || 'object'}
+                                autoComplete="off"
+                              />
+                            )}
+                          </label>
+                          <label className="hf-auth-field">
+                            <span className="plugin-field-header">
+                              <span className="plugin-detail-label">
+                                Score threshold
+                              </span>
+                              <strong className="plugin-field-value">
+                                {samScoreThresholdValue.toFixed(2)}
+                              </strong>
+                            </span>
+                            <input
+                              className="plugin-range-input"
+                              type="range"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              value={samScoreThresholdValue}
+                              onChange={(event) =>
+                                setSamScoreThresholdDraft(event.target.value)
+                              }
+                            />
+                          </label>
+                          <label className="hf-auth-field">
+                            <span className="plugin-detail-label">Max results</span>
+                            <input
+                              className="class-manager-input"
+                              type="number"
+                              min="1"
+                              max="64"
+                              step="1"
+                              value={samMaxResultsDraft}
+                              onChange={(event) =>
+                                setSamMaxResultsDraft(event.target.value)
+                              }
+                            />
+                          </label>
+                        </div>
+
+                        {selectedAnnotation ? (
+                          <p className="plugin-manager-note">
+                            Selected box: {selectedAnnotation.label || 'object'} at{' '}
+                            {Math.round(selectedAnnotation.x)},{' '}
+                            {Math.round(selectedAnnotation.y)} /{' '}
+                            {Math.round(selectedAnnotation.width)}x
+                            {Math.round(selectedAnnotation.height)}
+                          </p>
+                        ) : (
+                          <p className="plugin-manager-note">
+                            Select a box to enable box-guided refinement.
+                          </p>
+                        )}
+
+                        {selectedPlugin.runtime.status !== 'ready' &&
+                        selectedPlugin.runtime.message ? (
+                          <p className="plugin-manager-note is-error">
+                            {selectedPlugin.runtime.message}
+                          </p>
+                        ) : null}
+                        {!currentEntry ? (
+                          <p className="plugin-manager-note">
+                            Open an image before using SAM auto-annotation.
+                          </p>
+                        ) : null}
+
+                        <div className="hf-auth-actions">
+                          <AppButton
+                            variant="primary"
+                            className="plugin-download-action"
+                            onClick={() => void handleRunSamAutoAnnotate('full-image')}
+                            disabled={
+                              backendStatus !== 'online' ||
+                              isRunningSamAction ||
+                              !currentEntry ||
+                              !selectedPlugin.model.isInstalled ||
+                              selectedPlugin.runtime.status !== 'ready'
+                            }
+                          >
+                            {isRunningSamAction ? 'Running SAM...' : 'Auto-annotate image'}
+                          </AppButton>
+                          <AppButton
+                            variant="ghost"
+                            className="class-manager-close"
+                            onClick={() => void handleRunSamAutoAnnotate('selected-box')}
+                            disabled={
+                              backendStatus !== 'online' ||
+                              isRunningSamAction ||
+                              !currentEntry ||
+                              !selectedAnnotation ||
+                              !selectedPlugin.model.isInstalled ||
+                              selectedPlugin.runtime.status !== 'ready'
+                            }
+                          >
+                            Refine selected box
+                          </AppButton>
+                        </div>
+                      </div>
+                    ) : null}
+                  </section>
+                ) : (
+                  <span className="muted">No plugins registered.</span>
+                )}
+              </div>
             )}
-          </section>
-        </aside>
+          </aside>
+        ) : null}
       </div>
 
       {isClassManagerOpen ? (
@@ -2083,13 +3098,17 @@ function App() {
             className="class-manager-lightbox"
             role="dialog"
             aria-modal="true"
-            aria-label="Manage classes"
+            aria-label="Project classes"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="class-manager-header">
               <div>
-                <p className="section-kicker">Classes</p>
-                <h2>Manage classes</h2>
+                <p className="section-kicker">Settings</p>
+                <h2>Project classes</h2>
+                <p className="plugin-manager-note">
+                  Used for YOLO export and empty-image annotations in the current
+                  project.
+                </p>
               </div>
               <AppButton
                 variant="ghost"
@@ -2112,7 +3131,7 @@ function App() {
                     addClass()
                   }
                 }}
-                placeholder="New class name"
+                placeholder="New project class"
               />
               <AppButton
                 variant="primary"
@@ -2126,10 +3145,10 @@ function App() {
             <div className="class-manager-list" aria-label="Class manager list">
               {classList.length > 0 ? (
                 classList.map((label) => {
-                  const isPreset = backendClasses.includes(label)
+                  const isProjectClass = projectClasses.includes(label)
                   const usageCount = classUsageCounts[label] ?? 0
                   const isEditing = editingClassLabel === label
-                  const canDelete = !isPreset && usageCount === 0
+                  const canDelete = usageCount === 0
 
                   return (
                     <div key={label} className="class-manager-item">
@@ -2157,7 +3176,7 @@ function App() {
                         <button
                           type="button"
                           className={
-                            label === activeLabel
+                            label === effectiveActiveLabel
                               ? 'class-manager-main is-active'
                               : 'class-manager-main'
                           }
@@ -2165,7 +3184,7 @@ function App() {
                         >
                           <span className="class-manager-name">{label}</span>
                           <span className="class-manager-meta">
-                            {isPreset ? 'preset' : 'custom'}
+                            {isProjectClass ? 'project' : 'annotation only'}
                             {usageCount > 0
                               ? ` · ${usageCount} ${usageCount === 1 ? 'box' : 'boxes'}`
                               : ''}
@@ -2197,12 +3216,7 @@ function App() {
                               variant="ghost"
                               className="class-manager-action"
                               onClick={() => startEditingClass(label)}
-                              disabled={isPreset}
-                              title={
-                                isPreset
-                                  ? 'Preset classes cannot be renamed here'
-                                  : 'Rename class'
-                              }
+                              title="Rename class"
                             >
                               Rename
                             </AppButton>
@@ -2212,11 +3226,9 @@ function App() {
                               onClick={() => removeClass(label)}
                               disabled={!canDelete}
                               title={
-                                isPreset
-                                  ? 'Preset classes cannot be deleted here'
-                                  : usageCount > 0
-                                    ? 'Reassign or delete boxes before removing this class'
-                                    : 'Delete class'
+                                usageCount > 0
+                                  ? 'Reassign or delete boxes before removing this class'
+                                  : 'Delete class'
                               }
                             >
                               Delete
@@ -2228,7 +3240,613 @@ function App() {
                   )
                 })
               ) : (
-                <span className="muted">No classes available.</span>
+                <span className="muted">No project classes configured.</span>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {isPluginsOpen ? (
+        <div
+          className="lightbox-backdrop"
+          onClick={closePluginsManager}
+        >
+          <div
+            className="plugin-manager-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Plugins"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="class-manager-header">
+              <div>
+                <p className="section-kicker">Plugins</p>
+              </div>
+              <div className="hotkeys-toolbar">
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={() => {
+                    void refreshPlugins()
+                    void refreshHfAuthStatus()
+                  }}
+                  disabled={backendStatus !== 'online' || downloadingPluginId !== null}
+                >
+                  Refresh
+                </AppButton>
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={closePluginsManager}
+                >
+                  Close
+                </AppButton>
+              </div>
+            </div>
+
+            <section className="hf-auth-panel" aria-label="Hugging Face authorization">
+              <div className="hf-auth-copy">
+                <div className="plugin-card-title-row">
+                  <h3>Hugging Face access</h3>
+                  <span
+                    className={
+                      hfAuthStatus?.hasUsableAccessToken
+                        ? 'plugin-status is-installed'
+                        : 'plugin-status'
+                    }
+                  >
+                    {hfAuthStatus?.authSource === 'oauth'
+                      ? 'Connected'
+                      : hfAuthStatus?.isExpired
+                        ? 'Expired'
+                        : hfAuthStatus?.isConfigured
+                          ? 'Not connected'
+                          : 'Not configured'}
+                  </span>
+                </div>
+                {hfAuthStatus?.authSource === 'oauth' ? null : (
+                  <p className="plugin-manager-note">
+                    {hfAuthStatus?.isConfigured
+                      ? 'Save the OAuth Client ID once, then connect with Hugging Face.'
+                      : 'Create a public Hugging Face OAuth app, paste its Client ID here, save it, and then click Connect Hugging Face.'}
+                  </p>
+                )}
+                <div className="hf-auth-config-grid">
+                  <label className="hf-auth-field">
+                    <span className="plugin-detail-label">Client ID</span>
+                    <div className="hf-auth-field-row">
+                      <input
+                        className="class-manager-input"
+                        type={isHfClientIdVisible ? 'text' : 'password'}
+                        value={hfClientIdDraft}
+                        onChange={(event) => setHfClientIdDraft(event.target.value)}
+                        placeholder="Paste Hugging Face OAuth Client ID"
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <AppButton
+                        variant="ghost"
+                        className="class-manager-close hf-auth-field-button"
+                        onClick={() =>
+                          setIsHfClientIdVisible((current) => !current)
+                        }
+                        disabled={!hfClientIdDraft}
+                      >
+                        {isHfClientIdVisible ? 'Hide' : 'Show'}
+                      </AppButton>
+                    </div>
+                  </label>
+                  <label className="hf-auth-field">
+                    <span className="plugin-detail-label">Callback URL</span>
+                    <div className="hf-auth-field-row">
+                      <input
+                        className="class-manager-input"
+                        type="text"
+                        value={hfAuthStatus?.callbackUrl ?? ''}
+                        readOnly
+                      />
+                      <AppButton
+                        variant="menu-trigger"
+                        className="class-manager-close hf-auth-copy-icon-button"
+                        onClick={() => void handleCopyHfCallbackUrl()}
+                        disabled={!hfAuthStatus?.callbackUrl}
+                        aria-label={
+                          isCallbackCopied ? 'Callback URL copied' : 'Copy callback URL'
+                        }
+                        title={
+                          isCallbackCopied ? 'Callback URL copied' : 'Copy callback URL'
+                        }
+                      >
+                        {isCallbackCopied ? (
+                          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path
+                              d="M3.5 8.5 6.5 11.5 12.5 4.5"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        ) : (
+                          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <rect
+                              x="5"
+                              y="3"
+                              width="7"
+                              height="9"
+                              rx="1.25"
+                              stroke="currentColor"
+                              strokeWidth="1.25"
+                            />
+                            <path
+                              d="M4 5H3.25C2.56 5 2 5.56 2 6.25v6.5C2 13.44 2.56 14 3.25 14h5.5C9.44 14 10 13.44 10 12.75V12"
+                              stroke="currentColor"
+                              strokeWidth="1.25"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          </svg>
+                        )}
+                        <span className="visually-hidden">
+                          {isCallbackCopied ? 'Copied' : 'Copy'}
+                        </span>
+                      </AppButton>
+                    </div>
+                  </label>
+                </div>
+                <div className="hf-auth-steps">
+                  <p className="plugin-manager-note">
+                    1. Open{' '}
+                    <a
+                      className="plugin-link"
+                      href={HUGGING_FACE_OAUTH_APP_URL}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Hugging Face OAuth app settings
+                    </a>{' '}
+                    and create a public app.
+                  </p>
+                  <p className="plugin-manager-note">
+                    2. Add the callback URL shown above to Redirect URLs.
+                  </p>
+                  <p className="plugin-manager-note">
+                    3. Copy the Client ID here, save it, then click Connect Hugging Face.
+                  </p>
+                </div>
+                {hfAuthStatus?.authSource === 'oauth' ? (
+                  <p className="plugin-manager-note">
+                    Expires: {formatPluginInstallDate(hfAuthStatus.expiresAt)}
+                  </p>
+                ) : null}
+              </div>
+              <div className="hf-auth-actions">
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={() => void handleSaveHuggingFaceAuthConfig()}
+                  disabled={backendStatus !== 'online' || isSavingHfConfig}
+                >
+                  {isSavingHfConfig ? 'Saving...' : 'Save client ID'}
+                </AppButton>
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={() => void handleClearHuggingFaceAuthConfig()}
+                  disabled={
+                    backendStatus !== 'online' ||
+                    isSavingHfConfig ||
+                    (!hfClientIdDraft.trim() && !hfAuthStatus?.clientId)
+                  }
+                >
+                  Clear config
+                </AppButton>
+                <AppButton
+                  variant="primary"
+                  className="plugin-download-action"
+                  onClick={() => void handleStartHuggingFaceAuth()}
+                  disabled={
+                    backendStatus !== 'online' ||
+                    isStartingHfAuth ||
+                    isSavingHfConfig ||
+                    !hfAuthStatus?.isConfigured
+                  }
+                >
+                  {isStartingHfAuth ? 'Opening login...' : 'Connect Hugging Face'}
+                </AppButton>
+                {hfAuthStatus?.authSource === 'oauth' ? (
+                  <AppButton
+                    variant="ghost"
+                    className="class-manager-close"
+                    onClick={() => void handleLogoutHuggingFaceAuth()}
+                    disabled={isStartingHfAuth}
+                  >
+                    Disconnect
+                  </AppButton>
+                ) : null}
+              </div>
+            </section>
+
+            {hfAuthError ? (
+              <p className="plugin-manager-note is-error">{hfAuthError}</p>
+            ) : null}
+
+            {pluginsError ? (
+              <p className="plugin-manager-note is-error">{pluginsError}</p>
+            ) : null}
+
+            <div className="plugin-card-list" aria-label="Installed plugins">
+              {plugins.length > 0 ? (
+                plugins.map((plugin) => {
+                  const pluginDownload = getPluginDownloadState(plugin)
+                  const pluginRuntimeInstall = getPluginRuntimeInstallState(plugin)
+                  const isDownloading = downloadingPluginId === plugin.id
+                  const isRuntimeInstallPending =
+                    installingPluginRuntimeId === plugin.id ||
+                    pluginRuntimeInstall.status === 'running'
+                  const runtimeInstallProfile =
+                    pluginRuntimeInstall.resolvedProfile ??
+                    pluginRuntimeInstall.requestedProfile
+                  const runtimeStatusLabel = getPluginRuntimeStatusLabel(plugin)
+                  const isRuntimeReadyOnGpu =
+                    plugin.runtime.status === 'ready' &&
+                    plugin.runtime.device === 'cuda'
+                  const isRuntimeReadyOnCpu =
+                    plugin.runtime.status === 'ready' &&
+                    plugin.runtime.device === 'cpu'
+                  const isCpuRuntimeSupported = plugin.id !== 'sam-3-1'
+                  const isRuntimeInstallLocked =
+                    backendStatus !== 'online' ||
+                    (isAnyPluginRuntimeInstallRunning && !isRuntimeInstallPending)
+                  const installStatus = plugin.model.isInstalled
+                    ? 'Installed'
+                    : 'Model missing'
+                  const downloadTotalBytes =
+                    pluginDownload.totalBytes ?? plugin.model.expectedSizeBytes
+                  const downloadProgressRatio = getProgressRatio(
+                    pluginDownload.downloadedBytes,
+                    downloadTotalBytes,
+                  )
+                  const downloadProgressLabel = pluginDownload.totalBytes
+                    ? `${formatByteSize(pluginDownload.downloadedBytes)} / ${formatByteSize(pluginDownload.totalBytes)}`
+                    : `${formatByteSize(pluginDownload.downloadedBytes)} downloaded`
+                  const downloadSpeedBytesPerSecond =
+                    getPluginDownloadSpeedBytesPerSecond(pluginDownload)
+                  const downloadEtaSeconds = getPluginDownloadEtaSeconds(
+                    pluginDownload,
+                    downloadTotalBytes,
+                  )
+                  const downloadElapsedSeconds = getElapsedSeconds(
+                    pluginDownload.startedAt,
+                  )
+                  const runtimeElapsedSeconds = getElapsedSeconds(
+                    pluginRuntimeInstall.startedAt,
+                  )
+                  const runtimeTerminalOutput =
+                    getPluginRuntimeInstallTerminalOutput(pluginRuntimeInstall)
+                  const shouldShowRuntimeTerminal =
+                    runtimeTerminalOutput !== null ||
+                    pluginRuntimeInstall.status === 'running'
+
+                  return (
+                    <section key={plugin.id} className="plugin-card">
+                      <div className="plugin-card-header">
+                        <div className="plugin-card-copy">
+                          <div className="plugin-card-title-row">
+                            <h3>{plugin.name}</h3>
+                            <span
+                              className={
+                                plugin.model.isInstalled
+                                  ? 'plugin-status is-installed'
+                                  : 'plugin-status'
+                              }
+                            >
+                              {installStatus}
+                            </span>
+                          </div>
+                        </div>
+                        <AppButton
+                          variant="primary"
+                          className="plugin-download-action"
+                          onClick={() => void handleDownloadPlugin(plugin.id)}
+                          disabled={
+                            backendStatus !== 'online' ||
+                            plugin.model.isInstalled ||
+                            downloadingPluginId !== null ||
+                            (plugin.model.requiresAuth &&
+                              !hfAuthStatus?.hasUsableAccessToken)
+                          }
+                        >
+                          {isDownloading
+                            ? downloadTotalBytes
+                              ? `Downloading ${formatProgressPercent(
+                                  pluginDownload.downloadedBytes,
+                                  downloadTotalBytes,
+                                )}`
+                              : 'Downloading...'
+                            : plugin.model.isInstalled
+                              ? 'Installed'
+                              : 'Download model'}
+                        </AppButton>
+                      </div>
+
+                      {pluginDownload.status === 'running' ? (
+                        <div className="plugin-progress-panel" role="status" aria-live="polite">
+                          <div className="plugin-progress-header">
+                            <span className="plugin-progress-label">
+                              <span
+                                className="dataset-progress-spinner"
+                                aria-hidden="true"
+                              />
+                              Model download
+                            </span>
+                            <strong className="plugin-progress-value">
+                              {formatProgressPercentFromRatio(downloadProgressRatio) ??
+                                'In progress'}
+                            </strong>
+                          </div>
+                          <div
+                            className="plugin-progress-track"
+                            role="progressbar"
+                            aria-label={`${plugin.name} model download progress`}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={
+                              downloadProgressRatio === null
+                                ? undefined
+                                : Math.round(downloadProgressRatio * 100)
+                            }
+                          >
+                            <div
+                              className={`plugin-progress-fill${
+                                downloadProgressRatio === null
+                                  ? ' is-indeterminate'
+                                  : ''
+                              }`}
+                              style={{
+                                width:
+                                  downloadProgressRatio === null
+                                    ? '38%'
+                                    : `${Math.max(
+                                        downloadProgressRatio * 100,
+                                        pluginDownload.downloadedBytes > 0 ? 4 : 0,
+                                      )}%`,
+                              }}
+                            />
+                          </div>
+                          <div className="plugin-progress-meta">
+                            <span>{downloadProgressLabel}</span>
+                            {downloadSpeedBytesPerSecond ? (
+                              <span>{formatByteSize(downloadSpeedBytesPerSecond)}/s</span>
+                            ) : null}
+                            {downloadEtaSeconds !== null ? (
+                              <span>
+                                {downloadEtaSeconds > 0
+                                  ? `ETA ${formatDurationCompact(downloadEtaSeconds)}`
+                                  : 'Finishing...'}
+                              </span>
+                            ) : downloadElapsedSeconds !== null ? (
+                              <span>
+                                Elapsed {formatDurationCompact(downloadElapsedSeconds)}
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                      ) : null}
+                      {pluginDownload.status === 'failed' && pluginDownload.error ? (
+                        <p className="plugin-download-meta is-error">
+                          {pluginDownload.error}
+                        </p>
+                      ) : null}
+
+                      {plugin.runtime.supportsAutoAnnotate ? (
+                        <div className="plugin-runtime-panel">
+                          <div className="plugin-card-title-row">
+                            <span className="plugin-detail-label">Runtime</span>
+                            <span
+                              className={
+                                plugin.runtime.status === 'ready'
+                                  ? 'plugin-status is-installed'
+                                  : 'plugin-status'
+                              }
+                            >
+                              {runtimeStatusLabel}
+                            </span>
+                          </div>
+
+                          <div className="plugin-runtime-actions">
+                            <AppButton
+                              variant={isRuntimeReadyOnGpu ? 'ghost' : 'primary'}
+                              className="plugin-runtime-action"
+                              onClick={() =>
+                                void handleInstallPluginRuntime(plugin.id, 'cuda')
+                              }
+                              disabled={
+                                isRuntimeInstallLocked ||
+                                isRuntimeReadyOnGpu ||
+                                isRuntimeInstallPending
+                              }
+                            >
+                              {isRuntimeInstallPending &&
+                              runtimeInstallProfile === 'cuda'
+                                ? 'Installing GPU/CUDA...'
+                                : isRuntimeReadyOnGpu
+                                  ? 'Installed on GPU'
+                                  : 'Install GPU/CUDA'}
+                            </AppButton>
+                            <AppButton
+                              variant="ghost"
+                              className="plugin-runtime-action"
+                              onClick={() =>
+                                void handleInstallPluginRuntime(plugin.id, 'cpu')
+                              }
+                              disabled={
+                                isRuntimeInstallLocked ||
+                                !isCpuRuntimeSupported ||
+                                isRuntimeReadyOnCpu ||
+                                isRuntimeInstallPending
+                              }
+                            >
+                              {isRuntimeInstallPending &&
+                              runtimeInstallProfile === 'cpu'
+                                ? 'Installing CPU...'
+                                : !isCpuRuntimeSupported
+                                  ? 'CPU unsupported'
+                                  : isRuntimeReadyOnCpu
+                                  ? 'Installed on CPU'
+                                  : 'Install CPU'}
+                            </AppButton>
+                          </div>
+
+                          {pluginRuntimeInstall.status === 'running' ? (
+                            shouldShowRuntimeTerminal ? (
+                              <div
+                                className="plugin-runtime-terminal"
+                                role="log"
+                                aria-live="polite"
+                                aria-atomic="false"
+                              >
+                                <div className="plugin-runtime-terminal-header">
+                                  <span className="plugin-progress-label">
+                                    <span
+                                      className="dataset-progress-spinner"
+                                      aria-hidden="true"
+                                    />
+                                    Install terminal
+                                  </span>
+                                  <strong className="plugin-progress-value">
+                                    {formatPluginRuntimeInstallStep(
+                                      pluginRuntimeInstall.step,
+                                    )}
+                                  </strong>
+                                </div>
+                                <div className="plugin-progress-meta">
+                                  <span>
+                                    Profile:{' '}
+                                    {formatPluginRuntimeProfileLabel(
+                                      runtimeInstallProfile,
+                                    )}
+                                  </span>
+                                  {runtimeElapsedSeconds !== null ? (
+                                    <span>
+                                      Elapsed{' '}
+                                      {formatDurationCompact(runtimeElapsedSeconds)}
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <pre
+                                  ref={
+                                    isRuntimeInstallPending
+                                      ? runtimeInstallLogRef
+                                      : undefined
+                                  }
+                                  className="plugin-runtime-terminal-body"
+                                >
+                                  {runtimeTerminalOutput ??
+                                    'Waiting for installation output...\n'}
+                                </pre>
+                              </div>
+                            ) : null
+                          ) : null}
+                          {pluginRuntimeInstall.status !== 'running' &&
+                          shouldShowRuntimeTerminal ? (
+                            <div className="plugin-runtime-terminal">
+                              <div className="plugin-runtime-terminal-header">
+                                <span className="plugin-progress-label">
+                                  Install terminal
+                                </span>
+                                <strong className="plugin-progress-value">
+                                  {pluginRuntimeInstall.status === 'completed'
+                                    ? 'Completed'
+                                    : pluginRuntimeInstall.status === 'failed'
+                                      ? 'Failed'
+                                      : 'Idle'}
+                                </strong>
+                              </div>
+                              <pre className="plugin-runtime-terminal-body">
+                                {runtimeTerminalOutput}
+                              </pre>
+                            </div>
+                          ) : null}
+                          {pluginRuntimeInstall.status === 'completed' &&
+                          pluginRuntimeInstall.message ? (
+                            <p className="plugin-manager-note is-success">
+                              {pluginRuntimeInstall.message}
+                            </p>
+                          ) : null}
+                          {pluginRuntimeInstall.status === 'failed' &&
+                          pluginRuntimeInstall.error ? (
+                            <p className="plugin-manager-note is-error">
+                              {pluginRuntimeInstall.error}
+                            </p>
+                          ) : null}
+                          {pluginRuntimeInstall.status === 'idle' &&
+                          plugin.runtime.message ? (
+                            <p className="plugin-manager-note">
+                              {plugin.runtime.message}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      <div className="plugin-chip-list" aria-label={`${plugin.name} capabilities`}>
+                        {plugin.capabilities.map((capability) => (
+                          <span key={capability} className="plugin-chip">
+                            {capability}
+                          </span>
+                        ))}
+                      </div>
+
+                      <div className="plugin-details-grid">
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Target</span>
+                          <strong>{plugin.integrationTarget}</strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Version</span>
+                          <strong>{plugin.version}</strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Model file</span>
+                          <strong>{plugin.model.filename}</strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Size</span>
+                          <strong>
+                            {formatByteSize(
+                              plugin.model.installedBytes ??
+                                plugin.model.expectedSizeBytes,
+                            )}
+                          </strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Installed at</span>
+                          <strong>
+                            {formatPluginInstallDate(plugin.model.installedAt)}
+                          </strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Auth</span>
+                          <strong>
+                            {plugin.model.requiresAuth
+                              ? hfAuthStatus?.hasUsableAccessToken
+                                ? 'Ready via OAuth'
+                                : 'Connect HF account'
+                              : 'Not required'}
+                          </strong>
+                        </div>
+                        <div className="plugin-detail">
+                          <span className="plugin-detail-label">Runtime</span>
+                          <strong>{runtimeStatusLabel}</strong>
+                        </div>
+                      </div>
+
+                    </section>
+                  )
+                })
+              ) : (
+                <span className="muted">No plugins registered.</span>
               )}
             </div>
           </div>
@@ -2481,6 +4099,254 @@ function stripExtension(filename: string) {
   return dotIndex > 0 ? filename.slice(0, dotIndex) : filename
 }
 
+function clampNumericInput(
+  value: string,
+  fallback: number,
+  bounds: { min: number; max: number },
+) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) {
+    return fallback
+  }
+
+  return Math.min(bounds.max, Math.max(bounds.min, parsed))
+}
+
+function getPluginDownloadState(plugin: PluginInfo) {
+  return (
+    plugin.download ?? {
+      status: 'idle' as const,
+      downloadedBytes: 0,
+      totalBytes: plugin.model.expectedSizeBytes ?? null,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+    }
+  )
+}
+
+function getPluginRuntimeInstallState(plugin: PluginInfo) {
+  return (
+    plugin.runtime.install ?? {
+      status: 'idle' as const,
+      requestedProfile: null,
+      resolvedProfile: null,
+      step: null,
+      stepStartedAt: null,
+      log: null,
+      message: null,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+    }
+  )
+}
+
+function getPluginRuntimeStatusLabel(plugin: PluginInfo) {
+  if (plugin.runtime.status === 'ready') {
+    if (plugin.runtime.device === 'cuda') {
+      return 'Ready on GPU'
+    }
+    if (plugin.runtime.device === 'cpu') {
+      return 'Ready on CPU'
+    }
+    return 'Ready'
+  }
+
+  if (plugin.runtime.status === 'missing-model') {
+    return 'Model missing'
+  }
+
+  if (plugin.runtime.status === 'missing-runtime') {
+    return 'Runtime missing'
+  }
+
+  return 'Setup failed'
+}
+
+function formatPluginRuntimeProfileLabel(
+  profile?: PluginRuntimeInstallProfile | null,
+) {
+  if (profile === 'cuda') {
+    return 'GPU/CUDA'
+  }
+  if (profile === 'cpu') {
+    return 'CPU'
+  }
+  return 'Auto'
+}
+
+function formatPluginRuntimeInstallStep(step?: string | null) {
+  switch (step) {
+    case 'preparing':
+      return 'Preparing environment'
+    case 'installing-pytorch':
+      return 'Installing PyTorch'
+    case 'downloading-sam3':
+      return 'Downloading SAM 3 source'
+    case 'installing-sam3':
+      return 'Installing SAM 3 package'
+    case 'verifying':
+      return 'Verifying runtime'
+    case 'completed':
+      return 'Completed'
+    case 'failed':
+      return 'Failed'
+    default:
+      return step || 'Preparing environment'
+  }
+}
+
+function getPluginRuntimeInstallTerminalOutput(
+  install: PluginRuntimeInstallState,
+) {
+  if (install.log && install.log.trim()) {
+    return install.log
+  }
+
+  if (install.message) {
+    return `[status] ${install.message}\n`
+  }
+
+  return null
+}
+
+function parseIsoTimestamp(value?: string | null) {
+  if (!value) {
+    return null
+  }
+
+  const parsed = new Date(value)
+  const time = parsed.getTime()
+  if (Number.isNaN(time)) {
+    return null
+  }
+
+  return time
+}
+
+function getElapsedSeconds(startedAt?: string | null) {
+  const startedAtMs = parseIsoTimestamp(startedAt)
+  if (startedAtMs === null) {
+    return null
+  }
+
+  return Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
+}
+
+function formatDurationCompact(value?: number | null) {
+  if (value === null || value === undefined || value < 0) {
+    return null
+  }
+
+  const totalSeconds = Math.max(0, Math.round(value))
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`
+  }
+
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (totalSeconds < 3600) {
+    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
+  }
+
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`
+}
+
+function getProgressRatio(completed: number, total?: number | null) {
+  if (!total || total <= 0) {
+    return null
+  }
+
+  return Math.max(0, Math.min(1, completed / total))
+}
+
+function formatByteSize(value?: number | null) {
+  if (!value || value <= 0) {
+    return '—'
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = value
+  let unitIndex = 0
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex += 1
+  }
+
+  const digits = size >= 100 || unitIndex === 0 ? 0 : 1
+  return `${size.toFixed(digits)} ${units[unitIndex]}`
+}
+
+function formatProgressPercent(downloadedBytes: number, totalBytes: number) {
+  if (!totalBytes || totalBytes <= 0) {
+    return '0%'
+  }
+
+  const percent = Math.max(
+    0,
+    Math.min(100, Math.round((downloadedBytes / totalBytes) * 100)),
+  )
+  return `${percent}%`
+}
+
+function formatProgressPercentFromRatio(ratio?: number | null) {
+  if (ratio === null || ratio === undefined) {
+    return null
+  }
+
+  return `${Math.max(0, Math.min(100, Math.round(ratio * 100)))}%`
+}
+
+function getPluginDownloadSpeedBytesPerSecond(download: PluginDownloadState) {
+  const elapsedSeconds = getElapsedSeconds(download.startedAt)
+  if (!elapsedSeconds || elapsedSeconds < 1 || download.downloadedBytes <= 0) {
+    return null
+  }
+
+  return download.downloadedBytes / elapsedSeconds
+}
+
+function getPluginDownloadEtaSeconds(
+  download: PluginDownloadState,
+  totalBytes?: number | null,
+) {
+  if (!totalBytes || totalBytes <= download.downloadedBytes) {
+    return null
+  }
+
+  const elapsedSeconds = getElapsedSeconds(download.startedAt)
+  if (!elapsedSeconds || elapsedSeconds < 3) {
+    return null
+  }
+
+  const speedBytesPerSecond = getPluginDownloadSpeedBytesPerSecond(download)
+  if (!speedBytesPerSecond || speedBytesPerSecond <= 0) {
+    return null
+  }
+
+  return Math.max(
+    0,
+    Math.round((totalBytes - download.downloadedBytes) / speedBytesPerSecond),
+  )
+}
+
+function formatPluginInstallDate(value?: string | null) {
+  if (!value) {
+    return 'Not installed'
+  }
+
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return value
+  }
+
+  return parsed.toLocaleString()
+}
+
 function readStoredSidebarVisibility() {
   if (typeof window === 'undefined') {
     return true
@@ -2615,6 +4481,40 @@ function coercePersistedSessionState(
         ? currentImageRelativePath
         : null,
   }
+}
+
+function coerceProjectClassesByRootPath(value: unknown) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return {}
+  }
+
+  const next: Record<string, string[]> = {}
+
+  for (const [rootPath, labels] of Object.entries(value)) {
+    if (typeof rootPath !== 'string' || rootPath.trim() === '') {
+      continue
+    }
+
+    if (!Array.isArray(labels)) {
+      continue
+    }
+
+    next[rootPath] = sanitizeClassList(
+      labels.filter((label): label is string => typeof label === 'string'),
+    )
+  }
+
+  return next
+}
+
+function sanitizeClassList(labels: string[]) {
+  return [
+    ...new Set(
+      labels
+        .map((label) => label.trim())
+        .filter(Boolean),
+    ),
+  ]
 }
 
 function buildDefaultHotkeyBindings(): HotkeyBindings {
@@ -2965,6 +4865,49 @@ function labelFromDatasetPath(path: string) {
   const normalized = path.replace(/[\\/]+$/, '')
   const parts = normalized.split(/[\\/]/).filter(Boolean)
   return parts.at(-1) || path
+}
+
+function resolveProjectClassAlias(label: string, projectClasses: string[]) {
+  const normalizedLabel = label.trim()
+  const match = normalizedLabel.match(/^class_(\d+)$/)
+  if (!match) {
+    return normalizedLabel || 'object'
+  }
+
+  const classIndex = Number(match[1])
+  if (!Number.isInteger(classIndex) || classIndex < 0) {
+    return normalizedLabel || 'object'
+  }
+
+  return projectClasses[classIndex] ?? (normalizedLabel || 'object')
+}
+
+function remapProjectClassAliasesInImageMap(
+  annotationsByImage: Record<string, Annotation[]>,
+  projectClasses: string[],
+) {
+  let hasChanges = false
+  const nextEntries = Object.entries(annotationsByImage).map(
+    ([imageId, imageAnnotations]) => {
+      const nextAnnotations = imageAnnotations.map((annotation) => {
+        const label = resolveProjectClassAlias(annotation.label, projectClasses)
+        if (label === annotation.label) {
+          return annotation
+        }
+
+        hasChanges = true
+        return {
+          ...annotation,
+          label,
+          color: labelToColor(label),
+        }
+      })
+
+      return [imageId, nextAnnotations] as const
+    },
+  )
+
+  return hasChanges ? Object.fromEntries(nextEntries) : annotationsByImage
 }
 
 function isEditableTarget(target: EventTarget | null) {

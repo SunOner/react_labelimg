@@ -14,6 +14,7 @@ DEFAULT_APP_STATE = {
     "recentDatasets": [],
     "sessionState": None,
     "hotkeys": None,
+    "projectClassesByRootPath": {},
 }
 
 
@@ -38,6 +39,12 @@ class CacheStore:
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS service_secrets (
                         key TEXT PRIMARY KEY,
                         value_json TEXT NOT NULL,
                         updated_at REAL NOT NULL
@@ -138,6 +145,50 @@ class CacheStore:
                     )
 
         return state
+
+    def load_service_secret(self, key: str):
+        with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT value_json
+                    FROM service_secrets
+                    WHERE key = ?
+                    """,
+                    (key,),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            return None
+
+    def save_service_secret(self, key: str, value: Any):
+        now = time.time()
+
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO service_secrets (key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(value, ensure_ascii=False), now),
+                )
+
+    def delete_service_secret(self, key: str):
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM service_secrets WHERE key = ?",
+                    (key,),
+                )
 
     def load_dataset_manifest(self, root_path: Path):
         dataset_key = self.dataset_key_for_path(root_path)

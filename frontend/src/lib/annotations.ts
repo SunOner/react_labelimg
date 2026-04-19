@@ -35,6 +35,29 @@ export function buildClassList(annotations: Annotation[]) {
   return [...labels]
 }
 
+export function buildYoloClassList(
+  annotations: Annotation[],
+  preferredClasses: string[] = [],
+) {
+  const labels = new Set<string>()
+
+  for (const preferredClass of preferredClasses) {
+    const normalized = preferredClass.trim()
+    if (normalized) {
+      labels.add(normalized)
+    }
+  }
+
+  for (const annotation of annotations) {
+    const normalized = annotation.label.trim()
+    if (normalized) {
+      labels.add(normalized)
+    }
+  }
+
+  return [...labels]
+}
+
 export function labelToColor(label: string) {
   const normalized = label.trim() || 'object'
   let hash = 0
@@ -142,8 +165,12 @@ export function serializePascalVoc(
     .join('\n')
 }
 
-export function serializeYolo(image: LoadedImage, annotations: Annotation[]) {
-  const classes = buildClassList(annotations)
+export function serializeYolo(
+  image: LoadedImage,
+  annotations: Annotation[],
+  preferredClasses: string[] = [],
+) {
+  const classes = buildYoloClassList(annotations, preferredClasses)
 
   const annotationText = annotations
     .map((annotation) => {

@@ -4,11 +4,15 @@
 
 ## Start
 
+On Windows, run the project from inside WSL (WSL2 recommended). Open a WSL
+terminal, switch to the repository there, and run all commands below from the
+Linux environment. On Linux, use the same steps directly.
+
 Install backend dependencies:
 
 ```bash
-python -m venv .venv
-".venv\Scripts\activate"
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -23,25 +27,20 @@ npm run build
 Run the application from the repository root:
 
 ```bash
+source .venv/bin/activate
 python main.py
 ```
 
-Open:
+Open in your browser from WSL or Windows:
 
 - app: `http://127.0.0.1:8000`
 - API docs: `http://127.0.0.1:8000/docs`
 
 ## Development
 
-Run backend with reload:
+Run backend:
 
 ```bash
+source .venv/bin/activate
 python main.py --reload
-```
-
-Run frontend dev server in another terminal:
-
-```bash
-cd frontend
-npm run dev
 ```
