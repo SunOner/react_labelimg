@@ -42,7 +42,8 @@ import {
   type PluginRuntimeInstallProfile,
 } from './lib/api'
 import {
-  MIN_BOX_SIZE,
+  MIN_ANNOTATION_SIZE,
+  MIN_SAM_CLICK_REGION_SIZE,
   buildClassList,
   downloadTextFile,
   labelToColor,
@@ -2877,7 +2878,7 @@ function App() {
       }
 
       const clickRegionSize = Math.max(
-        MIN_BOX_SIZE * 4,
+        MIN_SAM_CLICK_REGION_SIZE,
         Math.round(Math.min(image.width, image.height) * 0.04),
       )
       const halfSize = clickRegionSize / 2
@@ -2922,7 +2923,10 @@ function App() {
     const nextRect = rectFromPoints(currentDrawStart, point)
     const shouldResetNewBoxMode = viewportTool === 'new-box'
 
-    if (nextRect.width < MIN_BOX_SIZE || nextRect.height < MIN_BOX_SIZE) {
+    if (
+      nextRect.width < MIN_ANNOTATION_SIZE ||
+      nextRect.height < MIN_ANNOTATION_SIZE
+    ) {
       if (!shouldResetNewBoxMode) {
         updateDrawStart(null)
         setDraftRect(null)
@@ -3730,13 +3734,7 @@ function App() {
                             {Math.round(selectedAnnotation.width)}x
                             {Math.round(selectedAnnotation.height)}
                           </p>
-                        ) : (
-                          <p className="plugin-manager-note">
-                            Select a box to enable box-guided refinement. Image
-                            auto-annotation uses every filled Prompt / Label pair,
-                            while box refinement uses the first filled pair.
-                          </p>
-                        )}
+                        ) : null}
 
                         {!currentEntry ? (
                           <p className="plugin-manager-note">

@@ -8,15 +8,16 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { AppButton } from './ui/AppButton'
-import { MIN_BOX_SIZE } from '../lib/annotations'
+import { MIN_ANNOTATION_SIZE } from '../lib/annotations'
 import type { Annotation, LoadedImage, Point, Rect } from '../types'
 
 const STAGE_WIDTH = 1600
 const STAGE_HEIGHT = 900
 const MIN_ZOOM = 1
-const MAX_ZOOM = 4
+const MAX_ZOOM = 8
 const ZOOM_STEP = 0.25
 const BOX_DRAG_ARM_THRESHOLD_PX = 4
+const CONTEXT_SUBMENU_CLOSE_DELAY_MS = 180
 
 type AnnotationViewportProps = {
   image: LoadedImage | null
@@ -113,6 +114,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const stageViewportRef = useRef<HTMLDivElement | null>(null)
   const overlayRef = useRef<SVGSVGElement | null>(null)
   const contextMenuRef = useRef<HTMLDivElement | null>(null)
+  const contextSubmenuCloseTimeoutRef = useRef<number | null>(null)
   const interactionRef = useRef<AnnotationInteraction | null>(null)
   const selectionCycleRef = useRef<{
     point: Point
@@ -127,6 +129,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     x: number
     y: number
   } | null>(null)
+  const [isContextSubmenuOpen, setIsContextSubmenuOpen] = useState(false)
 
   const setStageViewportNode = useCallback((node: HTMLDivElement | null) => {
     resizeObserverRef.current?.disconnect()
@@ -163,8 +166,36 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   useEffect(() => {
     return () => {
       resizeObserverRef.current?.disconnect()
+      if (contextSubmenuCloseTimeoutRef.current !== null) {
+        window.clearTimeout(contextSubmenuCloseTimeoutRef.current)
+      }
     }
   }, [])
+
+  const clearContextSubmenuCloseTimeout = () => {
+    if (contextSubmenuCloseTimeoutRef.current !== null) {
+      window.clearTimeout(contextSubmenuCloseTimeoutRef.current)
+      contextSubmenuCloseTimeoutRef.current = null
+    }
+  }
+
+  const openContextSubmenu = () => {
+    clearContextSubmenuCloseTimeout()
+    setIsContextSubmenuOpen(true)
+  }
+
+  const scheduleContextSubmenuClose = () => {
+    clearContextSubmenuCloseTimeout()
+    contextSubmenuCloseTimeoutRef.current = window.setTimeout(() => {
+      setIsContextSubmenuOpen(false)
+      contextSubmenuCloseTimeoutRef.current = null
+    }, CONTEXT_SUBMENU_CLOSE_DELAY_MS)
+  }
+
+  useEffect(() => {
+    clearContextSubmenuCloseTimeout()
+    setIsContextSubmenuOpen(false)
+  }, [contextMenu])
 
   const onWindowPointerMove = useEffectEvent((event: PointerEvent) => {
     const interaction = interactionRef.current
@@ -460,6 +491,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     : []
   const contextMenuSubmenuClassName = [
     'annotation-context-submenu',
+    isContextSubmenuOpen ? 'is-open' : '',
     contextMenu && contextMenu.x > liveViewport.width - 296 ? 'is-left' : '',
   ]
     .filter(Boolean)
@@ -1014,11 +1046,28 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     ? 'annotation-context-branch'
                     : 'annotation-context-branch is-disabled'
                 }
+                onPointerEnter={() => {
+                  if (contextMenuClassOptions.length > 0) {
+                    openContextSubmenu()
+                  }
+                }}
+                onPointerLeave={() => {
+                  if (contextMenuClassOptions.length > 0) {
+                    scheduleContextSubmenuClose()
+                  }
+                }}
               >
                 <button
                   type="button"
                   className="annotation-context-action annotation-context-action-branch"
                   disabled={contextMenuClassOptions.length === 0}
+                  aria-haspopup={contextMenuClassOptions.length > 0 ? 'menu' : undefined}
+                  aria-expanded={contextMenuClassOptions.length > 0 ? isContextSubmenuOpen : undefined}
+                  onClick={() => {
+                    if (contextMenuClassOptions.length > 0) {
+                      openContextSubmenu()
+                    }
+                  }}
                 >
                   <span className="annotation-context-action-copy">
                     <span className="annotation-context-icon" aria-hidden="true">
@@ -1054,6 +1103,8 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     className={contextMenuSubmenuClassName}
                     role="menu"
                     aria-label="Change class"
+                    onPointerEnter={openContextSubmenu}
+                    onPointerLeave={scheduleContextSubmenuClose}
                   >
                     <div className="annotation-context-title">Classes</div>
                     {contextMenuClassOptions.map((label) => (
@@ -1280,19 +1331,27 @@ function resizeRectFromHandle(
   let nextBottom = bottom
 
   if (handle.includes('w')) {
-    nextLeft = clamp(left + deltaX, 0, right - MIN_BOX_SIZE)
+    nextLeft = clamp(left + deltaX, 0, right - MIN_ANNOTATION_SIZE)
   }
 
   if (handle.includes('e')) {
-    nextRight = clamp(right + deltaX, left + MIN_BOX_SIZE, image.width)
+    nextRight = clamp(
+      right + deltaX,
+      left + MIN_ANNOTATION_SIZE,
+      image.width,
+    )
   }
 
   if (handle.includes('n')) {
-    nextTop = clamp(top + deltaY, 0, bottom - MIN_BOX_SIZE)
+    nextTop = clamp(top + deltaY, 0, bottom - MIN_ANNOTATION_SIZE)
   }
 
   if (handle.includes('s')) {
-    nextBottom = clamp(bottom + deltaY, top + MIN_BOX_SIZE, image.height)
+    nextBottom = clamp(
+      bottom + deltaY,
+      top + MIN_ANNOTATION_SIZE,
+      image.height,
+    )
   }
 
   return {

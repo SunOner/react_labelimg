@@ -2148,9 +2148,29 @@
   pointer-events: none;
 }
 
+.annotation-context-submenu::before {
+  content: '';
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  left: -10px;
+  width: 14px;
+}
+
 .annotation-context-submenu.is-left {
   left: auto;
   right: calc(100% + 4px);
+}
+
+.annotation-context-submenu.is-left::before {
+  left: auto;
+  right: -10px;
+}
+
+.annotation-context-submenu.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
 }
 
 .annotation-context-branch:hover > .annotation-context-submenu,
