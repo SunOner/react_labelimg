@@ -60,7 +60,7 @@ import type {
   Rect,
 } from './types'
 
-type ViewportTool = 'draw' | 'sam-click' | 'sam-box'
+type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
 
 const PRELOAD_RADIUS = 1
 const DELETE_IMAGE_ARM_DURATION_MS = 3000
@@ -122,6 +122,13 @@ const HOTKEY_ACTIONS = [
     title: 'Delete selected box',
     description: 'Remove the currently selected annotation',
     defaultBindings: ['Delete', 'Backspace'],
+  },
+  {
+    id: 'startNewBox',
+    section: 'Annotation',
+    title: 'Start new box',
+    description: 'Switch to draw mode and prepare a new box',
+    defaultBindings: ['W'],
   },
   {
     id: 'autoAnnotateImage',
@@ -282,7 +289,6 @@ function App() {
   >(readStoredPersistedSessionState)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [draftRect, setDraftRect] = useState<Rect | null>(null)
-  const [drawStart, setDrawStart] = useState<Point | null>(null)
   const [activeLabel, setActiveLabel] = useState('object')
   const [openMenu, setOpenMenu] = useState<
     'file' | 'annotation' | 'export' | 'plugins' | 'settings' | null
@@ -371,6 +377,8 @@ function App() {
   const annotationLoadStateRef = useRef<
     Record<string, 'idle' | 'loading' | 'ready' | 'error'>
   >({})
+  const drawStartRef = useRef<Point | null>(null)
+  const viewportHoverPointRef = useRef<Point | null>(null)
   const appStateSyncReadyRef = useRef(false)
   const pendingPreferredImageRelativePathRef = useRef<string | null>(null)
   const sessionVersionRef = useRef(0)
@@ -617,6 +625,18 @@ function App() {
     setRecentDatasets((current) => updater(current))
   }
 
+  const updateDrawStart = (next: Point | null) => {
+    drawStartRef.current = next
+  }
+
+  const handleViewportHoverPointChange = useEffectEvent((point: Point | null) => {
+    viewportHoverPointRef.current = point
+  })
+
+  useEffect(() => {
+    viewportHoverPointRef.current = null
+  }, [currentEntry?.id])
+
   const commitPersistedSessionState = (next: PersistedSessionState | null) => {
     setPersistedSessionState((current) => {
       if (arePersistedSessionStatesEqual(current, next)) {
@@ -787,7 +807,7 @@ function App() {
       setSessionLabel(nextSessionLabel)
       setSessionError(null)
       setSelectedId(null)
-      setDrawStart(null)
+      updateDrawStart(null)
       setDraftRect(null)
       setIsClassManagerOpen(false)
       setNewClassName('')
@@ -1533,7 +1553,10 @@ function App() {
   }, [confirmDialogState])
 
   useEffect(() => {
-    if (!isSamInteractiveReady && viewportTool !== 'draw') {
+    if (
+      !isSamInteractiveReady &&
+      (viewportTool === 'sam-click' || viewportTool === 'sam-box')
+    ) {
       setViewportTool('draw')
     }
   }, [isSamInteractiveReady, viewportTool])
@@ -1611,7 +1634,7 @@ function App() {
 
     pendingPreferredImageRelativePathRef.current = null
     setSelectedId(null)
-    setDrawStart(null)
+    updateDrawStart(null)
     setDraftRect(null)
     setCurrentImageEntry(nextEntry)
   }
@@ -1628,7 +1651,7 @@ function App() {
 
     pendingPreferredImageRelativePathRef.current = null
     setSelectedId(null)
-    setDrawStart(null)
+    updateDrawStart(null)
     setDraftRect(null)
     setCurrentImageEntry(nextEntry)
   }
@@ -1645,7 +1668,7 @@ function App() {
 
     pendingPreferredImageRelativePathRef.current = null
     setSelectedId(null)
-    setDrawStart(null)
+    updateDrawStart(null)
     setDraftRect(null)
     setCurrentImageEntry(nextEntry)
   }
@@ -2318,6 +2341,37 @@ function App() {
     }))
   })
 
+  const changeAnnotationLabel = useEffectEvent((
+    annotationId: string,
+    nextLabel: string,
+  ) => {
+    if (!currentEntry) {
+      return
+    }
+
+    const trimmedLabel = nextLabel.trim()
+    if (!trimmedLabel) {
+      return
+    }
+
+    annotationLoadStateRef.current[currentEntry.id] = 'ready'
+
+    setAnnotationsByImage((current) => ({
+      ...current,
+      [currentEntry.id]: (current[currentEntry.id] ?? []).map((annotation) =>
+        annotation.id === annotationId
+          ? {
+              ...annotation,
+              label: trimmedLabel,
+              color: labelToColor(trimmedLabel),
+            }
+          : annotation,
+      ),
+    }))
+    setSelectedId(annotationId)
+    setActiveLabel(trimmedLabel)
+  })
+
   const moveCurrentImageAnnotation = (
     annotationId: string,
     insertIndex: number,
@@ -2430,6 +2484,43 @@ function App() {
     }
   })
 
+  const startNewBoxDrawing = useEffectEvent((source: 'button' | 'hotkey' = 'button') => {
+    if (!currentEntry) {
+      return
+    }
+
+    if (!image) {
+      pushToast('Wait until the image finishes loading to start a new box.', 'info')
+      return
+    }
+
+    const startPoint =
+      viewportHoverPointRef.current ?? {
+        x: image.width / 2,
+        y: image.height / 2,
+      }
+
+    setViewportTool('new-box')
+    setSelectedId(null)
+    updateDrawStart(startPoint)
+    setDraftRect({ x: startPoint.x, y: startPoint.y, width: 0, height: 0 })
+
+    pushToast(
+      source === 'hotkey'
+        ? 'New box started. Move the mouse and click to place it.'
+        : 'Move the mouse and click to place the new box.',
+      'info',
+    )
+  })
+
+  const handleSelectViewportTool = useEffectEvent((tool: ViewportTool) => {
+    setViewportTool(tool)
+    if (tool !== 'new-box') {
+      updateDrawStart(null)
+      setDraftRect(null)
+    }
+  })
+
   const onGlobalKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (
       hotkeyCaptureTarget ||
@@ -2478,6 +2569,23 @@ function App() {
       return
     }
 
+    const matchesStartNewBoxDefaultKey =
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.shiftKey &&
+      (event.code === 'KeyW' || event.key.toLowerCase() === 'w')
+
+    if (matchesHotkeyAction(event, 'startNewBox') || matchesStartNewBoxDefaultKey) {
+      if (event.repeat) {
+        return
+      }
+
+      event.preventDefault()
+      startNewBoxDrawing('hotkey')
+      return
+    }
+
     if (matchesHotkeyAction(event, 'autoAnnotateImage')) {
       event.preventDefault()
       void handleRunSamAutoAnnotate('full-image')
@@ -2501,8 +2609,8 @@ function App() {
       onGlobalKeyDown(event)
     }
 
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    document.addEventListener('keydown', onKeyDown, true)
+    return () => document.removeEventListener('keydown', onKeyDown, true)
   }, [])
 
   const applyLocalSession = useEffectEvent((
@@ -2638,7 +2746,7 @@ function App() {
       setSessionLoadProgress(null)
       setSessionError(null)
       setSelectedId(null)
-      setDrawStart(null)
+      updateDrawStart(null)
       setDraftRect(null)
       setIsClassManagerOpen(false)
       setNewClassName('')
@@ -2791,30 +2899,40 @@ function App() {
     }
 
     setSelectedId(null)
-    setDrawStart(point)
+    updateDrawStart(point)
     setDraftRect({ x: point.x, y: point.y, width: 0, height: 0 })
   })
 
   const handleCanvasPointerMove = useEffectEvent((point: Point) => {
-    if (!drawStart) {
+    const currentDrawStart = drawStartRef.current
+    if (!currentDrawStart) {
       return
     }
 
-    setDraftRect(rectFromPoints(drawStart, point))
+    const nextRect = rectFromPoints(currentDrawStart, point)
+    setDraftRect(nextRect)
   })
 
   const handleCanvasPointerUp = useEffectEvent((point: Point) => {
-    if (!drawStart || !image) {
+    const currentDrawStart = drawStartRef.current
+    if (!currentDrawStart || !image) {
       return
     }
 
-    const nextRect = rectFromPoints(drawStart, point)
-    setDrawStart(null)
-    setDraftRect(null)
+    const nextRect = rectFromPoints(currentDrawStart, point)
+    const shouldResetNewBoxMode = viewportTool === 'new-box'
 
     if (nextRect.width < MIN_BOX_SIZE || nextRect.height < MIN_BOX_SIZE) {
+      if (!shouldResetNewBoxMode) {
+        updateDrawStart(null)
+        setDraftRect(null)
+      }
+
       return
     }
+
+    updateDrawStart(null)
+    setDraftRect(null)
 
     if (viewportTool === 'sam-box') {
       void runSamAutoAnnotate({
@@ -2842,6 +2960,10 @@ function App() {
     }))
     annotationLoadStateRef.current[image.id] = 'ready'
     setSelectedId(nextAnnotation.id)
+
+    if (shouldResetNewBoxMode) {
+      setViewportTool('draw')
+    }
   })
 
   const handleLabelExport = (format: 'json' | 'voc' | 'yolo') => {
@@ -3100,7 +3222,7 @@ function App() {
               tool={viewportTool}
               showSamTools={isSamInteractiveReady}
               isSamBusy={isRunningSamAction}
-              onSelectTool={setViewportTool}
+              onSelectTool={handleSelectViewportTool}
               onOpenDataset={handleOpenLocalDirectory}
               recentDatasets={recentDatasets}
               onOpenRecentDataset={handleOpenRecentDataset}
@@ -3109,10 +3231,13 @@ function App() {
               onStartDrawing={handleCanvasPointerDown}
               onUpdateDrawing={handleCanvasPointerMove}
               onFinishDrawing={handleCanvasPointerUp}
+              classOptions={classList}
               onSelectAnnotation={setSelectedId}
               onUpdateAnnotationRect={updateAnnotationRect}
+              onChangeAnnotationLabel={changeAnnotationLabel}
               onDuplicateAnnotation={duplicateAnnotation}
               onDeleteAnnotation={removeAnnotation}
+              onHoverPointChange={handleViewportHoverPointChange}
             />
           </div>
         </main>
@@ -3255,6 +3380,20 @@ function App() {
                       Project classes
                     </AppButton>
                   </div>
+                  <AppButton
+                    variant="primary"
+                    isActive={viewportTool === 'new-box'}
+                    className="labeling-new-box-button"
+                    onClick={() => startNewBoxDrawing()}
+                    disabled={!image}
+                    title={
+                      viewportTool === 'new-box'
+                        ? 'Move the mouse and click to place the new box'
+                        : 'Start a new box (W)'
+                    }
+                  >
+                    {viewportTool === 'new-box' ? 'Click to place' : 'New box (W)'}
+                  </AppButton>
                   <div className="chip-list" aria-label="Known classes">
                     {classList.length > 0 ? (
                       classList.map((label) => (

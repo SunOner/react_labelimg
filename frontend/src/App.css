@@ -273,6 +273,15 @@
   background: var(--accent-strong);
 }
 
+.ui-button--primary.is-active {
+  border-color: rgba(77, 208, 166, 0.55);
+  background: var(--accent-strong);
+  box-shadow:
+    inset 0 0 0 1px rgba(7, 17, 13, 0.28),
+    0 0 0 1px rgba(77, 208, 166, 0.18),
+    0 10px 20px rgba(77, 208, 166, 0.18);
+}
+
 .menu-item-copy {
   display: grid;
   gap: 3px;
@@ -700,6 +709,11 @@
   color: var(--ink-soft);
   font-size: 0.76rem;
   font-family: var(--font-mono);
+}
+
+.labeling-new-box-button {
+  width: 100%;
+  justify-content: center;
 }
 
 .class-add-button:hover {
@@ -1960,6 +1974,7 @@
 .viewport-overlay {
   overflow: visible;
   cursor: crosshair;
+  pointer-events: all;
   touch-action: none;
   text-rendering: geometricPrecision;
   shape-rendering: geometricPrecision;
@@ -2065,6 +2080,63 @@
   line-height: 1.15;
   text-align: left;
   cursor: pointer;
+}
+
+.annotation-context-action-copy {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.annotation-context-branch {
+  position: relative;
+}
+
+.annotation-context-action-branch {
+  justify-content: space-between;
+}
+
+.annotation-context-arrow {
+  margin-left: 8px;
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  line-height: 1;
+}
+
+.annotation-context-submenu {
+  position: absolute;
+  top: -1px;
+  left: calc(100% + 4px);
+  z-index: 9;
+  min-width: 148px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  background: rgba(10, 14, 18, 0.98);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.annotation-context-submenu.is-left {
+  left: auto;
+  right: calc(100% + 4px);
+}
+
+.annotation-context-branch:hover > .annotation-context-submenu,
+.annotation-context-branch:focus-within > .annotation-context-submenu {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.annotation-context-branch.is-disabled .annotation-context-action {
+  opacity: 0.56;
+  cursor: not-allowed;
 }
 
 .annotation-context-icon {

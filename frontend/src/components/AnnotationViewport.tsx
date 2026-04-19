@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
-  type WheelEvent as ReactWheelEvent,
 } from 'react'
 import { AppButton } from './ui/AppButton'
 import { MIN_BOX_SIZE } from '../lib/annotations'
@@ -17,6 +16,7 @@ const STAGE_HEIGHT = 900
 const MIN_ZOOM = 1
 const MAX_ZOOM = 4
 const ZOOM_STEP = 0.25
+const BOX_DRAG_ARM_THRESHOLD_PX = 4
 
 type AnnotationViewportProps = {
   image: LoadedImage | null
@@ -26,10 +26,11 @@ type AnnotationViewportProps = {
   annotations: Annotation[]
   selectedId: string | null
   draftRect: Rect | null
-  tool: 'draw' | 'sam-click' | 'sam-box'
+  tool: 'draw' | 'new-box' | 'sam-click' | 'sam-box'
   showSamTools: boolean
   isSamBusy: boolean
-  onSelectTool: (tool: 'draw' | 'sam-click' | 'sam-box') => void
+  classOptions: string[]
+  onSelectTool: (tool: 'draw' | 'new-box' | 'sam-click' | 'sam-box') => void
   onOpenDataset: () => void
   recentDatasets: Array<{ path: string; label: string }>
   onOpenRecentDataset: (path: string) => void
@@ -40,8 +41,10 @@ type AnnotationViewportProps = {
   onFinishDrawing: (point: Point) => void
   onSelectAnnotation: (annotationId: string) => void
   onUpdateAnnotationRect: (annotationId: string, rect: Rect) => void
+  onChangeAnnotationLabel: (annotationId: string, nextLabel: string) => void
   onDuplicateAnnotation: (annotationId: string) => void
   onDeleteAnnotation: (annotationId: string) => void
+  onHoverPointChange?: (point: Point | null) => void
 }
 
 type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se'
@@ -57,6 +60,12 @@ type AnnotationInteraction =
       kind: 'pan'
       startClient: Point
       originPan: Point
+    }
+  | {
+      kind: 'pending-select'
+      annotationId: string
+      startClient: Point
+      startPoint: Point
     }
   | {
       kind: 'move'
@@ -83,6 +92,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   tool,
   showSamTools,
   isSamBusy,
+  classOptions,
   onSelectTool,
   onOpenDataset,
   recentDatasets,
@@ -94,8 +104,10 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   onFinishDrawing,
   onSelectAnnotation,
   onUpdateAnnotationRect,
+  onChangeAnnotationLabel,
   onDuplicateAnnotation,
   onDeleteAnnotation,
+  onHoverPointChange,
 }: AnnotationViewportProps) {
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
   const stageViewportRef = useRef<HTMLDivElement | null>(null)
@@ -171,6 +183,10 @@ export const AnnotationViewport = memo(function AnnotationViewport({
           zoom,
         ),
       )
+      return
+    }
+
+    if (interaction.kind === 'pending-select') {
       return
     }
 
@@ -274,7 +290,8 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const canZoomOut = zoom > MIN_ZOOM
   const canZoomIn = zoom < MAX_ZOOM
   const zoomLabel = `${Math.round(zoom * 100)}%`
-  const isDrawTool = tool === 'draw'
+  const isDrawTool = tool === 'draw' || tool === 'new-box'
+  const isEditTool = tool === 'draw'
   const canUseSamBox = tool === 'sam-box' && !isSamBusy
   const overlayClassName = [
     'viewport-overlay',
@@ -284,6 +301,71 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   ]
     .filter(Boolean)
     .join(' ')
+
+  const updateZoom = (
+    nextZoom: number,
+    focalPoint?: { clientX: number; clientY: number },
+  ) => {
+    const clampedZoom = clampZoom(nextZoom)
+    if (clampedZoom === zoom) {
+      return
+    }
+
+    const viewport = stageViewportRef.current
+    if (!viewport) {
+      setZoom(clampedZoom)
+      return
+    }
+
+    const bounds = viewport.getBoundingClientRect()
+    const liveBounds = {
+      width: viewport.clientWidth || 1,
+      height: viewport.clientHeight || 1,
+    }
+    const currentPan = clampPan(pan, liveBounds, zoom)
+    const currentOffset = getStageOffset(liveBounds, zoom)
+    const pointerX = focalPoint ? focalPoint.clientX - bounds.left : bounds.width / 2
+    const pointerY = focalPoint ? focalPoint.clientY - bounds.top : bounds.height / 2
+    const stageX = (pointerX - currentOffset.x - currentPan.x) / zoom
+    const stageY = (pointerY - currentOffset.y - currentPan.y) / zoom
+    const nextOffset = getStageOffset(liveBounds, clampedZoom)
+    const nextPan = clampPan(
+      {
+        x: pointerX - nextOffset.x - stageX * clampedZoom,
+        y: pointerY - nextOffset.y - stageY * clampedZoom,
+      },
+      liveBounds,
+      clampedZoom,
+    )
+
+    setZoom(clampedZoom)
+    setPan(nextPan)
+  }
+
+  const handleViewportWheel = useEffectEvent((event: WheelEvent) => {
+    event.preventDefault()
+    const nextZoom = zoom + (event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP)
+    updateZoom(nextZoom, {
+      clientX: event.clientX,
+      clientY: event.clientY,
+    })
+  })
+
+  useEffect(() => {
+    const viewport = stageViewportRef.current
+    if (!viewport) {
+      return
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      handleViewportWheel(event)
+    }
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false })
+    return () => {
+      viewport.removeEventListener('wheel', handleWheel)
+    }
+  }, [handleViewportWheel, viewportSize.width, viewportSize.height])
 
   if (!image) {
     const emptyStateLabel = isLoading
@@ -370,61 +452,24 @@ export const AnnotationViewport = memo(function AnnotationViewport({
         top: Math.max(6, Math.min(contextMenu.y, liveViewport.height - 108)),
       }
     : null
-
-  const updateZoom = (
-    nextZoom: number,
-    focalPoint?: { clientX: number; clientY: number },
-  ) => {
-    const clampedZoom = clampZoom(nextZoom)
-    if (clampedZoom === zoom) {
-      return
-    }
-
-    const viewport = stageViewportRef.current
-    if (!viewport) {
-      setZoom(clampedZoom)
-      return
-    }
-
-    const bounds = viewport.getBoundingClientRect()
-    const liveBounds = {
-      width: viewport.clientWidth || 1,
-      height: viewport.clientHeight || 1,
-    }
-    const currentPan = clampPan(pan, liveBounds, zoom)
-    const currentOffset = getStageOffset(liveBounds, zoom)
-    const pointerX = focalPoint ? focalPoint.clientX - bounds.left : bounds.width / 2
-    const pointerY = focalPoint ? focalPoint.clientY - bounds.top : bounds.height / 2
-    const stageX = (pointerX - currentOffset.x - currentPan.x) / zoom
-    const stageY = (pointerY - currentOffset.y - currentPan.y) / zoom
-    const nextOffset = getStageOffset(liveBounds, clampedZoom)
-    const nextPan = clampPan(
-      {
-        x: pointerX - nextOffset.x - stageX * clampedZoom,
-        y: pointerY - nextOffset.y - stageY * clampedZoom,
-      },
-      liveBounds,
-      clampedZoom,
-    )
-
-    setZoom(clampedZoom)
-    setPan(nextPan)
-  }
+  const contextMenuAnnotation = contextMenu
+    ? annotations.find((annotation) => annotation.id === contextMenu.annotationId) ?? null
+    : null
+  const contextMenuClassOptions = contextMenuAnnotation
+    ? classOptions.filter((label) => label !== contextMenuAnnotation.label)
+    : []
+  const contextMenuSubmenuClassName = [
+    'annotation-context-submenu',
+    contextMenu && contextMenu.x > liveViewport.width - 296 ? 'is-left' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
 
   const handleZoomOut = () => updateZoom(zoom - ZOOM_STEP)
 
   const handleZoomIn = () => updateZoom(zoom + ZOOM_STEP)
 
   const handleZoomReset = () => updateZoom(1)
-
-  const handleViewportWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
-    event.preventDefault()
-    const nextZoom = zoom + (event.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP)
-    updateZoom(nextZoom, {
-      clientX: event.clientX,
-      clientY: event.clientY,
-    })
-  }
 
   const handleOverlayPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     const stagePoint = stagePointFromEvent(event)
@@ -495,6 +540,17 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       return
     }
 
+    if (tool === 'new-box') {
+      if (!clampedPoint) {
+        selectionCycleRef.current = null
+        return
+      }
+
+      selectionCycleRef.current = null
+      onFinishDrawing(point ?? clampedPoint)
+      return
+    }
+
     if (hitAnnotation) {
       if (!stagePoint) {
         return
@@ -504,22 +560,34 @@ export const AnnotationViewport = memo(function AnnotationViewport({
         point: stagePoint,
         candidateIds: hitCandidates.map((candidate) => candidate.id),
       }
-      onSelectAnnotation(hitAnnotation.id)
 
       if (!point) {
+        onSelectAnnotation(hitAnnotation.id)
         return
       }
 
+      if (hitAnnotation.id === selectedId) {
+        onSelectAnnotation(hitAnnotation.id)
+        interactionRef.current = {
+          kind: 'move',
+          annotationId: hitAnnotation.id,
+          startPoint: point,
+          originRect: {
+            x: hitAnnotation.x,
+            y: hitAnnotation.y,
+            width: hitAnnotation.width,
+            height: hitAnnotation.height,
+          },
+        }
+        return
+      }
+
+      event.currentTarget.setPointerCapture(event.pointerId)
       interactionRef.current = {
-        kind: 'move',
+        kind: 'pending-select',
         annotationId: hitAnnotation.id,
+        startClient: { x: event.clientX, y: event.clientY },
         startPoint: point,
-        originRect: {
-          x: hitAnnotation.x,
-          y: hitAnnotation.y,
-          width: hitAnnotation.width,
-          height: hitAnnotation.height,
-        },
       }
       return
     }
@@ -535,7 +603,38 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   }
 
   const handleOverlayPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
-    if (interactionRef.current?.kind === 'pan') {
+    const hoverPoint = pointFromEvent(event, image, stageImagePlacement, 'strict')
+    const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
+    onHoverPointChange?.(hoverPoint)
+
+    const interaction = interactionRef.current
+
+    if (interaction?.kind === 'pan') {
+      return
+    }
+
+    if (interaction?.kind === 'pending-select') {
+      if (event.buttons !== 1) {
+        return
+      }
+
+      const deltaX = Math.abs(event.clientX - interaction.startClient.x)
+      const deltaY = Math.abs(event.clientY - interaction.startClient.y)
+      if (
+        deltaX < BOX_DRAG_ARM_THRESHOLD_PX &&
+        deltaY < BOX_DRAG_ARM_THRESHOLD_PX
+      ) {
+        return
+      }
+
+      if (!clampedPoint) {
+        return
+      }
+
+      selectionCycleRef.current = null
+      interactionRef.current = null
+      onStartDrawing(interaction.startPoint)
+      onUpdateDrawing(clampedPoint)
       return
     }
 
@@ -543,11 +642,22 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       return
     }
 
+    if (tool === 'new-box') {
+      if (!clampedPoint) {
+        return
+      }
+
+      onUpdateDrawing(clampedPoint)
+      return
+    }
+
     handlePointerMove(event, image, stageImagePlacement, onUpdateDrawing)
   }
 
   const handleOverlayPointerUp = (event: ReactPointerEvent<SVGSVGElement>) => {
-    if (interactionRef.current?.kind === 'pan') {
+    const interaction = interactionRef.current
+
+    if (interaction?.kind === 'pan') {
       if (event.currentTarget.hasPointerCapture(event.pointerId)) {
         event.currentTarget.releasePointerCapture(event.pointerId)
       }
@@ -556,11 +666,31 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       return
     }
 
+    if (interaction?.kind === 'pending-select') {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId)
+      }
+
+      interactionRef.current = null
+      if (event.type !== 'pointercancel') {
+        onSelectAnnotation(interaction.annotationId)
+      }
+      return
+    }
+
     if (tool === 'sam-click') {
       return
     }
 
+    if (tool === 'new-box') {
+      return
+    }
+
     handlePointerUp(event, image, stageImagePlacement, onFinishDrawing)
+  }
+
+  const handleOverlayPointerLeave = () => {
+    onHoverPointChange?.(null)
   }
 
   const handleOverlayContextMenu = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -642,10 +772,10 @@ export const AnnotationViewport = memo(function AnnotationViewport({
         <div className="viewport-tools" aria-label="Viewport tools">
           <button
             type="button"
-            className={tool === 'draw' ? 'viewport-tool is-active' : 'viewport-tool'}
+            className={isDrawTool ? 'viewport-tool is-active' : 'viewport-tool'}
             onClick={() => onSelectTool('draw')}
-            title="Draw new box"
-            aria-label="Draw new box"
+            title="Draw new box (W)"
+            aria-label="Draw new box (W)"
           >
             <svg viewBox="0 0 20 20" aria-hidden="true">
               <rect x="4" y="4" width="12" height="12" rx="1.5" />
@@ -691,7 +821,6 @@ export const AnnotationViewport = memo(function AnnotationViewport({
         <div
           ref={setStageViewportNode}
           className="viewport-scroll"
-          onWheel={handleViewportWheel}
           onContextMenu={(event) => event.preventDefault()}
         >
           <div
@@ -730,12 +859,14 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               className={overlayClassName}
               viewBox={`0 0 ${STAGE_WIDTH} ${STAGE_HEIGHT}`}
               preserveAspectRatio="xMidYMid meet"
+              pointerEvents="all"
               shapeRendering="geometricPrecision"
               textRendering="geometricPrecision"
               onPointerDown={handleOverlayPointerDown}
               onPointerMove={handleOverlayPointerMove}
               onPointerUp={handleOverlayPointerUp}
               onPointerCancel={handleOverlayPointerUp}
+              onPointerLeave={handleOverlayPointerLeave}
               onContextMenu={handleOverlayContextMenu}
             >
               {annotationGeometries.map((geometry) => {
@@ -790,7 +921,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                       {annotation.label || 'object'}
                     </text>
                   </g>
-                  {isDrawTool && isSelected
+                  {isEditTool && isSelected
                     ? buildResizeHandles(stageRect).map((handle) => (
                         <circle
                           key={handle.id}
@@ -877,6 +1008,70 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               aria-label="Annotation options"
             >
               <div className="annotation-context-title">Options</div>
+              <div
+                className={
+                  contextMenuClassOptions.length > 0
+                    ? 'annotation-context-branch'
+                    : 'annotation-context-branch is-disabled'
+                }
+              >
+                <button
+                  type="button"
+                  className="annotation-context-action annotation-context-action-branch"
+                  disabled={contextMenuClassOptions.length === 0}
+                >
+                  <span className="annotation-context-action-copy">
+                    <span className="annotation-context-icon" aria-hidden="true">
+                      <svg viewBox="0 0 16 16" fill="none">
+                        <path
+                          d="M3.25 4.5h6.5"
+                          stroke="currentColor"
+                          strokeWidth="1.35"
+                          strokeLinecap="round"
+                        />
+                        <path
+                          d="M3.25 8h9.5"
+                          stroke="currentColor"
+                          strokeWidth="1.35"
+                          strokeLinecap="round"
+                        />
+                        <path
+                          d="M3.25 11.5h6.5"
+                          stroke="currentColor"
+                          strokeWidth="1.35"
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                    </span>
+                    <span>Change class</span>
+                  </span>
+                  <span className="annotation-context-arrow" aria-hidden="true">
+                    ›
+                  </span>
+                </button>
+                {contextMenuClassOptions.length > 0 ? (
+                  <div
+                    className={contextMenuSubmenuClassName}
+                    role="menu"
+                    aria-label="Change class"
+                  >
+                    <div className="annotation-context-title">Classes</div>
+                    {contextMenuClassOptions.map((label) => (
+                      <button
+                        key={label}
+                        type="button"
+                        className="annotation-context-action"
+                        onClick={() => {
+                          onChangeAnnotationLabel(contextMenu.annotationId, label)
+                          setContextMenu(null)
+                        }}
+                      >
+                        <span>{label}</span>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               <button
                 type="button"
                 className="annotation-context-action"
@@ -1773,10 +1968,13 @@ function areAnnotationViewportPropsEqual(
     previousProps.onStartDrawing === nextProps.onStartDrawing &&
     previousProps.onUpdateDrawing === nextProps.onUpdateDrawing &&
     previousProps.onFinishDrawing === nextProps.onFinishDrawing &&
+    areStringArraysEqual(previousProps.classOptions, nextProps.classOptions) &&
     previousProps.onSelectAnnotation === nextProps.onSelectAnnotation &&
     previousProps.onUpdateAnnotationRect === nextProps.onUpdateAnnotationRect &&
+    previousProps.onChangeAnnotationLabel === nextProps.onChangeAnnotationLabel &&
     previousProps.onDuplicateAnnotation === nextProps.onDuplicateAnnotation &&
-    previousProps.onDeleteAnnotation === nextProps.onDeleteAnnotation
+    previousProps.onDeleteAnnotation === nextProps.onDeleteAnnotation &&
+    previousProps.onHoverPointChange === nextProps.onHoverPointChange
   )
 }
 
@@ -1798,6 +1996,18 @@ function areLoadedImagesEqual(
     left.width === right.width &&
     left.height === right.height
   )
+}
+
+function areStringArraysEqual(left: string[], right: string[]) {
+  if (left === right) {
+    return true
+  }
+
+  if (left.length !== right.length) {
+    return false
+  }
+
+  return left.every((value, index) => value === right[index])
 }
 
 function areRectsEqual(left: Rect | null, right: Rect | null) {
