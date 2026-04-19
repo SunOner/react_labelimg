@@ -786,9 +786,17 @@
 }
 
 .hotkeys-toolbar {
-  display: inline-flex;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  justify-content: end;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+}
+
+.hotkeys-toolbar .class-manager-close {
+  min-width: 136px;
+  justify-content: center;
 }
 
 .confirm-dialog-copy {
@@ -1268,7 +1276,7 @@
 
 .hotkeys-section {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .hotkeys-section-title {
@@ -1281,16 +1289,16 @@
 
 .hotkeys-list {
   display: grid;
-  gap: 6px;
+  gap: 8px;
 }
 
 .hotkeys-row {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(190px, 240px) minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: minmax(220px, 1fr) minmax(320px, 404px);
+  gap: 14px;
   align-items: start;
-  padding: 8px 10px;
+  padding: 10px 12px;
   border: 1px solid var(--border-soft);
   background: var(--surface-raised);
 }
@@ -1304,6 +1312,8 @@
   min-width: 0;
   display: grid;
   gap: 4px;
+  align-content: start;
+  padding-top: 2px;
 }
 
 .hotkeys-action-title {
@@ -1331,28 +1341,42 @@
 .hotkeys-binding-stack {
   min-width: 0;
   display: grid;
-  gap: 8px;
+  width: 100%;
+  max-width: 404px;
+  justify-self: end;
+  gap: 6px;
 }
 
 .hotkeys-binding {
   min-width: 0;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: minmax(104px, 1fr) auto;
+  align-items: stretch;
+  gap: 8px 10px;
 }
 
 .hotkeys-binding-actions,
 .hotkeys-row-actions {
-  display: inline-flex;
-  flex-wrap: wrap;
+  display: grid;
   align-items: center;
   gap: 6px;
 }
 
+.hotkeys-binding-actions {
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(78px, max-content);
+  justify-content: start;
+}
+
+.hotkeys-row-actions {
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+  gap: 8px;
+}
+
 .hotkeys-binding-action {
   min-width: 0;
-  padding: 6px 9px;
+  min-height: 36px;
+  padding: 0 10px;
   border: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.03);
   color: var(--ink-soft);
@@ -1371,9 +1395,11 @@
 }
 
 .hotkeys-capture-note {
+  min-width: 0;
   color: var(--ink-soft);
   font-size: 0.76rem;
   font-family: var(--font-mono);
+  line-height: 1.35;
 }
 
 .hotkeys-description {
@@ -2438,6 +2464,18 @@
     flex-direction: column;
   }
 
+  .hotkeys-toolbar {
+    width: 100%;
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    justify-content: stretch;
+  }
+
+  .hotkeys-toolbar .class-manager-close {
+    width: 100%;
+    min-width: 0;
+  }
+
   .hf-auth-panel,
   .hf-auth-actions {
     flex-direction: column;
@@ -2466,6 +2504,26 @@
   .plugin-details-grid,
   .hotkeys-row {
     grid-template-columns: 1fr;
+  }
+
+  .hotkeys-binding,
+  .hotkeys-row-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .hotkeys-binding-stack {
+    max-width: none;
+    justify-self: stretch;
+  }
+
+  .hotkeys-binding-actions {
+    grid-auto-flow: row;
+    grid-auto-columns: auto;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .hotkeys-binding-action {
+    width: 100%;
   }
 
   .sam-prompt-row {
