@@ -142,6 +142,9 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     y: number
   } | null>(null)
   const [isContextSubmenuOpen, setIsContextSubmenuOpen] = useState(false)
+  const autoFitZoom = image
+    ? getAutoFitZoom(image.width, image.height)
+    : MIN_ZOOM
 
   const setStageViewportNode = useCallback((node: HTMLDivElement | null) => {
     resizeObserverRef.current?.disconnect()
@@ -208,6 +211,18 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     clearContextSubmenuCloseTimeout()
     setIsContextSubmenuOpen(false)
   }, [contextMenu])
+
+  useEffect(() => {
+    if (!image) {
+      return
+    }
+
+    interactionRef.current = null
+    setIsPanning(false)
+    setContextMenu(null)
+    setPan({ x: 0, y: 0 })
+    setZoom(autoFitZoom)
+  }, [autoFitZoom, image?.height, image?.id, image?.width])
 
   const onWindowPointerMove = useEffectEvent((event: PointerEvent) => {
     const interaction = interactionRef.current
@@ -508,12 +523,19 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   ]
     .filter(Boolean)
     .join(' ')
+  const isAtAutoFitZoom =
+    Math.abs(zoom - autoFitZoom) < 0.001 &&
+    Math.abs(resolvedPan.x) < 0.5 &&
+    Math.abs(resolvedPan.y) < 0.5
 
   const handleZoomOut = () => updateZoom(zoom - ZOOM_STEP)
 
   const handleZoomIn = () => updateZoom(zoom + ZOOM_STEP)
 
-  const handleZoomReset = () => updateZoom(1)
+  const handleZoomReset = () => {
+    setPan({ x: 0, y: 0 })
+    setZoom(autoFitZoom)
+  }
 
   const handleOverlayPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     const stagePoint = stagePointFromEvent(event)
@@ -794,11 +816,11 @@ export const AnnotationViewport = memo(function AnnotationViewport({
           <AppButton
             variant="menu-trigger"
             onClick={handleZoomReset}
-            disabled={zoom === 1}
-            aria-label="Reset zoom"
-            title="Reset zoom"
+            disabled={isAtAutoFitZoom}
+            aria-label={`Fit image (${Math.round(autoFitZoom * 100)}%)`}
+            title={`Fit image (${Math.round(autoFitZoom * 100)}%)`}
           >
-            100%
+            Fit
           </AppButton>
           <AppButton
             variant="menu-trigger"
@@ -1545,6 +1567,22 @@ function fitContainRect(
     height,
     scale,
   }
+}
+
+function getAutoFitZoom(imageWidth: number, imageHeight: number) {
+  const placement = fitContainRect(
+    imageWidth,
+    imageHeight,
+    STAGE_WIDTH,
+    STAGE_HEIGHT,
+  )
+
+  return clampZoom(
+    Math.max(
+      STAGE_WIDTH / placement.width,
+      STAGE_HEIGHT / placement.height,
+    ),
+  )
 }
 
 function mapAnnotationToStage(
