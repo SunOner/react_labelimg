@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, Thread
@@ -143,6 +143,22 @@ class SessionOpenJob:
     total_images: int = 0
     session_revision: int = 0
     session_payload: dict[str, Any] | None = None
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class DuplicateSearchJob:
+    id: str
+    session_id: str
+    status: Literal["running", "completed", "failed"]
+    phase: Literal["hashing", "comparing", "completed", "failed"]
+    minimum_similarity_percent: int
+    processed_images: int = 0
+    total_images: int = 0
+    processed_pairs: int = 0
+    total_pairs: int = 0
+    revision: int = 0
+    matches: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
 
 
@@ -303,10 +319,16 @@ class PluginAutoAnnotateRequest(BaseModel):
     maxResults: int = 12
 
 
+class DuplicateSearchRequest(BaseModel):
+    minimumSimilarityPercent: int = 92
+
+
 LOCAL_SESSIONS: dict[str, LocalSession] = {}
 LOCAL_SESSION_JOBS: dict[str, SessionOpenJob] = {}
 LOCAL_IMAGE_PATHS: dict[str, Path] = {}
 SESSION_JOB_LOCK = Lock()
+DUPLICATE_SEARCH_JOBS: dict[str, DuplicateSearchJob] = {}
+DUPLICATE_SEARCH_LOCK = Lock()
 HF_OAUTH_PENDING_STATES: dict[str, dict[str, Any]] = {}
 HF_OAUTH_PENDING_LOCK = Lock()
 PLUGIN_DOWNLOAD_JOBS: dict[str, PluginDownloadJob] = {}
@@ -753,6 +775,72 @@ def read_local_session_job(job_id: str, after_revision: int = 0):
         "session": session_payload,
         "error": job.error,
     }
+
+
+@app.post("/api/local/sessions/{session_id}/duplicate-search")
+def start_local_duplicate_search(
+    session_id: str,
+    payload: DuplicateSearchRequest | None = None,
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if len(session.images) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="At least two images are required to search for duplicates",
+        )
+
+    request_payload = payload or DuplicateSearchRequest()
+    minimum_similarity_percent = max(
+        0,
+        min(100, int(request_payload.minimumSimilarityPercent)),
+    )
+    job = start_duplicate_search_job(session, minimum_similarity_percent)
+    return {
+        "jobId": job.id,
+    }
+
+
+@app.get("/api/local/duplicate-search-jobs/{job_id}")
+def read_local_duplicate_search_job(job_id: str, after_revision: int = 0):
+    with DUPLICATE_SEARCH_LOCK:
+        job = DUPLICATE_SEARCH_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Duplicate search job not found")
+
+        revision = job.revision
+        all_matches = list(job.matches)
+        matches_payload = list(all_matches) if revision > after_revision else None
+        response = {
+            "jobId": job.id,
+            "status": job.status,
+            "phase": job.phase,
+            "processedImages": job.processed_images,
+            "totalImages": job.total_images,
+            "processedPairs": job.processed_pairs,
+            "totalPairs": job.total_pairs,
+            "minimumSimilarityPercent": job.minimum_similarity_percent,
+            "revision": revision,
+            "error": job.error,
+        }
+        session_id = job.session_id
+
+    filtered_matches = filter_duplicate_search_matches_for_active_session(
+        session_id,
+        all_matches,
+    )
+    response["matchCount"] = len(filtered_matches)
+    response["matches"] = (
+        filter_duplicate_search_matches_for_active_session(
+            session_id,
+            matches_payload or [],
+        )
+        if matches_payload is not None
+        else None
+    )
+    return response
 
 
 @app.get("/api/local/images/{image_id}")
@@ -2739,6 +2827,259 @@ def serialize_manifest_images(images: list[SessionImage]):
         }
         for image in images
     ]
+
+
+def start_duplicate_search_job(
+    session: LocalSession,
+    minimum_similarity_percent: int,
+):
+    image_snapshot = list(session.images)
+    job = DuplicateSearchJob(
+        id=uuid4().hex,
+        session_id=session.id,
+        status="running",
+        phase="hashing",
+        minimum_similarity_percent=minimum_similarity_percent,
+        total_images=len(image_snapshot),
+        total_pairs=(len(image_snapshot) * max(len(image_snapshot) - 1, 0)) // 2,
+    )
+
+    with DUPLICATE_SEARCH_LOCK:
+        DUPLICATE_SEARCH_JOBS[job.id] = job
+
+    def worker():
+        run_duplicate_search_job(job.id, image_snapshot)
+
+    Thread(target=worker, daemon=True).start()
+    return job
+
+
+def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
+    with DUPLICATE_SEARCH_LOCK:
+        job = DUPLICATE_SEARCH_JOBS.get(job_id)
+        minimum_similarity_percent = job.minimum_similarity_percent if job else 92
+
+    if job is None:
+        return
+
+    try:
+        signatures: list[dict[str, Any] | None] = []
+        for index, image in enumerate(images, start=1):
+            try:
+                signature = build_duplicate_image_signature(image.full_path)
+            except HTTPException:
+                raise
+            except Exception:
+                LOGGER.warning(
+                    "Skipping duplicate-search signature for %s",
+                    image.full_path,
+                    exc_info=True,
+                )
+                signature = None
+
+            signatures.append(signature)
+            with DUPLICATE_SEARCH_LOCK:
+                active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
+                if active_job is None:
+                    return
+                active_job.phase = "hashing"
+                active_job.processed_images = index
+
+        processed_pairs = 0
+        total_pairs = (len(images) * max(len(images) - 1, 0)) // 2
+        last_progress_publish_at = time.monotonic()
+
+        for left_index, left_image in enumerate(images):
+            left_signature = signatures[left_index]
+            for right_index in range(left_index + 1, len(images)):
+                right_image = images[right_index]
+                right_signature = signatures[right_index]
+                processed_pairs += 1
+
+                if left_signature is not None and right_signature is not None:
+                    similarity_percent, relative_transform = compare_duplicate_signatures(
+                        left_signature,
+                        right_signature,
+                    )
+                    if similarity_percent >= minimum_similarity_percent:
+                        with DUPLICATE_SEARCH_LOCK:
+                            active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
+                            if active_job is None:
+                                return
+                            active_job.phase = "comparing"
+                            active_job.processed_pairs = processed_pairs
+                            active_job.matches.append(
+                                {
+                                    "id": uuid4().hex,
+                                    "leftImageId": left_image.id,
+                                    "leftName": left_image.name,
+                                    "leftRelativePath": left_image.relative_path,
+                                    "rightImageId": right_image.id,
+                                    "rightName": right_image.name,
+                                    "rightRelativePath": right_image.relative_path,
+                                    "similarityPercent": similarity_percent,
+                                    "relativeTransform": relative_transform,
+                                }
+                            )
+                            active_job.revision += 1
+                        last_progress_publish_at = time.monotonic()
+                        continue
+
+                should_publish_progress = (
+                    processed_pairs == total_pairs
+                    or processed_pairs <= 32
+                    or processed_pairs % 96 == 0
+                    or time.monotonic() - last_progress_publish_at >= 0.18
+                )
+                if should_publish_progress:
+                    with DUPLICATE_SEARCH_LOCK:
+                        active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
+                        if active_job is None:
+                            return
+                        active_job.phase = "comparing"
+                        active_job.processed_pairs = processed_pairs
+                    last_progress_publish_at = time.monotonic()
+
+        with DUPLICATE_SEARCH_LOCK:
+            active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
+            if active_job is None:
+                return
+            active_job.status = "completed"
+            active_job.phase = "completed"
+            active_job.processed_images = len(images)
+            active_job.processed_pairs = total_pairs
+    except Exception as exc:
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        with DUPLICATE_SEARCH_LOCK:
+            active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
+            if active_job is None:
+                return
+            active_job.status = "failed"
+            active_job.phase = "failed"
+            active_job.error = detail or "Failed to search duplicate images"
+
+
+def filter_duplicate_search_matches_for_active_session(
+    session_id: str,
+    matches: list[dict[str, Any]],
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        return []
+
+    active_image_ids = set(session.images_by_id.keys())
+    return [
+        match
+        for match in matches
+        if match.get("leftImageId") in active_image_ids
+        and match.get("rightImageId") in active_image_ids
+    ]
+
+
+def build_duplicate_image_signature(image_path: Path):
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow is required to search for duplicate images",
+        ) from exc
+
+    transpose_variants: tuple[tuple[str, Any], ...] = (
+        ("same", None),
+        ("rotate-90", Image.Transpose.ROTATE_90),
+        ("rotate-180", Image.Transpose.ROTATE_180),
+        ("rotate-270", Image.Transpose.ROTATE_270),
+        ("mirror-horizontal", Image.Transpose.FLIP_LEFT_RIGHT),
+        ("mirror-vertical", Image.Transpose.FLIP_TOP_BOTTOM),
+        ("transpose", Image.Transpose.TRANSPOSE),
+        ("transverse", Image.Transpose.TRANSVERSE),
+    )
+
+    with Image.open(image_path) as source_image:
+        prepared_image = ImageOps.exif_transpose(source_image).convert("L")
+        prepared_image = ImageOps.autocontrast(prepared_image)
+        resample = Image.Resampling.LANCZOS
+        variants: list[dict[str, Any]] = []
+        base_average_hash = 0
+        base_difference_hash = 0
+
+        for name, operation in transpose_variants:
+            transformed_image = (
+                prepared_image if operation is None else prepared_image.transpose(operation)
+            )
+            average_hash = compute_duplicate_average_hash(
+                transformed_image,
+                resample=resample,
+            )
+            difference_hash = compute_duplicate_difference_hash(
+                transformed_image,
+                resample=resample,
+            )
+            variants.append(
+                {
+                    "name": name,
+                    "averageHash": average_hash,
+                    "differenceHash": difference_hash,
+                }
+            )
+            if operation is None:
+                base_average_hash = average_hash
+                base_difference_hash = difference_hash
+
+    return {
+        "averageHash": base_average_hash,
+        "differenceHash": base_difference_hash,
+        "variants": variants,
+    }
+
+
+def compute_duplicate_average_hash(image: Any, *, resample: Any):
+    resized = image.resize((8, 8), resample=resample)
+    pixels = list(resized.getdata())
+    average_value = sum(int(pixel) for pixel in pixels) / max(len(pixels), 1)
+    hash_value = 0
+    for pixel in pixels:
+        hash_value = (hash_value << 1) | int(int(pixel) >= average_value)
+
+    return hash_value
+
+
+def compute_duplicate_difference_hash(image: Any, *, resample: Any):
+    resized = image.resize((9, 8), resample=resample)
+    pixels = list(resized.getdata())
+    hash_value = 0
+
+    for row_index in range(8):
+        row_offset = row_index * 9
+        for column_index in range(8):
+            left_pixel = int(pixels[row_offset + column_index])
+            right_pixel = int(pixels[row_offset + column_index + 1])
+            hash_value = (hash_value << 1) | int(left_pixel > right_pixel)
+
+    return hash_value
+
+
+def compare_duplicate_signatures(
+    left_signature: dict[str, Any],
+    right_signature: dict[str, Any],
+):
+    best_similarity = 0.0
+    best_transform = "same"
+
+    for variant in right_signature.get("variants", []):
+        average_distance = (
+            int(left_signature["averageHash"]) ^ int(variant["averageHash"])
+        ).bit_count()
+        difference_distance = (
+            int(left_signature["differenceHash"]) ^ int(variant["differenceHash"])
+        ).bit_count()
+        similarity = 1.0 - ((average_distance + difference_distance) / 128.0)
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_transform = str(variant["name"])
+
+    return round(max(0.0, best_similarity) * 100, 1), best_transform
 
 
 def build_session_image(path: Path, root_path: Path):

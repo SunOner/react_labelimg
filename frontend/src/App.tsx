@@ -20,6 +20,7 @@ import {
   fetchApiHealth,
   fetchHuggingFaceAuthStatus,
   fetchLocalAnnotations,
+  fetchLocalDuplicateSearchJob,
   fetchLocalSessionJob,
   fetchPlugins,
   fetchPredefinedClasses,
@@ -32,12 +33,15 @@ import {
   runPluginAutoAnnotate,
   runCacheDbAction,
   saveLocalAnnotations,
+  startLocalDuplicateSearch,
   startHuggingFaceAuth,
   updateHuggingFaceAuthConfig,
   updateAppState,
   type CacheDbAction,
   type CacheDbSummary,
   type HuggingFaceAuthStatus,
+  type LocalDuplicateSearchJobResponse,
+  type LocalDuplicateSearchMatch,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
   type PluginAutoAnnotateResult,
@@ -79,6 +83,7 @@ const HOTKEY_BINDINGS_STORAGE_KEY = 'labelimg.hotkeys'
 const SAM_SETTINGS_STORAGE_KEY = 'labelimg.samSettings'
 const DEFAULT_SAM_SCORE_THRESHOLD = '0.25'
 const DEFAULT_SAM_MAX_RESULTS = '8'
+const DEFAULT_DUPLICATE_SEARCH_THRESHOLD = '92'
 const MAX_RECENT_DATASETS = 6
 const HUGGING_FACE_OAUTH_APP_URL =
   'https://huggingface.co/settings/applications/new'
@@ -276,6 +281,20 @@ type ToastItem = {
   isClosing: boolean
 }
 
+type DuplicateSearchRuntimeStatus = 'idle' | LocalDuplicateSearchJobResponse['status']
+
+type DuplicateSearchRuntime = {
+  jobId: string | null
+  revision: number
+  status: DuplicateSearchRuntimeStatus
+  phase: LocalDuplicateSearchJobResponse['phase']
+  processedImages: number
+  totalImages: number
+  processedPairs: number
+  totalPairs: number
+  minimumSimilarityPercent: number
+}
+
 const CACHE_DB_ACTION_ITEMS: Array<{
   action: CacheDbAction
   title: string
@@ -367,7 +386,7 @@ function App() {
   const [draftRect, setDraftRect] = useState<Rect | null>(null)
   const [activeLabel, setActiveLabel] = useState('object')
   const [openMenu, setOpenMenu] = useState<
-    'file' | 'annotation' | 'export' | 'plugins' | 'settings' | null
+    'file' | 'annotation' | 'export' | 'tools' | 'plugins' | 'settings' | null
   >(null)
   const [backendStatus, setBackendStatus] = useState<
     'checking' | 'online' | 'offline'
@@ -390,6 +409,7 @@ function App() {
   const [isHotkeysOpen, setIsHotkeysOpen] = useState(false)
   const [isCacheDbOpen, setIsCacheDbOpen] = useState(false)
   const [isPluginsOpen, setIsPluginsOpen] = useState(false)
+  const [isDuplicateSearchOpen, setIsDuplicateSearchOpen] = useState(false)
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
@@ -445,6 +465,18 @@ function App() {
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [armedDeleteImageId, setArmedDeleteImageId] = useState<string | null>(null)
   const [isDeletingCurrentImage, setIsDeletingCurrentImage] = useState(false)
+  const [duplicateSearchThresholdDraft, setDuplicateSearchThresholdDraft] =
+    useState(DEFAULT_DUPLICATE_SEARCH_THRESHOLD)
+  const [duplicateSearchRuntime, setDuplicateSearchRuntime] =
+    useState<DuplicateSearchRuntime>(buildInitialDuplicateSearchRuntime)
+  const [duplicateSearchMatches, setDuplicateSearchMatches] = useState<
+    LocalDuplicateSearchMatch[]
+  >([])
+  const [duplicateSearchError, setDuplicateSearchError] = useState<string | null>(
+    null,
+  )
+  const [duplicateSearchDeletingImageId, setDuplicateSearchDeletingImageId] =
+    useState<string | null>(null)
   const [draggedAnnotationId, setDraggedAnnotationId] = useState<string | null>(
     null,
   )
@@ -477,6 +509,16 @@ function App() {
   const toastTimeoutsRef = useRef<Record<string, number>>({})
   const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
   const pluginToastKeysRef = useRef<Record<string, string>>({})
+
+  const resetDuplicateSearchState = (closeDialog = false) => {
+    if (closeDialog) {
+      setIsDuplicateSearchOpen(false)
+    }
+    setDuplicateSearchRuntime(buildInitialDuplicateSearchRuntime())
+    setDuplicateSearchMatches([])
+    setDuplicateSearchError(null)
+    setDuplicateSearchDeletingImageId(null)
+  }
 
   const currentImageIndex =
     currentImageEntry !== null
@@ -529,6 +571,14 @@ function App() {
   const effectiveActiveLabel = classList.includes(activeLabel)
     ? activeLabel
     : (classList[0] ?? activeLabel)
+  const duplicateSearchThresholdValue = clampNumericInput(
+    duplicateSearchThresholdDraft,
+    92,
+    {
+      min: 0,
+      max: 100,
+    },
+  )
   const samScoreThresholdValue = clampNumericInput(samScoreThresholdDraft, 0.25, {
     min: 0,
     max: 1,
@@ -544,6 +594,24 @@ function App() {
     {},
   )
   const hasSession = images.length > 0
+  const canSearchDuplicates =
+    backendStatus === 'online' && currentSessionId !== null && images.length > 1
+  const imagesById = new Map<string, ImageEntry>(
+    images.map((entry) => [entry.id, entry] as const),
+  )
+  const visibleDuplicateSearchMatches = duplicateSearchMatches.filter((match) => {
+    return (
+      imagesById.has(match.leftImageId) && imagesById.has(match.rightImageId)
+    )
+  })
+  const displayedDuplicateSearchThreshold =
+    duplicateSearchRuntime.status === 'idle'
+      ? Math.round(duplicateSearchThresholdValue)
+      : duplicateSearchRuntime.minimumSimilarityPercent
+  const duplicateSearchProgressRatio =
+    duplicateSearchRuntime.totalPairs > 0
+      ? duplicateSearchRuntime.processedPairs / duplicateSearchRuntime.totalPairs
+      : null
   const isCurrentImageLoading =
     Boolean(currentEntry) &&
     (!currentResource || currentResource.status === 'loading')
@@ -1631,6 +1699,109 @@ function App() {
   }, [isPluginsOpen])
 
   useEffect(() => {
+    if (!isDuplicateSearchOpen) {
+      return
+    }
+
+    const handleCloseHotkey = (event: KeyboardEvent) => {
+      if (matchesHotkeyAction(event, 'closeOverlay')) {
+        event.preventDefault()
+        closeDuplicateSearch()
+      }
+    }
+
+    window.addEventListener('keydown', handleCloseHotkey)
+    return () => window.removeEventListener('keydown', handleCloseHotkey)
+  }, [isDuplicateSearchOpen])
+
+  useEffect(() => {
+    const jobId = duplicateSearchRuntime.jobId
+    if (!jobId) {
+      return
+    }
+
+    let cancelled = false
+
+    const pollJob = async () => {
+      let lastRevision = 0
+
+      while (!cancelled) {
+        try {
+          const job = await fetchLocalDuplicateSearchJob(jobId, lastRevision)
+          if (cancelled) {
+            return
+          }
+
+          setDuplicateSearchRuntime((current) => {
+            if (current.jobId !== jobId) {
+              return current
+            }
+
+            return {
+              jobId,
+              revision: job.revision,
+              status: job.status,
+              phase: job.phase,
+              processedImages: job.processedImages,
+              totalImages: job.totalImages,
+              processedPairs: job.processedPairs,
+              totalPairs: job.totalPairs,
+              minimumSimilarityPercent: job.minimumSimilarityPercent,
+            }
+          })
+
+          if (job.matches) {
+            lastRevision = job.revision
+            setDuplicateSearchMatches(sortDuplicateSearchMatches(job.matches))
+          }
+
+          if (job.status === 'failed') {
+            setDuplicateSearchError(
+              job.error || 'Failed to search for duplicate images',
+            )
+            return
+          }
+
+          if (job.status === 'completed') {
+            setDuplicateSearchError(null)
+            return
+          }
+        } catch (error) {
+          if (cancelled) {
+            return
+          }
+
+          setDuplicateSearchRuntime((current) => {
+            if (current.jobId !== jobId) {
+              return current
+            }
+
+            return {
+              ...current,
+              status: 'failed',
+              phase: 'failed',
+            }
+          })
+          setDuplicateSearchError(
+            error instanceof Error
+              ? error.message
+              : 'Failed to read duplicate-search progress',
+          )
+          return
+        }
+
+        await delay(180)
+      }
+    }
+
+    void pollJob()
+
+    return () => {
+      cancelled = true
+    }
+  }, [duplicateSearchRuntime.jobId])
+
+  useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       if (event.origin !== window.location.origin) {
         return
@@ -1948,9 +2119,23 @@ function App() {
 
   const clearSession = () => {
     setOpenMenu(null)
+    resetDuplicateSearchState(true)
     commitPersistedSessionState(null)
     resetSessionState([], 'No session')
   }
+
+  const focusImageById = useEffectEvent((imageId: string) => {
+    const nextEntry = images.find((entry) => entry.id === imageId) ?? null
+    if (!nextEntry) {
+      return
+    }
+
+    pendingPreferredImageRelativePathRef.current = null
+    setSelectedId(null)
+    updateDrawStart(null)
+    setDraftRect(null)
+    setCurrentImageEntry(nextEntry)
+  })
 
   const openClassManager = () => {
     if (!currentSessionRootPath) {
@@ -1969,6 +2154,24 @@ function App() {
     setNewClassName('')
     setEditingClassLabel(null)
     setEditingClassDraft('')
+  }
+
+  const closeDuplicateSearch = () => {
+    setIsDuplicateSearchOpen(false)
+    setDuplicateSearchError(null)
+  }
+
+  const openDuplicateSearch = () => {
+    if (!canSearchDuplicates) {
+      return
+    }
+
+    setOpenMenu(null)
+    setDuplicateSearchError(null)
+    setIsDuplicateSearchOpen(true)
+    if (duplicateSearchRuntime.status === 'idle') {
+      void startDuplicateSearch()
+    }
   }
 
   const openHotkeys = () => {
@@ -2016,6 +2219,54 @@ function App() {
     setIsPluginsOpen(false)
     setDownloadingPluginId(null)
   }
+
+  const startDuplicateSearch = useEffectEvent(async () => {
+    if (!currentSessionId || images.length < 2) {
+      setDuplicateSearchError(
+        'Open a folder with at least two images to search for duplicates.',
+      )
+      return
+    }
+
+    const minimumSimilarityPercent = Math.round(duplicateSearchThresholdValue)
+    setDuplicateSearchError(null)
+    setDuplicateSearchDeletingImageId(null)
+    setDuplicateSearchMatches([])
+    setDuplicateSearchRuntime({
+      jobId: null,
+      revision: 0,
+      status: 'running',
+      phase: 'hashing',
+      processedImages: 0,
+      totalImages: images.length,
+      processedPairs: 0,
+      totalPairs: (images.length * Math.max(images.length - 1, 0)) / 2,
+      minimumSimilarityPercent,
+    })
+
+    try {
+      const response = await startLocalDuplicateSearch(
+        currentSessionId,
+        minimumSimilarityPercent,
+      )
+      setDuplicateSearchRuntime((current) => ({
+        ...current,
+        jobId: response.jobId,
+      }))
+    } catch (error) {
+      setDuplicateSearchRuntime((current) => ({
+        ...current,
+        status: 'failed',
+        phase: 'failed',
+        jobId: null,
+      }))
+      setDuplicateSearchError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to start duplicate search',
+      )
+    }
+  })
 
   const handleDownloadPlugin = useEffectEvent(async (pluginId: string) => {
     setPluginsError(null)
@@ -2795,13 +3046,79 @@ function App() {
     replaceImageAnnotations(currentEntry.id, [], { selectedAnnotationId: null })
   }
 
+  const deleteSessionImageById = useEffectEvent(async (
+    imageId: string,
+    preferredImageRelativePath?: string | null,
+  ) => {
+    if (!currentSessionId || !isDatasetSession) {
+      throw new Error('Open a dataset to delete images.')
+    }
+
+    const imageToDelete = images.find((entry) => entry.id === imageId) ?? null
+    if (!imageToDelete) {
+      throw new Error('Image not found in the current session.')
+    }
+
+    const imageIndex = images.findIndex((entry) => entry.id === imageId)
+    const nextPreferredImageRelativePath =
+      preferredImageRelativePath !== undefined
+        ? preferredImageRelativePath
+        : currentEntry?.id === imageId
+          ? images[imageIndex + 1]?.relativePath ??
+            images[imageIndex - 1]?.relativePath ??
+            null
+          : currentEntry?.relativePath ?? null
+
+    const session = await deleteLocalSessionImage(currentSessionId, imageToDelete.id)
+
+    applyLocalSession(session, {
+      preferredImageRelativePath: nextPreferredImageRelativePath,
+    })
+
+    if (!nextPreferredImageRelativePath && persistedSessionState) {
+      commitPersistedSessionState({
+        ...persistedSessionState,
+        currentImageRelativePath: null,
+      })
+    }
+
+    pushToast(`Deleted ${imageToDelete.relativePath}.`, 'success')
+    return imageToDelete
+  })
+
+  const handleDeleteDuplicateResultImage = useEffectEvent(async (
+    imageId: string,
+    fallbackImageId: string,
+  ) => {
+    if (!isDatasetSession) {
+      setDuplicateSearchError('Only dataset sessions support deleting duplicate images.')
+      return
+    }
+
+    const fallbackEntry = imagesById.get(fallbackImageId) ?? null
+    const preferredImageRelativePath =
+      currentEntry?.id === imageId
+        ? (fallbackEntry?.relativePath ?? null)
+        : (currentEntry?.relativePath ?? fallbackEntry?.relativePath ?? null)
+
+    setDuplicateSearchDeletingImageId(imageId)
+    setDuplicateSearchError(null)
+
+    try {
+      await deleteSessionImageById(imageId, preferredImageRelativePath)
+    } catch (error) {
+      setDuplicateSearchError(
+        error instanceof Error ? error.message : 'Failed to delete image',
+      )
+    } finally {
+      setDuplicateSearchDeletingImageId((current) =>
+        current === imageId ? null : current,
+      )
+    }
+  })
+
   const handleDeleteCurrentImage = useEffectEvent(async () => {
-    if (
-      !currentSessionId ||
-      !currentEntry ||
-      !currentSessionRootPath ||
-      !isDatasetSession
-    ) {
+    if (!currentEntry || !isDatasetSession) {
       return
     }
 
@@ -2811,34 +3128,12 @@ function App() {
       return
     }
 
-    const imageToDelete = currentEntry
-    const preferredImageRelativePath =
-      images[currentImageIndex + 1]?.relativePath ??
-      images[currentImageIndex - 1]?.relativePath ??
-      null
-
     clearDeleteImageArm()
     setIsDeletingCurrentImage(true)
     setSessionError(null)
 
     try {
-      const session = await deleteLocalSessionImage(
-        currentSessionId,
-        imageToDelete.id,
-      )
-
-      applyLocalSession(session, {
-        preferredImageRelativePath,
-      })
-
-      if (!preferredImageRelativePath && isDatasetSession && persistedSessionState) {
-        commitPersistedSessionState({
-          ...persistedSessionState,
-          currentImageRelativePath: null,
-        })
-      }
-
-      pushToast(`Deleted ${imageToDelete.relativePath}.`, 'success')
+      await deleteSessionImageById(currentEntry.id)
     } catch (error) {
       setSessionError(
         error instanceof Error ? error.message : 'Failed to delete image',
@@ -2889,7 +3184,8 @@ function App() {
       isClassManagerOpen ||
       isHotkeysOpen ||
       isCacheDbOpen ||
-      isPluginsOpen
+      isPluginsOpen ||
+      isDuplicateSearchOpen
     ) {
       return
     }
@@ -3094,6 +3390,7 @@ function App() {
     annotationLoadStateRef.current = {}
     imageResourcesRef.current = {}
     clearScheduledAnnotationSave()
+    resetDuplicateSearchState(true)
     pendingPreferredImageRelativePathRef.current =
       preferredImageRelativePath && preferredImageIndex < 0
         ? preferredImageRelativePath
@@ -3518,6 +3815,28 @@ function App() {
                     setOpenMenu(null)
                   }}
                   disabled={!image}
+                />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="menu-root">
+            <AppButton
+              variant="menu-trigger"
+              isActive={openMenu === 'tools'}
+              onClick={() =>
+                setOpenMenu((current) => (current === 'tools' ? null : 'tools'))
+              }
+            >
+              Tools
+            </AppButton>
+            {openMenu === 'tools' ? (
+              <div className="menu-popover" role="menu" aria-label="Tools">
+                <MenuItemButton
+                  title="Search Duplicates"
+                  description="Scan the current dataset and surface similar image pairs live"
+                  onClick={openDuplicateSearch}
+                  disabled={!canSearchDuplicates}
                 />
               </div>
             ) : null}
@@ -4230,6 +4549,282 @@ function App() {
           </aside>
         ) : null}
       </div>
+
+      {isDuplicateSearchOpen ? (
+        <div
+          className="lightbox-backdrop"
+          onClick={closeDuplicateSearch}
+        >
+          <div
+            className="plugin-manager-lightbox duplicate-search-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Search duplicates"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="class-manager-header duplicate-search-header">
+              <div>
+                <p className="section-kicker">Tools</p>
+                <h2>Search duplicates</h2>
+                <p className="plugin-manager-note">
+                  Perceptual scan of the current dataset with rotated and mirrored
+                  variants. Matching pairs appear here while the scan is running.
+                </p>
+              </div>
+              <div className="hotkeys-toolbar">
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={() => void startDuplicateSearch()}
+                  disabled={!canSearchDuplicates || duplicateSearchRuntime.status === 'running'}
+                >
+                  {duplicateSearchRuntime.status === 'running'
+                    ? 'Scanning...'
+                    : duplicateSearchRuntime.status === 'completed'
+                      ? 'Rescan'
+                      : 'Start scan'}
+                </AppButton>
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={closeDuplicateSearch}
+                >
+                  Close
+                </AppButton>
+              </div>
+            </div>
+
+            <section className="plugin-card duplicate-search-summary-card">
+              <div className="duplicate-search-toolbar">
+                <label className="hf-auth-field duplicate-search-threshold-field">
+                  <span className="plugin-detail-label">Minimum similarity</span>
+                  <div className="duplicate-search-threshold-row">
+                    <input
+                      className="class-manager-input"
+                      type="number"
+                      min="0"
+                      max="100"
+                      step="1"
+                      value={duplicateSearchThresholdDraft}
+                      onChange={(event) =>
+                        setDuplicateSearchThresholdDraft(event.target.value)
+                      }
+                    />
+                    <span className="duplicate-search-threshold-suffix">%</span>
+                  </div>
+                </label>
+
+                <div className="duplicate-search-status-copy">
+                  <div className="plugin-card-title-row">
+                    <h3>
+                      {formatDuplicateSearchPhase(
+                        duplicateSearchRuntime.status,
+                        duplicateSearchRuntime.phase,
+                      )}
+                    </h3>
+                    <span
+                      className={
+                        duplicateSearchRuntime.status === 'completed'
+                          ? 'plugin-status is-installed'
+                          : 'plugin-status'
+                      }
+                    >
+                      {duplicateSearchRuntime.status === 'running'
+                        ? 'Live'
+                        : duplicateSearchRuntime.status === 'failed'
+                          ? 'Error'
+                          : duplicateSearchRuntime.status === 'completed'
+                            ? 'Completed'
+                            : 'Idle'}
+                    </span>
+                  </div>
+                  <p className="plugin-manager-note">
+                    {duplicateSearchRuntime.status === 'running'
+                      ? 'Tiles are added immediately after each similar pair is detected.'
+                      : duplicateSearchRuntime.status === 'completed'
+                        ? 'Use Rescan after changing the threshold to refresh the results.'
+                        : 'Open a dataset and start the scan to compare visually similar files.'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="meta-grid duplicate-search-meta-grid">
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Threshold</span>
+                  <strong>{displayedDuplicateSearchThreshold}%</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Matches</span>
+                  <strong>{visibleDuplicateSearchMatches.length}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Images</span>
+                  <strong>
+                    {duplicateSearchRuntime.processedImages.toLocaleString()} /{' '}
+                    {duplicateSearchRuntime.totalImages.toLocaleString()}
+                  </strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Pairs</span>
+                  <strong>
+                    {duplicateSearchRuntime.processedPairs.toLocaleString()} /{' '}
+                    {duplicateSearchRuntime.totalPairs.toLocaleString()}
+                  </strong>
+                </div>
+              </div>
+
+              {duplicateSearchRuntime.status === 'running' ? (
+                <div className="duplicate-search-progress-panel">
+                  <div className="dataset-progress-meta">
+                    <span className="dataset-progress-spinner" aria-hidden="true" />
+                    <span className="plugin-manager-note">
+                      {duplicateSearchProgressRatio !== null
+                        ? `${formatProgressPercentFromRatio(duplicateSearchProgressRatio) ?? '0%'} compared`
+                        : 'Preparing scan'}
+                    </span>
+                  </div>
+                  <div className="duplicate-search-progress-track" aria-hidden="true">
+                    <div
+                      className="duplicate-search-progress-bar"
+                      style={{
+                        width: `${
+                          Math.max(
+                            0,
+                            Math.min(100, (duplicateSearchProgressRatio ?? 0) * 100),
+                          )
+                        }%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+
+              {duplicateSearchError ? (
+                <p className="plugin-manager-note is-error">{duplicateSearchError}</p>
+              ) : null}
+            </section>
+
+            <section className="plugin-card duplicate-search-results-card">
+              <div className="plugin-card-title-row">
+                <h3>Live matches</h3>
+                <span className="plugin-status">
+                  {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
+                </span>
+              </div>
+
+              {visibleDuplicateSearchMatches.length > 0 ? (
+                <div className="duplicate-search-grid">
+                  {visibleDuplicateSearchMatches.map((match) => {
+                    const leftEntry = imagesById.get(match.leftImageId)
+                    const rightEntry = imagesById.get(match.rightImageId)
+                    if (!leftEntry || !rightEntry) {
+                      return null
+                    }
+
+                    const isDeletingLeft =
+                      duplicateSearchDeletingImageId === match.leftImageId
+                    const isDeletingRight =
+                      duplicateSearchDeletingImageId === match.rightImageId
+
+                    return (
+                      <article key={match.id} className="duplicate-search-card">
+                        <div className="duplicate-search-card-main">
+                          <button
+                            type="button"
+                            className="duplicate-search-preview"
+                            onClick={() => focusImageById(match.leftImageId)}
+                          >
+                            <span className="duplicate-search-preview-frame">
+                              <img
+                                src={leftEntry.url}
+                                alt={match.leftRelativePath}
+                                loading="lazy"
+                              />
+                            </span>
+                            <span className="duplicate-search-preview-copy">
+                              <strong>{match.leftName}</strong>
+                              <span>{match.leftRelativePath}</span>
+                            </span>
+                          </button>
+
+                          <div className="duplicate-search-card-center">
+                            <div className="duplicate-search-score">
+                              <strong>
+                                {formatDuplicateSimilarity(match.similarityPercent)}
+                              </strong>
+                              <span>
+                                {formatDuplicateTransform(match.relativeTransform)}
+                              </span>
+                            </div>
+                            <AppButton
+                              variant="ghost"
+                              className="duplicate-search-delete-button"
+                              onClick={() =>
+                                void handleDeleteDuplicateResultImage(
+                                  match.leftImageId,
+                                  match.rightImageId,
+                                )
+                              }
+                              disabled={
+                                !isDatasetSession ||
+                                duplicateSearchDeletingImageId !== null
+                              }
+                            >
+                              {isDeletingLeft ? 'Deleting...' : 'Delete left'}
+                            </AppButton>
+                            <AppButton
+                              variant="ghost"
+                              className="duplicate-search-delete-button"
+                              onClick={() =>
+                                void handleDeleteDuplicateResultImage(
+                                  match.rightImageId,
+                                  match.leftImageId,
+                                )
+                              }
+                              disabled={
+                                !isDatasetSession ||
+                                duplicateSearchDeletingImageId !== null
+                              }
+                            >
+                              {isDeletingRight ? 'Deleting...' : 'Delete right'}
+                            </AppButton>
+                          </div>
+
+                          <button
+                            type="button"
+                            className="duplicate-search-preview"
+                            onClick={() => focusImageById(match.rightImageId)}
+                          >
+                            <span className="duplicate-search-preview-frame">
+                              <img
+                                src={rightEntry.url}
+                                alt={match.rightRelativePath}
+                                loading="lazy"
+                              />
+                            </span>
+                            <span className="duplicate-search-preview-copy">
+                              <strong>{match.rightName}</strong>
+                              <span>{match.rightRelativePath}</span>
+                            </span>
+                          </button>
+                        </div>
+                      </article>
+                    )
+                  })}
+                </div>
+              ) : duplicateSearchRuntime.status === 'completed' ? (
+                <p className="plugin-manager-note">
+                  No pairs reached {duplicateSearchRuntime.minimumSimilarityPercent}%.
+                </p>
+              ) : (
+                <p className="plugin-manager-note">
+                  Similar image tiles will appear here in real time during the scan.
+                </p>
+              )}
+            </section>
+          </div>
+        </div>
+      ) : null}
 
       {isClassManagerOpen ? (
         <div
@@ -5700,6 +6295,84 @@ function formatProgressPercentFromRatio(ratio?: number | null) {
   }
 
   return `${Math.max(0, Math.min(100, Math.round(ratio * 100)))}%`
+}
+
+function buildInitialDuplicateSearchRuntime(): DuplicateSearchRuntime {
+  return {
+    jobId: null,
+    revision: 0,
+    status: 'idle',
+    phase: 'hashing',
+    processedImages: 0,
+    totalImages: 0,
+    processedPairs: 0,
+    totalPairs: 0,
+    minimumSimilarityPercent: Number(DEFAULT_DUPLICATE_SEARCH_THRESHOLD),
+  }
+}
+
+function sortDuplicateSearchMatches(matches: LocalDuplicateSearchMatch[]) {
+  return [...matches].sort((left, right) => {
+    if (right.similarityPercent !== left.similarityPercent) {
+      return right.similarityPercent - left.similarityPercent
+    }
+
+    if (left.leftRelativePath !== right.leftRelativePath) {
+      return left.leftRelativePath.localeCompare(right.leftRelativePath)
+    }
+
+    return left.rightRelativePath.localeCompare(right.rightRelativePath)
+  })
+}
+
+function formatDuplicateSimilarity(value: number) {
+  return `${Math.max(0, Math.min(100, value)).toFixed(value % 1 === 0 ? 0 : 1)}%`
+}
+
+function formatDuplicateSearchPhase(
+  status: DuplicateSearchRuntimeStatus,
+  phase: DuplicateSearchRuntime['phase'],
+) {
+  if (status === 'failed' || phase === 'failed') {
+    return 'Scan failed'
+  }
+
+  if (status === 'completed' || phase === 'completed') {
+    return 'Scan completed'
+  }
+
+  if (phase === 'comparing') {
+    return 'Comparing image pairs'
+  }
+
+  if (phase === 'hashing') {
+    return 'Analyzing image signatures'
+  }
+
+  return 'Ready to scan'
+}
+
+function formatDuplicateTransform(transform: string) {
+  switch (transform) {
+    case 'same':
+      return 'Same orientation'
+    case 'rotate-90':
+      return 'Rotated 90°'
+    case 'rotate-180':
+      return 'Rotated 180°'
+    case 'rotate-270':
+      return 'Rotated 270°'
+    case 'mirror-horizontal':
+      return 'Mirrored horizontally'
+    case 'mirror-vertical':
+      return 'Mirrored vertically'
+    case 'transpose':
+      return 'Diagonal mirror'
+    case 'transverse':
+      return 'Reverse diagonal mirror'
+    default:
+      return transform
+  }
 }
 
 function getPluginDownloadSpeedBytesPerSecond(download: PluginDownloadState) {

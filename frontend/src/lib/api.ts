@@ -63,6 +63,37 @@ export type LocalSessionJobResponse = {
   error?: string | null
 }
 
+export type LocalDuplicateSearchJobStartResponse = {
+  jobId: string
+}
+
+export type LocalDuplicateSearchMatch = {
+  id: string
+  leftImageId: string
+  leftName: string
+  leftRelativePath: string
+  rightImageId: string
+  rightName: string
+  rightRelativePath: string
+  similarityPercent: number
+  relativeTransform: string
+}
+
+export type LocalDuplicateSearchJobResponse = {
+  jobId: string
+  status: 'running' | 'completed' | 'failed'
+  phase: 'hashing' | 'comparing' | 'completed' | 'failed'
+  processedImages: number
+  totalImages: number
+  processedPairs: number
+  totalPairs: number
+  minimumSimilarityPercent: number
+  revision: number
+  matchCount: number
+  matches?: LocalDuplicateSearchMatch[] | null
+  error?: string | null
+}
+
 export type RecentDatasetEntry = {
   path: string
   label: string
@@ -493,6 +524,33 @@ export async function openLocalDirectoryPathJob(path: string) {
 export async function fetchLocalSessionJob(jobId: string, afterRevision = 0) {
   return requestJson<LocalSessionJobResponse>(
     `/api/local/session-jobs/${jobId}?after_revision=${afterRevision}`,
+  )
+}
+
+export async function startLocalDuplicateSearch(
+  sessionId: string,
+  minimumSimilarityPercent: number,
+) {
+  return requestJson<LocalDuplicateSearchJobStartResponse>(
+    `/api/local/sessions/${sessionId}/duplicate-search`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        minimumSimilarityPercent,
+      }),
+    },
+  )
+}
+
+export async function fetchLocalDuplicateSearchJob(
+  jobId: string,
+  afterRevision = 0,
+) {
+  return requestJson<LocalDuplicateSearchJobResponse>(
+    `/api/local/duplicate-search-jobs/${jobId}?after_revision=${afterRevision}`,
   )
 }
 
