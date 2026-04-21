@@ -31,6 +31,8 @@ export type LocalSessionJobStartResponse = {
 export type LocalAnnotation = {
   id: string
   label: string
+  sourceClassIndex?: number | null
+  hasUnknownClass?: boolean
   difficult: boolean
   x: number
   y: number

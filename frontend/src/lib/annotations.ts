@@ -11,6 +11,7 @@ const COLOR_PALETTE = [
   '#505f7b',
 ]
 
+export const INVALID_ANNOTATION_COLOR = '#e25c5c'
 export const MIN_ANNOTATION_SIZE = 1
 export const MIN_SAM_CLICK_REGION_SIZE = 40
 

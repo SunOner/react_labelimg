@@ -259,6 +259,8 @@ class CacheDbActionPayload(BaseModel):
 
 class LocalAnnotationPayload(BaseModel):
     label: str | None = None
+    sourceClassIndex: int | None = None
+    hasUnknownClass: bool = False
     difficult: bool = False
     x: float
     y: float
@@ -2866,7 +2868,10 @@ def load_image_annotations(session: LocalSession, image: SessionImage):
             class_source_path=class_source.source_path,
             class_source_mtime_ns=class_source.source_mtime_ns,
         )
-        if cached_annotations is not None:
+        if (
+            cached_annotations is not None
+            and cached_yolo_annotations_include_source_indexes(cached_annotations)
+        ):
             return cached_annotations
 
         annotations = load_yolo_annotations(
@@ -2929,6 +2934,7 @@ def save_image_annotations(
 ):
     annotation_format = image.annotation_format or infer_session_annotation_format(session)
     annotation_path = resolve_annotation_output_path(session, image, annotation_format)
+    cache_payload = annotations
 
     if annotation_format == "voc":
         write_pascal_voc_annotations(annotation_path, image, annotations)
@@ -2952,6 +2958,7 @@ def save_image_annotations(
         )
         write_yolo_classes(classes_path, class_names)
         write_yolo_annotations(annotation_path, image.full_path, annotations, class_names)
+        cache_payload = attach_yolo_source_class_indexes(annotations, class_names)
         class_source_path = classes_path
         class_source_mtime_ns = classes_path.stat().st_mtime_ns
 
@@ -2968,7 +2975,7 @@ def save_image_annotations(
         image_mtime_ns=image.mtime_ns,
         class_source_path=class_source_path,
         class_source_mtime_ns=class_source_mtime_ns,
-        payload=annotations,
+        payload=cache_payload,
     )
     CACHE_STORE.save_dataset_manifest(
         session.root_path,
@@ -3317,11 +3324,14 @@ def load_yolo_annotations(
             if 0 <= class_index < len(class_names)
             else f"class_{class_index}"
         )
+        has_unknown_class = not (0 <= class_index < len(class_names))
 
         annotations.append(
             {
                 "id": uuid4().hex,
                 "label": label,
+                "sourceClassIndex": class_index,
+                "hasUnknownClass": has_unknown_class,
                 "difficult": False,
                 "x": left,
                 "y": top,
@@ -3331,6 +3341,41 @@ def load_yolo_annotations(
         )
 
     return annotations
+
+
+def cached_yolo_annotations_include_source_indexes(
+    annotations: list[dict[str, Any]],
+):
+    for annotation in annotations:
+        if "sourceClassIndex" not in annotation:
+            return False
+        if "hasUnknownClass" not in annotation:
+            return False
+
+        source_class_index = annotation.get("sourceClassIndex")
+        if source_class_index is not None and not isinstance(source_class_index, int):
+            return False
+        if not isinstance(annotation.get("hasUnknownClass"), bool):
+            return False
+
+    return True
+
+
+def attach_yolo_source_class_indexes(
+    annotations: list[dict[str, Any]],
+    class_names: list[str],
+):
+    indexed_annotations: list[dict[str, Any]] = []
+
+    for annotation in annotations:
+        label = str(annotation.get("label") or "object").strip() or "object"
+        source_class_index = class_names.index(label) if label in class_names else None
+        next_annotation = dict(annotation)
+        next_annotation["sourceClassIndex"] = source_class_index
+        next_annotation["hasUnknownClass"] = source_class_index is None
+        indexed_annotations.append(next_annotation)
+
+    return indexed_annotations
 
 
 def count_yolo_annotation_lines(annotation_path: Path):

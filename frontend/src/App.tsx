@@ -47,6 +47,7 @@ import {
   type PluginRuntimeInstallProfile,
 } from './lib/api'
 import {
+  INVALID_ANNOTATION_COLOR,
   MIN_ANNOTATION_SIZE,
   MIN_SAM_CLICK_REGION_SIZE,
   buildClassList,
@@ -517,7 +518,13 @@ function App() {
     currentSessionRootPath !== null && hasStoredProjectClasses
       ? (projectClassesByRootPath[currentSessionRootPath] ?? [])
       : backendClasses
-  const annotationClassList = buildClassList(sessionAnnotations)
+  const usableSessionAnnotations = sessionAnnotations.filter((annotation) =>
+    isAnnotationUsableInLabeling(annotation, projectClasses),
+  )
+  const exportableAnnotations = annotations.filter((annotation) =>
+    isAnnotationUsableInLabeling(annotation, projectClasses),
+  )
+  const annotationClassList = buildClassList(usableSessionAnnotations)
   const classList = [...new Set([...projectClasses, ...annotationClassList])]
   const effectiveActiveLabel = classList.includes(activeLabel)
     ? activeLabel
@@ -529,7 +536,7 @@ function App() {
   const isDatasetSession = persistedSessionState?.sourceKind === 'dataset'
   const isDeleteImageArmed =
     currentEntry !== null && armedDeleteImageId === currentEntry.id
-  const classUsageCounts = sessionAnnotations.reduce<Record<string, number>>(
+  const classUsageCounts = usableSessionAnnotations.reduce<Record<string, number>>(
     (current, annotation) => {
       current[annotation.label] = (current[annotation.label] ?? 0) + 1
       return current
@@ -954,6 +961,9 @@ function App() {
 
     const sessionId = currentSessionId
     const preferredClasses = [...(projectClassesOverride ?? projectClasses)]
+    const persistedAnnotations = nextAnnotations.filter((annotation) =>
+      isAnnotationUsableInLabeling(annotation, preferredClasses),
+    )
     const nextRevision = (annotationSaveRevisionRef.current[imageId] ?? 0) + 1
     annotationSaveRevisionRef.current[imageId] = nextRevision
 
@@ -968,7 +978,7 @@ function App() {
       void saveLocalAnnotations(
         sessionId,
         imageId,
-        nextAnnotations,
+        persistedAnnotations,
         preferredClasses,
       )
         .then((payload) => {
@@ -1006,11 +1016,15 @@ function App() {
     } = {},
   ) => {
     annotationLoadStateRef.current[imageId] = 'ready'
+    const effectiveProjectClasses = options.projectClassesOverride ?? projectClasses
     commitAnnotationsByImage((current) => ({
       ...current,
       [imageId]: nextAnnotations,
     }))
-    updateImageAnnotationMetadata(imageId, nextAnnotations.length)
+    updateImageAnnotationMetadata(
+      imageId,
+      countLabelingEligibleAnnotations(nextAnnotations, effectiveProjectClasses),
+    )
 
     if (options.selectedAnnotationId !== undefined && currentEntry?.id === imageId) {
       setSelectedId(options.selectedAnnotationId)
@@ -1208,11 +1222,14 @@ function App() {
         }
 
         const nextAnnotations = payload.annotations.map((annotation) => {
-          const label = resolveProjectClassAlias(annotation.label, projectClasses)
+          const { label, color } = resolveAnnotationDisplayState(
+            annotation,
+            projectClasses,
+          )
           return {
             ...annotation,
             label,
-            color: labelToColor(label),
+            color,
           }
         })
 
@@ -1221,7 +1238,10 @@ function App() {
             imageEntry.id === entry.id
               ? {
                   ...imageEntry,
-                  annotationCount: payload.count ?? nextAnnotations.length,
+                  annotationCount: countLabelingEligibleAnnotations(
+                    nextAnnotations,
+                    projectClasses,
+                  ),
                 }
               : imageEntry,
           ),
@@ -2168,6 +2188,11 @@ function App() {
                 ? {
                     ...annotation,
                     label: bestMatch.label,
+                    sourceClassIndex: projectClassIndexForLabel(
+                      bestMatch.label,
+                      projectClasses,
+                    ),
+                    hasUnknownClass: false,
                     color: labelToColor(bestMatch.label),
                     x: bestMatch.x,
                     y: bestMatch.y,
@@ -2211,6 +2236,11 @@ function App() {
         const nextAnnotations = collectedAnnotations.map((annotation) => ({
           id: crypto.randomUUID(),
           label: annotation.label,
+          sourceClassIndex: projectClassIndexForLabel(
+            annotation.label,
+            projectClasses,
+          ),
+          hasUnknownClass: false,
           color: labelToColor(annotation.label),
           difficult: false,
           x: annotation.x,
@@ -2579,7 +2609,10 @@ function App() {
       annotationLoadStateRef.current[imageId] = 'ready'
       updateImageAnnotationMetadata(
         imageId,
-        nextAnnotationsByImage[imageId]?.length ?? 0,
+        countLabelingEligibleAnnotations(
+          nextAnnotationsByImage[imageId] ?? [],
+          nextProjectClasses ?? projectClasses,
+        ),
       )
       scheduleAnnotationSave(
         imageId,
@@ -2706,6 +2739,11 @@ function App() {
           ? {
               ...annotation,
               label: trimmedLabel,
+              sourceClassIndex: projectClassIndexForLabel(
+                trimmedLabel,
+                projectClasses,
+              ),
+              hasUnknownClass: false,
               color: labelToColor(trimmedLabel),
             }
           : annotation,
@@ -3285,6 +3323,8 @@ function App() {
     const nextAnnotation: Annotation = {
       id: crypto.randomUUID(),
       label,
+      sourceClassIndex: projectClassIndexForLabel(label, projectClasses),
+      hasUnknownClass: false,
       color: labelToColor(label),
       difficult: false,
       ...nextRect,
@@ -3306,7 +3346,7 @@ function App() {
       return
     }
 
-    if (format !== 'yolo' && annotations.length === 0) {
+    if (format !== 'yolo' && exportableAnnotations.length === 0) {
       return
     }
 
@@ -3315,7 +3355,7 @@ function App() {
     if (format === 'json') {
       downloadTextFile(
         `${baseName}.labelimg-next.json`,
-        serializeSession(image, annotations),
+        serializeSession(image, exportableAnnotations),
         'application/json;charset=utf-8',
       )
       return
@@ -3324,13 +3364,13 @@ function App() {
     if (format === 'voc') {
       downloadTextFile(
         `${baseName}.xml`,
-        serializePascalVoc(image, annotations),
+        serializePascalVoc(image, exportableAnnotations),
         'application/xml;charset=utf-8',
       )
       return
     }
 
-    const yolo = serializeYolo(image, annotations, projectClasses)
+    const yolo = serializeYolo(image, exportableAnnotations, projectClasses)
     downloadTextFile(`${baseName}.txt`, yolo.annotationText)
     downloadTextFile('classes.txt', yolo.classesText)
   }
@@ -3791,158 +3831,176 @@ function App() {
                         setDragInsertIndex(null)
                       }}
                     >
-                      {annotations.map((annotation, index) => (
-                        <div
-                          key={annotation.id}
-                          className={[
-                            'current-box-row',
-                            draggedAnnotationId === annotation.id
-                              ? 'is-dragging'
-                              : '',
-                            draggedAnnotationId !== annotation.id &&
-                            dragInsertIndex === index
-                              ? 'drop-before'
-                              : '',
-                            draggedAnnotationId !== annotation.id &&
-                            dragInsertIndex === index + 1
-                              ? 'drop-after'
-                              : '',
-                          ]
-                            .filter(Boolean)
-                            .join(' ')}
-                          draggable
-                          onDragStart={(event) => {
-                            event.dataTransfer.effectAllowed = 'move'
-                            event.dataTransfer.setData('text/plain', annotation.id)
-                            setSelectedId(annotation.id)
-                            setDraggedAnnotationId(annotation.id)
-                            setDragInsertIndex(index)
-                          }}
-                          onDragOver={(event) => {
-                            if (!draggedAnnotationId) {
-                              return
-                            }
+                      {annotations.map((annotation, index) => {
+                        const isInvalidAnnotation = !isAnnotationUsableInLabeling(
+                          annotation,
+                          projectClasses,
+                        )
 
-                            event.preventDefault()
-                            const bounds = event.currentTarget.getBoundingClientRect()
-                            const nextInsertIndex =
-                              event.clientY < bounds.top + bounds.height / 2
-                                ? index
-                                : index + 1
+                        return (
+                          <div
+                            key={annotation.id}
+                            className={[
+                              'current-box-row',
+                              isInvalidAnnotation ? 'is-invalid-class' : '',
+                              draggedAnnotationId === annotation.id
+                                ? 'is-dragging'
+                                : '',
+                              draggedAnnotationId !== annotation.id &&
+                              dragInsertIndex === index
+                                ? 'drop-before'
+                                : '',
+                              draggedAnnotationId !== annotation.id &&
+                              dragInsertIndex === index + 1
+                                ? 'drop-after'
+                                : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' ')}
+                            draggable
+                            onDragStart={(event) => {
+                              event.dataTransfer.effectAllowed = 'move'
+                              event.dataTransfer.setData('text/plain', annotation.id)
+                              setSelectedId(annotation.id)
+                              setDraggedAnnotationId(annotation.id)
+                              setDragInsertIndex(index)
+                            }}
+                            onDragOver={(event) => {
+                              if (!draggedAnnotationId) {
+                                return
+                              }
 
-                            if (dragInsertIndex !== nextInsertIndex) {
-                              setDragInsertIndex(nextInsertIndex)
-                            }
-                          }}
-                          onDrop={(event) => {
-                            if (!draggedAnnotationId || dragInsertIndex === null) {
-                              return
-                            }
+                              event.preventDefault()
+                              const bounds = event.currentTarget.getBoundingClientRect()
+                              const nextInsertIndex =
+                                event.clientY < bounds.top + bounds.height / 2
+                                  ? index
+                                  : index + 1
 
-                            event.preventDefault()
-                            moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
-                            setDraggedAnnotationId(null)
-                            setDragInsertIndex(null)
-                          }}
-                          onDragEnd={() => {
-                            setDraggedAnnotationId(null)
-                            setDragInsertIndex(null)
-                          }}
-                        >
-                          <AppButton
-                            variant="list-row"
-                            isActive={annotation.id === selectedId}
-                            className="current-box-item"
-                            onClick={() => setSelectedId(annotation.id)}
-                            title={annotation.label || 'object'}
+                              if (dragInsertIndex !== nextInsertIndex) {
+                                setDragInsertIndex(nextInsertIndex)
+                              }
+                            }}
+                            onDrop={(event) => {
+                              if (!draggedAnnotationId || dragInsertIndex === null) {
+                                return
+                              }
+
+                              event.preventDefault()
+                              moveCurrentImageAnnotation(draggedAnnotationId, dragInsertIndex)
+                              setDraggedAnnotationId(null)
+                              setDragInsertIndex(null)
+                            }}
+                            onDragEnd={() => {
+                              setDraggedAnnotationId(null)
+                              setDragInsertIndex(null)
+                            }}
                           >
-                            <span className="current-box-index">{index + 1}</span>
-                            <span
-                              className="current-box-swatch"
-                              style={{ backgroundColor: annotation.color }}
-                              aria-hidden="true"
-                            />
-                            <span className="current-box-name">
-                              {annotation.label || 'object'}
-                            </span>
-                          </AppButton>
-                          <div className="current-box-actions">
                             <AppButton
-                              variant="ghost"
-                              className="current-box-action"
-                              title="Duplicate box"
-                              aria-label={`Duplicate ${annotation.label || 'object'}`}
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                duplicateAnnotation(annotation.id)
-                              }}
+                              variant="list-row"
+                              isActive={annotation.id === selectedId}
+                              className="current-box-item"
+                              onClick={() => setSelectedId(annotation.id)}
+                              title={
+                                isInvalidAnnotation
+                                  ? `${annotation.label || 'object'} · missing class mapping`
+                                  : annotation.label || 'object'
+                              }
                             >
-                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                <rect
-                                  x="5.25"
-                                  y="5.25"
-                                  width="7"
-                                  height="7"
-                                  rx="1.25"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                />
-                                <path
-                                  d="M3.75 10.75h-.5c-.55 0-1-.45-1-1v-6.5c0-.55.45-1 1-1h6.5c.55 0 1 .45 1 1v.5"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                              </svg>
+                              <span className="current-box-index">{index + 1}</span>
+                              <span
+                                className="current-box-swatch"
+                                style={{ backgroundColor: annotation.color }}
+                                aria-hidden="true"
+                              />
+                              <span className="current-box-name">
+                                {annotation.label || 'object'}
+                                {isInvalidAnnotation ? ' · missing class' : ''}
+                              </span>
                             </AppButton>
-                            <AppButton
-                              variant="ghost"
-                              className="current-box-action is-danger"
-                              title="Delete box"
-                              aria-label={`Delete ${annotation.label || 'object'}`}
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                removeAnnotation(annotation.id)
-                              }}
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                <path
-                                  d="M3.5 4.5h9"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M6 2.75h4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                                <path
-                                  d="M6.75 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M9.25 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                              </svg>
-                            </AppButton>
+                            <div className="current-box-actions">
+                              <AppButton
+                                variant="ghost"
+                                className="current-box-action"
+                                title={
+                                  isInvalidAnnotation
+                                    ? 'Resolve or delete this box before duplicating it'
+                                    : 'Duplicate box'
+                                }
+                                aria-label={`Duplicate ${annotation.label || 'object'}`}
+                                disabled={isInvalidAnnotation}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  duplicateAnnotation(annotation.id)
+                                }}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                  <rect
+                                    x="5.25"
+                                    y="5.25"
+                                    width="7"
+                                    height="7"
+                                    rx="1.25"
+                                    stroke="currentColor"
+                                    strokeWidth="1.35"
+                                  />
+                                  <path
+                                    d="M3.75 10.75h-.5c-.55 0-1-.45-1-1v-6.5c0-.55.45-1 1-1h6.5c.55 0 1 .45 1 1v.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.35"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              </AppButton>
+                              <AppButton
+                                variant="ghost"
+                                className="current-box-action is-danger"
+                                title="Delete box"
+                                aria-label={`Delete ${annotation.label || 'object'}`}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  removeAnnotation(annotation.id)
+                                }}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                  <path
+                                    d="M3.5 4.5h9"
+                                    stroke="currentColor"
+                                    strokeWidth="1.35"
+                                    strokeLinecap="round"
+                                  />
+                                  <path
+                                    d="M6 2.75h4"
+                                    stroke="currentColor"
+                                    strokeWidth="1.35"
+                                    strokeLinecap="round"
+                                  />
+                                  <path
+                                    d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.35"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                  <path
+                                    d="M6.75 6.5v4"
+                                    stroke="currentColor"
+                                    strokeWidth="1.2"
+                                    strokeLinecap="round"
+                                  />
+                                  <path
+                                    d="M9.25 6.5v4"
+                                    stroke="currentColor"
+                                    strokeWidth="1.2"
+                                    strokeLinecap="round"
+                                  />
+                                </svg>
+                              </AppButton>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   ) : (
                     <span className="muted">No boxes on this image.</span>
@@ -4190,8 +4248,8 @@ function App() {
                 <p className="section-kicker">Settings</p>
                 <h2>Project classes</h2>
                 <p className="plugin-manager-note">
-                  Used for YOLO export and empty-image annotations in the current
-                  project.
+                  Used for YOLO class mapping, export and empty-image
+                  annotations in the current project.
                 </p>
               </div>
               <AppButton
@@ -6296,6 +6354,18 @@ function labelFromDatasetPath(path: string) {
   return parts.at(-1) || path
 }
 
+function projectClassIndexForLabel(label: string, projectClasses: string[]) {
+  const normalizedLabel = label.trim()
+  if (!normalizedLabel) {
+    return null
+  }
+
+  const classIndex = projectClasses.findIndex(
+    (projectClass) => projectClass === normalizedLabel,
+  )
+  return classIndex >= 0 ? classIndex : null
+}
+
 function resolveProjectClassAlias(label: string, projectClasses: string[]) {
   const normalizedLabel = label.trim()
   const match = normalizedLabel.match(/^class_(\d+)$/)
@@ -6311,6 +6381,75 @@ function resolveProjectClassAlias(label: string, projectClasses: string[]) {
   return projectClasses[classIndex] ?? (normalizedLabel || 'object')
 }
 
+function resolveProjectClassLabel(
+  annotation: {
+    label: string
+    sourceClassIndex?: number | null
+    hasUnknownClass?: boolean
+  },
+  projectClasses: string[],
+) {
+  const sourceClassIndex = annotation.sourceClassIndex
+  if (
+    typeof sourceClassIndex === 'number' &&
+    Number.isInteger(sourceClassIndex) &&
+    sourceClassIndex >= 0
+  ) {
+    const sourceLabel = projectClasses[sourceClassIndex]
+    if (sourceLabel) {
+      return sourceLabel
+    }
+  }
+
+  return resolveProjectClassAlias(annotation.label, projectClasses)
+}
+
+function isAnnotationUsableInLabeling(
+  annotation: {
+    sourceClassIndex?: number | null
+    hasUnknownClass?: boolean
+  },
+  projectClasses: string[],
+) {
+  if (!annotation.hasUnknownClass) {
+    return true
+  }
+
+  const sourceClassIndex = annotation.sourceClassIndex
+  return (
+    typeof sourceClassIndex === 'number' &&
+    Number.isInteger(sourceClassIndex) &&
+    sourceClassIndex >= 0 &&
+    Boolean(projectClasses[sourceClassIndex])
+  )
+}
+
+function countLabelingEligibleAnnotations(
+  annotations: Annotation[],
+  projectClasses: string[],
+) {
+  return annotations.filter((annotation) =>
+    isAnnotationUsableInLabeling(annotation, projectClasses),
+  ).length
+}
+
+function resolveAnnotationDisplayState(
+  annotation: {
+    label: string
+    sourceClassIndex?: number | null
+    hasUnknownClass?: boolean
+  },
+  projectClasses: string[],
+) {
+  const label = resolveProjectClassLabel(annotation, projectClasses)
+  return {
+    label,
+    color: isAnnotationUsableInLabeling(annotation, projectClasses)
+      ? labelToColor(label)
+      : INVALID_ANNOTATION_COLOR,
+  }
+}
+
 function remapProjectClassAliasesInImageMap(
   annotationsByImage: Record<string, Annotation[]>,
   projectClasses: string[],
@@ -6319,8 +6458,11 @@ function remapProjectClassAliasesInImageMap(
   const nextEntries = Object.entries(annotationsByImage).map(
     ([imageId, imageAnnotations]) => {
       const nextAnnotations = imageAnnotations.map((annotation) => {
-        const label = resolveProjectClassAlias(annotation.label, projectClasses)
-        if (label === annotation.label) {
+        const { label, color } = resolveAnnotationDisplayState(
+          annotation,
+          projectClasses,
+        )
+        if (label === annotation.label && color === annotation.color) {
           return annotation
         }
 
@@ -6328,7 +6470,7 @@ function remapProjectClassAliasesInImageMap(
         return {
           ...annotation,
           label,
-          color: labelToColor(label),
+          color,
         }
       })
 

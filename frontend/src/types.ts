@@ -13,6 +13,8 @@ export type Rect = {
 export type Annotation = Rect & {
   id: string
   label: string
+  sourceClassIndex?: number | null
+  hasUnknownClass?: boolean
   color: string
   difficult: boolean
 }
