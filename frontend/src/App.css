@@ -2165,6 +2165,16 @@
   cursor: nesw-resize;
 }
 
+.bbox-handle-n,
+.bbox-handle-s {
+  cursor: ns-resize;
+}
+
+.bbox-handle-e,
+.bbox-handle-w {
+  cursor: ew-resize;
+}
+
 .annotation-context-menu {
   position: absolute;
   z-index: 8;

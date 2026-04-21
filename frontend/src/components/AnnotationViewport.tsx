@@ -48,7 +48,16 @@ type AnnotationViewportProps = {
   onHoverPointChange?: (point: Point | null) => void
 }
 
-type ResizeHandle = 'nw' | 'ne' | 'sw' | 'se'
+type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+
+type ResizeHandleGeometry = {
+  id: ResizeHandle
+  cx: number
+  cy: number
+  radius: number
+  hitRadius: number
+  strokeWidth: number
+}
 
 type AnnotationLabelMetrics = {
   fontSize: number
@@ -1410,7 +1419,10 @@ function resizeRectFromHandle(
   }
 }
 
-function buildResizeHandles(rect: Rect, effectiveScale: number) {
+function buildResizeHandles(
+  rect: Rect,
+  effectiveScale: number,
+): ResizeHandleGeometry[] {
   const toStageUnits = (screenPx: number) => screenPx / effectiveScale
   const minSideScreenPx = Math.max(
     Math.min(rect.width, rect.height) * effectiveScale,
@@ -1424,9 +1436,17 @@ function buildResizeHandles(rect: Rect, effectiveScale: number) {
   const strokeWidth = toStageUnits(strokeWidthPx)
 
   return [
-    { id: 'nw' as const, cx: rect.x, cy: rect.y, radius, hitRadius, strokeWidth },
+    { id: 'nw', cx: rect.x, cy: rect.y, radius, hitRadius, strokeWidth },
     {
-      id: 'ne' as const,
+      id: 'n',
+      cx: rect.x + rect.width / 2,
+      cy: rect.y,
+      radius,
+      hitRadius,
+      strokeWidth,
+    },
+    {
+      id: 'ne',
       cx: rect.x + rect.width,
       cy: rect.y,
       radius,
@@ -1434,7 +1454,15 @@ function buildResizeHandles(rect: Rect, effectiveScale: number) {
       strokeWidth,
     },
     {
-      id: 'sw' as const,
+      id: 'e',
+      cx: rect.x + rect.width,
+      cy: rect.y + rect.height / 2,
+      radius,
+      hitRadius,
+      strokeWidth,
+    },
+    {
+      id: 'sw',
       cx: rect.x,
       cy: rect.y + rect.height,
       radius,
@@ -1442,9 +1470,25 @@ function buildResizeHandles(rect: Rect, effectiveScale: number) {
       strokeWidth,
     },
     {
-      id: 'se' as const,
+      id: 's',
+      cx: rect.x + rect.width / 2,
+      cy: rect.y + rect.height,
+      radius,
+      hitRadius,
+      strokeWidth,
+    },
+    {
+      id: 'se',
       cx: rect.x + rect.width,
       cy: rect.y + rect.height,
+      radius,
+      hitRadius,
+      strokeWidth,
+    },
+    {
+      id: 'w',
+      cx: rect.x,
+      cy: rect.y + rect.height / 2,
       radius,
       hitRadius,
       strokeWidth,
