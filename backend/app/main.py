@@ -17,10 +17,11 @@ import sys
 import tempfile
 import time
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 from typing import Any, Callable, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -110,6 +111,8 @@ NO_CACHE_HTML_HEADERS = {
 IMMUTABLE_IMAGE_HEADERS = {
     "Cache-Control": "public, max-age=31536000, immutable",
 }
+FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS = 0.01
+FINGERPRINT_WARMUP_BUSY_WAIT_SECONDS = 0.35
 
 
 @dataclass(slots=True)
@@ -329,6 +332,10 @@ LOCAL_IMAGE_PATHS: dict[str, Path] = {}
 SESSION_JOB_LOCK = Lock()
 DUPLICATE_SEARCH_JOBS: dict[str, DuplicateSearchJob] = {}
 DUPLICATE_SEARCH_LOCK = Lock()
+FINGERPRINT_WARMUP_PENDING: OrderedDict[str, tuple[Path, SessionImage]] = OrderedDict()
+FINGERPRINT_WARMUP_IN_PROGRESS: set[str] = set()
+FINGERPRINT_WARMUP_CONDITION = Condition()
+FINGERPRINT_WARMUP_WORKER_STARTED = False
 HF_OAUTH_PENDING_STATES: dict[str, dict[str, Any]] = {}
 HF_OAUTH_PENDING_LOCK = Lock()
 PLUGIN_DOWNLOAD_JOBS: dict[str, PluginDownloadJob] = {}
@@ -2623,6 +2630,7 @@ def build_cached_directory_session(root_path: Path):
     ]
     session.images_by_id = {image.id: image for image in session.images}
     register_session_images(session.images)
+    schedule_session_fingerprint_warmup(session)
     return session
 
 
@@ -2788,6 +2796,7 @@ def scan_directory_session(
         session.label,
         serialize_manifest_images(next_images),
     )
+    schedule_session_fingerprint_warmup(session)
     return serialize_session(session)
 
 
@@ -2848,13 +2857,82 @@ def start_duplicate_search_job(
         DUPLICATE_SEARCH_JOBS[job.id] = job
 
     def worker():
-        run_duplicate_search_job(job.id, image_snapshot)
+        run_duplicate_search_job(job.id, session.root_path, image_snapshot)
 
     Thread(target=worker, daemon=True).start()
     return job
 
 
-def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
+def schedule_session_fingerprint_warmup(session: LocalSession):
+    if len(session.images) < 2:
+        return
+    if CACHE_STORE.count_image_fingerprints_for_dataset(session.root_path) >= len(
+        session.images
+    ):
+        return
+
+    ensure_fingerprint_warmup_worker()
+    with FINGERPRINT_WARMUP_CONDITION:
+        for image in session.images:
+            if image.id in FINGERPRINT_WARMUP_IN_PROGRESS:
+                continue
+            if image.id in FINGERPRINT_WARMUP_PENDING:
+                continue
+            FINGERPRINT_WARMUP_PENDING[image.id] = (session.root_path, image)
+
+        FINGERPRINT_WARMUP_CONDITION.notify()
+
+
+def ensure_fingerprint_warmup_worker():
+    global FINGERPRINT_WARMUP_WORKER_STARTED
+
+    with FINGERPRINT_WARMUP_CONDITION:
+        if FINGERPRINT_WARMUP_WORKER_STARTED:
+            return
+        FINGERPRINT_WARMUP_WORKER_STARTED = True
+
+    Thread(target=run_fingerprint_warmup_worker, daemon=True).start()
+
+
+def run_fingerprint_warmup_worker():
+    while True:
+        with FINGERPRINT_WARMUP_CONDITION:
+            while not FINGERPRINT_WARMUP_PENDING:
+                FINGERPRINT_WARMUP_CONDITION.wait()
+
+            image_id, payload = FINGERPRINT_WARMUP_PENDING.popitem(last=False)
+            FINGERPRINT_WARMUP_IN_PROGRESS.add(image_id)
+
+        root_path, image = payload
+
+        try:
+            while is_duplicate_search_running():
+                time.sleep(FINGERPRINT_WARMUP_BUSY_WAIT_SECONDS)
+
+            _, cache_hit = load_or_build_duplicate_image_signature(root_path, image)
+            if not cache_hit:
+                time.sleep(FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS)
+        except Exception:
+            LOGGER.warning(
+                "Background fingerprint warmup skipped %s",
+                image.full_path,
+                exc_info=True,
+            )
+        finally:
+            with FINGERPRINT_WARMUP_CONDITION:
+                FINGERPRINT_WARMUP_IN_PROGRESS.discard(image_id)
+
+
+def is_duplicate_search_running():
+    with DUPLICATE_SEARCH_LOCK:
+        return any(job.status == "running" for job in DUPLICATE_SEARCH_JOBS.values())
+
+
+def run_duplicate_search_job(
+    job_id: str,
+    root_path: Path,
+    images: list[SessionImage],
+):
     with DUPLICATE_SEARCH_LOCK:
         job = DUPLICATE_SEARCH_JOBS.get(job_id)
         minimum_similarity_percent = job.minimum_similarity_percent if job else 92
@@ -2863,10 +2941,14 @@ def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
         return
 
     try:
+        total_pairs = (len(images) * max(len(images) - 1, 0)) // 2
+        processed_pairs = 0
         signatures: list[dict[str, Any] | None] = []
+        last_progress_publish_at = time.monotonic()
+
         for index, image in enumerate(images, start=1):
             try:
-                signature = build_duplicate_image_signature(image.full_path)
+                signature, _ = load_or_build_duplicate_image_signature(root_path, image)
             except HTTPException:
                 raise
             except Exception:
@@ -2882,24 +2964,19 @@ def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
                 active_job = DUPLICATE_SEARCH_JOBS.get(job_id)
                 if active_job is None:
                     return
-                active_job.phase = "hashing"
+                active_job.phase = "hashing" if index <= 1 else "comparing"
                 active_job.processed_images = index
+                active_job.processed_pairs = processed_pairs
 
-        processed_pairs = 0
-        total_pairs = (len(images) * max(len(images) - 1, 0)) // 2
-        last_progress_publish_at = time.monotonic()
-
-        for left_index, left_image in enumerate(images):
-            left_signature = signatures[left_index]
-            for right_index in range(left_index + 1, len(images)):
-                right_image = images[right_index]
-                right_signature = signatures[right_index]
+            current_image = images[index - 1]
+            for left_index, left_image in enumerate(images[: index - 1]):
+                left_signature = signatures[left_index]
                 processed_pairs += 1
 
-                if left_signature is not None and right_signature is not None:
+                if left_signature is not None and signature is not None:
                     similarity_percent, relative_transform = compare_duplicate_signatures(
                         left_signature,
-                        right_signature,
+                        signature,
                     )
                     if similarity_percent >= minimum_similarity_percent:
                         with DUPLICATE_SEARCH_LOCK:
@@ -2914,9 +2991,9 @@ def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
                                     "leftImageId": left_image.id,
                                     "leftName": left_image.name,
                                     "leftRelativePath": left_image.relative_path,
-                                    "rightImageId": right_image.id,
-                                    "rightName": right_image.name,
-                                    "rightRelativePath": right_image.relative_path,
+                                    "rightImageId": current_image.id,
+                                    "rightName": current_image.name,
+                                    "rightRelativePath": current_image.relative_path,
                                     "similarityPercent": similarity_percent,
                                     "relativeTransform": relative_transform,
                                 }
@@ -2937,6 +3014,7 @@ def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
                         if active_job is None:
                             return
                         active_job.phase = "comparing"
+                        active_job.processed_images = index
                         active_job.processed_pairs = processed_pairs
                     last_progress_publish_at = time.monotonic()
 
@@ -2957,6 +3035,37 @@ def run_duplicate_search_job(job_id: str, images: list[SessionImage]):
             active_job.status = "failed"
             active_job.phase = "failed"
             active_job.error = detail or "Failed to search duplicate images"
+
+
+def load_or_build_duplicate_image_signature(root_path: Path, image: SessionImage):
+    current_stat = image.full_path.stat()
+    if current_stat.st_mtime_ns != image.mtime_ns:
+        raise RuntimeError(f"Image changed while preparing fingerprint: {image.full_path}")
+    if current_stat.st_size != image.file_size:
+        raise RuntimeError(f"Image size changed while preparing fingerprint: {image.full_path}")
+
+    cached_signature = CACHE_STORE.load_image_fingerprint(
+        root_path=root_path,
+        image_id=image.id,
+        relative_path=image.relative_path,
+        full_path=image.full_path,
+        file_size=image.file_size,
+        mtime_ns=image.mtime_ns,
+    )
+    if cached_signature is not None:
+        return cached_signature, True
+
+    signature = build_duplicate_image_signature(image.full_path)
+    CACHE_STORE.save_image_fingerprint(
+        root_path=root_path,
+        image_id=image.id,
+        relative_path=image.relative_path,
+        full_path=image.full_path,
+        file_size=image.file_size,
+        mtime_ns=image.mtime_ns,
+        signature=signature,
+    )
+    return signature, False
 
 
 def filter_duplicate_search_matches_for_active_session(

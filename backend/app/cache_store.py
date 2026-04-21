@@ -94,6 +94,21 @@ class CacheStore:
                         payload_json TEXT NOT NULL,
                         updated_at REAL NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS image_fingerprints (
+                        image_id TEXT PRIMARY KEY,
+                        dataset_key TEXT NOT NULL,
+                        relative_path TEXT NOT NULL,
+                        full_path TEXT NOT NULL,
+                        file_size INTEGER NOT NULL,
+                        mtime_ns INTEGER NOT NULL,
+                        signature_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        FOREIGN KEY (dataset_key) REFERENCES dataset_manifests(dataset_key) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_image_fingerprints_dataset
+                    ON image_fingerprints(dataset_key);
                     """
                 )
 
@@ -182,6 +197,11 @@ class CacheStore:
                         "SELECT COUNT(*) FROM annotation_cache"
                     ).fetchone()[0]
                 )
+                image_fingerprint_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM image_fingerprints"
+                    ).fetchone()[0]
+                )
 
         db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
         wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
@@ -200,6 +220,7 @@ class CacheStore:
                 "datasetManifests": dataset_manifests_count,
                 "datasetImages": dataset_images_count,
                 "annotationCache": annotation_cache_count,
+                "imageFingerprints": image_fingerprint_count,
             },
         }
 
@@ -230,6 +251,22 @@ class CacheStore:
                 connection.execute("DELETE FROM annotation_cache")
 
         self.checkpoint_database()
+
+    def count_image_fingerprints_for_dataset(self, root_path: Path):
+        dataset_key = self.dataset_key_for_path(root_path)
+
+        with self._lock:
+            with self._connect() as connection:
+                return int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM image_fingerprints
+                        WHERE dataset_key = ?
+                        """,
+                        (dataset_key,),
+                    ).fetchone()[0]
+                )
 
     def checkpoint_database(self):
         with self._lock:
@@ -417,6 +454,18 @@ class CacheStore:
                     """,
                     image_rows,
                 )
+                connection.execute(
+                    """
+                    DELETE FROM image_fingerprints
+                    WHERE dataset_key = ?
+                      AND image_id NOT IN (
+                          SELECT image_id
+                          FROM dataset_images
+                          WHERE dataset_key = ?
+                      )
+                    """,
+                    (dataset_key, dataset_key),
+                )
 
     def update_dataset_annotation_metadata(
         self,
@@ -547,6 +596,112 @@ class CacheStore:
                         json.dumps(list(payload), ensure_ascii=False),
                         now,
                     ),
+                )
+
+    def load_image_fingerprint(
+        self,
+        *,
+        root_path: Path,
+        image_id: str,
+        relative_path: str,
+        full_path: Path,
+        file_size: int,
+        mtime_ns: int,
+    ):
+        dataset_key = self.dataset_key_for_path(root_path)
+
+        with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT
+                        dataset_key,
+                        relative_path,
+                        full_path,
+                        file_size,
+                        mtime_ns,
+                        signature_json
+                    FROM image_fingerprints
+                    WHERE image_id = ?
+                    """,
+                    (image_id,),
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        if row["dataset_key"] != dataset_key:
+            return None
+        if row["relative_path"] != relative_path:
+            return None
+        if row["full_path"] != str(full_path):
+            return None
+        if int(row["file_size"]) != int(file_size):
+            return None
+        if int(row["mtime_ns"]) != int(mtime_ns):
+            return None
+
+        try:
+            return json.loads(row["signature_json"])
+        except Exception:
+            return None
+
+    def save_image_fingerprint(
+        self,
+        *,
+        root_path: Path,
+        image_id: str,
+        relative_path: str,
+        full_path: Path,
+        file_size: int,
+        mtime_ns: int,
+        signature: dict[str, Any],
+    ):
+        dataset_key = self.dataset_key_for_path(root_path)
+        now = time.time()
+
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO image_fingerprints (
+                        image_id,
+                        dataset_key,
+                        relative_path,
+                        full_path,
+                        file_size,
+                        mtime_ns,
+                        signature_json,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(image_id) DO UPDATE SET
+                        dataset_key = excluded.dataset_key,
+                        relative_path = excluded.relative_path,
+                        full_path = excluded.full_path,
+                        file_size = excluded.file_size,
+                        mtime_ns = excluded.mtime_ns,
+                        signature_json = excluded.signature_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        image_id,
+                        dataset_key,
+                        relative_path,
+                        str(full_path),
+                        int(file_size),
+                        int(mtime_ns),
+                        json.dumps(signature, ensure_ascii=False),
+                        now,
+                    ),
+                )
+
+    def delete_image_fingerprint(self, image_id: str):
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM image_fingerprints WHERE image_id = ?",
+                    (image_id,),
                 )
 
     def _annotation_key_for_path(self, annotation_path: Path):

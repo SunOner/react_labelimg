@@ -295,6 +295,12 @@ type DuplicateSearchRuntime = {
   minimumSimilarityPercent: number
 }
 
+type DuplicateSearchPreviewImage = {
+  url: string
+  name: string
+  relativePath: string
+}
+
 const CACHE_DB_ACTION_ITEMS: Array<{
   action: CacheDbAction
   title: string
@@ -410,6 +416,8 @@ function App() {
   const [isCacheDbOpen, setIsCacheDbOpen] = useState(false)
   const [isPluginsOpen, setIsPluginsOpen] = useState(false)
   const [isDuplicateSearchOpen, setIsDuplicateSearchOpen] = useState(false)
+  const [duplicateSearchPreviewImage, setDuplicateSearchPreviewImage] =
+    useState<DuplicateSearchPreviewImage | null>(null)
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
@@ -514,6 +522,7 @@ function App() {
     if (closeDialog) {
       setIsDuplicateSearchOpen(false)
     }
+    setDuplicateSearchPreviewImage(null)
     setDuplicateSearchRuntime(buildInitialDuplicateSearchRuntime())
     setDuplicateSearchMatches([])
     setDuplicateSearchError(null)
@@ -1699,7 +1708,7 @@ function App() {
   }, [isPluginsOpen])
 
   useEffect(() => {
-    if (!isDuplicateSearchOpen) {
+    if (!isDuplicateSearchOpen || duplicateSearchPreviewImage) {
       return
     }
 
@@ -1712,7 +1721,23 @@ function App() {
 
     window.addEventListener('keydown', handleCloseHotkey)
     return () => window.removeEventListener('keydown', handleCloseHotkey)
-  }, [isDuplicateSearchOpen])
+  }, [duplicateSearchPreviewImage, isDuplicateSearchOpen])
+
+  useEffect(() => {
+    if (!duplicateSearchPreviewImage) {
+      return
+    }
+
+    const handleCloseHotkey = (event: KeyboardEvent) => {
+      if (matchesHotkeyAction(event, 'closeOverlay')) {
+        event.preventDefault()
+        closeDuplicateSearchImageLightbox()
+      }
+    }
+
+    window.addEventListener('keydown', handleCloseHotkey)
+    return () => window.removeEventListener('keydown', handleCloseHotkey)
+  }, [duplicateSearchPreviewImage])
 
   useEffect(() => {
     const jobId = duplicateSearchRuntime.jobId
@@ -2124,17 +2149,12 @@ function App() {
     resetSessionState([], 'No session')
   }
 
-  const focusImageById = useEffectEvent((imageId: string) => {
-    const nextEntry = images.find((entry) => entry.id === imageId) ?? null
-    if (!nextEntry) {
-      return
-    }
-
-    pendingPreferredImageRelativePathRef.current = null
-    setSelectedId(null)
-    updateDrawStart(null)
-    setDraftRect(null)
-    setCurrentImageEntry(nextEntry)
+  const openDuplicateSearchImageLightbox = useEffectEvent((entry: ImageEntry) => {
+    setDuplicateSearchPreviewImage({
+      url: entry.url,
+      name: entry.name,
+      relativePath: entry.relativePath,
+    })
   })
 
   const openClassManager = () => {
@@ -2157,8 +2177,13 @@ function App() {
   }
 
   const closeDuplicateSearch = () => {
+    setDuplicateSearchPreviewImage(null)
     setIsDuplicateSearchOpen(false)
     setDuplicateSearchError(null)
+  }
+
+  const closeDuplicateSearchImageLightbox = () => {
+    setDuplicateSearchPreviewImage(null)
   }
 
   const openDuplicateSearch = () => {
@@ -4620,6 +4645,8 @@ function App() {
                       {formatDuplicateSearchPhase(
                         duplicateSearchRuntime.status,
                         duplicateSearchRuntime.phase,
+                        duplicateSearchRuntime.processedImages,
+                        duplicateSearchRuntime.totalImages,
                       )}
                     </h3>
                     <span
@@ -4729,23 +4756,75 @@ function App() {
                     return (
                       <article key={match.id} className="duplicate-search-card">
                         <div className="duplicate-search-card-main">
-                          <button
-                            type="button"
-                            className="duplicate-search-preview"
-                            onClick={() => focusImageById(match.leftImageId)}
-                          >
-                            <span className="duplicate-search-preview-frame">
-                              <img
-                                src={leftEntry.url}
-                                alt={match.leftRelativePath}
-                                loading="lazy"
-                              />
-                            </span>
-                            <span className="duplicate-search-preview-copy">
-                              <strong>{match.leftName}</strong>
-                              <span>{match.leftRelativePath}</span>
-                            </span>
-                          </button>
+                          <div className="duplicate-search-image-column">
+                            <button
+                              type="button"
+                              className="duplicate-search-preview"
+                              onClick={() => openDuplicateSearchImageLightbox(leftEntry)}
+                            >
+                              <span className="duplicate-search-preview-frame">
+                                <img
+                                  src={leftEntry.url}
+                                  alt={match.leftRelativePath}
+                                  loading="lazy"
+                                />
+                              </span>
+                              <span className="duplicate-search-preview-copy">
+                                <strong>{match.leftName}</strong>
+                                <span>{match.leftRelativePath}</span>
+                              </span>
+                            </button>
+                            <AppButton
+                              variant="ghost"
+                              className="duplicate-search-delete-button"
+                              onClick={() =>
+                                void handleDeleteDuplicateResultImage(
+                                  match.leftImageId,
+                                  match.rightImageId,
+                                )
+                              }
+                              title={isDeletingLeft ? 'Deleting image...' : 'Delete image'}
+                              aria-label={`Delete image ${match.leftRelativePath}`}
+                              disabled={
+                                !isDatasetSession ||
+                                duplicateSearchDeletingImageId !== null
+                              }
+                            >
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path
+                                  d="M3.5 4.5h9"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M6 2.75h4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="M6.75 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M9.25 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
+                            </AppButton>
+                          </div>
 
                           <div className="duplicate-search-card-center">
                             <div className="duplicate-search-score">
@@ -4756,57 +4835,77 @@ function App() {
                                 {formatDuplicateTransform(match.relativeTransform)}
                               </span>
                             </div>
-                            <AppButton
-                              variant="ghost"
-                              className="duplicate-search-delete-button"
-                              onClick={() =>
-                                void handleDeleteDuplicateResultImage(
-                                  match.leftImageId,
-                                  match.rightImageId,
-                                )
-                              }
-                              disabled={
-                                !isDatasetSession ||
-                                duplicateSearchDeletingImageId !== null
-                              }
-                            >
-                              {isDeletingLeft ? 'Deleting...' : 'Delete left'}
-                            </AppButton>
-                            <AppButton
-                              variant="ghost"
-                              className="duplicate-search-delete-button"
-                              onClick={() =>
-                                void handleDeleteDuplicateResultImage(
-                                  match.rightImageId,
-                                  match.leftImageId,
-                                )
-                              }
-                              disabled={
-                                !isDatasetSession ||
-                                duplicateSearchDeletingImageId !== null
-                              }
-                            >
-                              {isDeletingRight ? 'Deleting...' : 'Delete right'}
-                            </AppButton>
                           </div>
 
-                          <button
-                            type="button"
-                            className="duplicate-search-preview"
-                            onClick={() => focusImageById(match.rightImageId)}
-                          >
-                            <span className="duplicate-search-preview-frame">
-                              <img
-                                src={rightEntry.url}
-                                alt={match.rightRelativePath}
-                                loading="lazy"
-                              />
-                            </span>
-                            <span className="duplicate-search-preview-copy">
-                              <strong>{match.rightName}</strong>
-                              <span>{match.rightRelativePath}</span>
-                            </span>
-                          </button>
+                          <div className="duplicate-search-image-column">
+                            <button
+                              type="button"
+                              className="duplicate-search-preview"
+                              onClick={() => openDuplicateSearchImageLightbox(rightEntry)}
+                            >
+                              <span className="duplicate-search-preview-frame">
+                                <img
+                                  src={rightEntry.url}
+                                  alt={match.rightRelativePath}
+                                  loading="lazy"
+                                />
+                              </span>
+                              <span className="duplicate-search-preview-copy">
+                                <strong>{match.rightName}</strong>
+                                <span>{match.rightRelativePath}</span>
+                              </span>
+                            </button>
+                            <AppButton
+                              variant="ghost"
+                              className="duplicate-search-delete-button"
+                              onClick={() =>
+                                void handleDeleteDuplicateResultImage(
+                                  match.rightImageId,
+                                  match.leftImageId,
+                                )
+                              }
+                              title={isDeletingRight ? 'Deleting image...' : 'Delete image'}
+                              aria-label={`Delete image ${match.rightRelativePath}`}
+                              disabled={
+                                !isDatasetSession ||
+                                duplicateSearchDeletingImageId !== null
+                              }
+                            >
+                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                <path
+                                  d="M3.5 4.5h9"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M6 2.75h4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                  stroke="currentColor"
+                                  strokeWidth="1.35"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                                <path
+                                  d="M6.75 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d="M9.25 6.5v4"
+                                  stroke="currentColor"
+                                  strokeWidth="1.2"
+                                  strokeLinecap="round"
+                                />
+                              </svg>
+                            </AppButton>
+                          </div>
                         </div>
                       </article>
                     )
@@ -4822,6 +4921,48 @@ function App() {
                 </p>
               )}
             </section>
+          </div>
+        </div>
+      ) : null}
+
+      {duplicateSearchPreviewImage ? (
+        <div
+          className="lightbox-backdrop image-lightbox-backdrop"
+          onClick={closeDuplicateSearchImageLightbox}
+        >
+          <div
+            className="image-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label={duplicateSearchPreviewImage.relativePath}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="image-lightbox-header">
+              <div className="image-lightbox-copy">
+                <p className="section-kicker">Preview</p>
+                <h2>{duplicateSearchPreviewImage.name}</h2>
+                <p
+                  className="plugin-manager-note image-lightbox-path"
+                  title={duplicateSearchPreviewImage.relativePath}
+                >
+                  {duplicateSearchPreviewImage.relativePath}
+                </p>
+              </div>
+              <AppButton
+                variant="ghost"
+                className="class-manager-close"
+                onClick={closeDuplicateSearchImageLightbox}
+              >
+                Close
+              </AppButton>
+            </div>
+
+            <div className="image-lightbox-stage">
+              <img
+                src={duplicateSearchPreviewImage.url}
+                alt={duplicateSearchPreviewImage.relativePath}
+              />
+            </div>
           </div>
         </div>
       ) : null}
@@ -6332,6 +6473,8 @@ function formatDuplicateSimilarity(value: number) {
 function formatDuplicateSearchPhase(
   status: DuplicateSearchRuntimeStatus,
   phase: DuplicateSearchRuntime['phase'],
+  processedImages: number,
+  totalImages: number,
 ) {
   if (status === 'failed' || phase === 'failed') {
     return 'Scan failed'
@@ -6342,6 +6485,10 @@ function formatDuplicateSearchPhase(
   }
 
   if (phase === 'comparing') {
+    if (processedImages < totalImages) {
+      return 'Analyzing signatures and ready pairs'
+    }
+
     return 'Comparing image pairs'
   }
 
