@@ -1,18 +1,18 @@
 :root {
-  --bg-base: #0a0f14;
-  --bg-accent: #10161d;
-  --surface-panel: rgba(15, 21, 28, 0.92);
-  --surface-raised: rgba(22, 29, 37, 0.96);
-  --surface-strong: #1b2530;
-  --surface-overlay: rgba(12, 17, 23, 0.98);
-  --surface-input: rgba(8, 12, 17, 0.94);
-  --surface-highlight: rgba(77, 208, 166, 0.1);
-  --surface-highlight-strong: rgba(77, 208, 166, 0.18);
+  --bg-base: #000000;
+  --bg-accent: #080808;
+  --surface-panel: rgba(8, 8, 8, 0.92);
+  --surface-raised: rgba(16, 16, 16, 0.96);
+  --surface-strong: #151515;
+  --surface-overlay: rgba(6, 6, 6, 0.98);
+  --surface-input: rgba(3, 3, 3, 0.94);
+  --surface-highlight: rgba(255, 255, 255, 0.05);
+  --surface-highlight-strong: rgba(255, 255, 255, 0.14);
   --surface-danger: rgba(240, 106, 95, 0.12);
   --ink-strong: #edf3f8;
   --ink-soft: #91a0ad;
-  --accent: #4dd0a6;
-  --accent-strong: #7be4c2;
+  --accent: #d5d9de;
+  --accent-strong: #f4f7fa;
   --danger: #f06a5f;
   --border-soft: rgba(148, 163, 184, 0.18);
   --border-strong: rgba(237, 243, 248, 0.16);
@@ -28,8 +28,8 @@
   color: var(--ink-strong);
   color-scheme: dark;
   background:
-    radial-gradient(circle at top left, rgba(77, 208, 166, 0.16), transparent 24%),
-    radial-gradient(circle at top right, rgba(59, 130, 246, 0.12), transparent 18%),
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.08), transparent 24%),
+    radial-gradient(circle at top right, rgba(255, 255, 255, 0.05), transparent 18%),
     linear-gradient(180deg, var(--bg-base), var(--bg-accent));
   font-synthesis: none;
   text-rendering: optimizeLegibility;

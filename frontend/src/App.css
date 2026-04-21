@@ -41,9 +41,9 @@
 }
 
 .toast-notification.is-success {
-  border-color: rgba(77, 208, 166, 0.34);
+  border-color: rgba(255, 255, 255, 0.2);
   background:
-    linear-gradient(0deg, rgba(77, 208, 166, 0.08), rgba(77, 208, 166, 0.08)),
+    linear-gradient(0deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.04)),
     var(--surface-overlay);
 }
 
@@ -260,27 +260,27 @@
   justify-content: center;
   min-height: 34px;
   padding: 0 14px;
-  border: 1px solid rgba(77, 208, 166, 0.24);
-  background: var(--accent);
-  color: #07110d;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: #050505;
+  color: var(--ink-strong);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.1),
-    0 10px 20px rgba(77, 208, 166, 0.14);
+    0 10px 20px rgba(0, 0, 0, 0.28);
   font-size: 0.88rem;
 }
 
 .ui-button--primary:hover:not(:disabled) {
   transform: translateY(-1px);
-  background: var(--accent-strong);
+  background: #111111;
 }
 
 .ui-button--primary.is-active {
-  border-color: rgba(77, 208, 166, 0.55);
-  background: var(--accent-strong);
+  border-color: rgba(255, 255, 255, 0.38);
+  background: #151515;
   box-shadow:
-    inset 0 0 0 1px rgba(7, 17, 13, 0.28),
-    0 0 0 1px rgba(77, 208, 166, 0.18),
-    0 10px 20px rgba(77, 208, 166, 0.18);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 0 0 1px rgba(255, 255, 255, 0.12),
+    0 10px 20px rgba(0, 0, 0, 0.32);
 }
 
 .menu-item-copy {
@@ -471,7 +471,7 @@
 
 .sam-prompt-add-button:hover:not(:disabled) {
   color: var(--ink-strong);
-  border-color: rgba(77, 208, 166, 0.28);
+  border-color: rgba(255, 255, 255, 0.24);
 }
 
 .panel-sidebar {
@@ -719,7 +719,7 @@
 
 .class-add-button:hover {
   color: var(--ink-strong);
-  border-color: rgba(77, 208, 166, 0.28);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .lightbox-backdrop {
@@ -1040,8 +1040,8 @@
   display: grid;
   gap: 8px;
   padding: 10px 12px;
-  border: 1px solid rgba(77, 208, 166, 0.18);
-  background: rgba(77, 208, 166, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .plugin-progress-panel.is-runtime {
@@ -1078,7 +1078,7 @@
   position: relative;
   height: 10px;
   overflow: hidden;
-  border: 1px solid rgba(77, 208, 166, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.03);
 }
 
@@ -1087,10 +1087,10 @@
   height: 100%;
   background: linear-gradient(
     90deg,
-    rgba(77, 208, 166, 0.38) 0%,
-    rgba(77, 208, 166, 0.92) 100%
+    rgba(120, 120, 120, 0.46) 0%,
+    rgba(235, 235, 235, 0.92) 100%
   );
-  box-shadow: 0 0 18px rgba(77, 208, 166, 0.22);
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.12);
 }
 
 .plugin-progress-fill::after {
@@ -1210,8 +1210,8 @@
 }
 
 .plugin-status.is-installed {
-  border-color: rgba(77, 208, 166, 0.24);
-  background: rgba(77, 208, 166, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--accent);
 }
 
@@ -1354,8 +1354,8 @@
 }
 
 .hotkeys-row.is-capturing {
-  border-color: rgba(77, 208, 166, 0.32);
-  background: rgba(77, 208, 166, 0.08);
+  border-color: rgba(255, 255, 255, 0.24);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .hotkeys-meta {
@@ -1379,8 +1379,8 @@
   width: fit-content;
   min-width: 88px;
   padding: 4px 8px;
-  border: 1px solid rgba(77, 208, 166, 0.24);
-  background: rgba(77, 208, 166, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--ink-strong);
   font-family: var(--font-mono);
   font-size: 0.76rem;
@@ -1450,7 +1450,7 @@
 
 .hotkeys-binding-action:hover:not(:disabled) {
   color: var(--ink-strong);
-  border-color: rgba(77, 208, 166, 0.28);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .hotkeys-binding-action.is-danger:hover:not(:disabled) {
@@ -1489,7 +1489,7 @@
 }
 
 .class-manager-input:focus {
-  outline: 2px solid rgba(77, 208, 166, 0.18);
+  outline: 2px solid rgba(255, 255, 255, 0.16);
   border-color: var(--accent);
 }
 
@@ -1529,7 +1529,7 @@
 
 .class-manager-main:hover,
 .class-manager-main.is-active {
-  border-color: rgba(77, 208, 166, 0.34);
+  border-color: rgba(255, 255, 255, 0.22);
   background: var(--surface-highlight);
 }
 
@@ -1578,7 +1578,7 @@
 
 .class-manager-action:hover:not(:disabled) {
   color: var(--ink-strong);
-  border-color: rgba(77, 208, 166, 0.28);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .class-manager-action.is-danger:hover:not(:disabled) {
@@ -1596,7 +1596,7 @@
   display: inline-flex;
   align-items: center;
   padding: 6px 10px;
-  background: rgba(77, 208, 166, 0.08);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--ink-strong);
   font-size: 0.88rem;
 }
@@ -1616,12 +1616,12 @@
 .ui-button--list-row:hover,
 .ui-button--list-row.is-active {
   background: var(--surface-highlight);
-  border-color: rgba(77, 208, 166, 0.34);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .ui-button--chip.is-active {
-  background: var(--accent);
-  color: #07110d;
+  background: #111111;
+  color: var(--ink-strong);
 }
 
 .ui-button--ghost,
@@ -1672,13 +1672,13 @@
 .current-box-row.drop-before .current-box-item {
   box-shadow:
     inset 0 2px 0 var(--accent),
-    inset 0 0 0 1px rgba(77, 208, 166, 0.16);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
 .current-box-row.drop-after .current-box-item {
   box-shadow:
     inset 0 -2px 0 var(--accent),
-    inset 0 0 0 1px rgba(77, 208, 166, 0.16);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
 .current-box-actions {
@@ -1701,7 +1701,7 @@
 
 .current-box-action:hover {
   color: var(--ink-strong);
-  border-color: rgba(77, 208, 166, 0.28);
+  border-color: rgba(255, 255, 255, 0.22);
 }
 
 .current-box-action svg {
@@ -1778,8 +1778,8 @@
 .dataset-progress-spinner {
   width: 14px;
   height: 14px;
-  border: 2px solid rgba(77, 208, 166, 0.14);
-  border-top-color: rgba(77, 208, 166, 0.95);
+  border: 2px solid rgba(255, 255, 255, 0.12);
+  border-top-color: rgba(255, 255, 255, 0.92);
   border-radius: 999px;
   animation: dataset-spinner-rotate 0.85s linear infinite;
   flex: 0 0 auto;
@@ -1859,19 +1859,19 @@
 
 .empty-illustration-frame {
   fill: rgba(20, 27, 33, 0.9);
-  stroke: rgba(77, 208, 166, 0.22);
+  stroke: rgba(255, 255, 255, 0.16);
   stroke-width: 4;
 }
 
 .empty-illustration-sun {
-  fill: rgba(77, 208, 166, 0.16);
-  stroke: rgba(77, 208, 166, 0.32);
+  fill: rgba(255, 255, 255, 0.1);
+  stroke: rgba(255, 255, 255, 0.2);
   stroke-width: 3;
 }
 
 .empty-illustration-landscape,
 .empty-illustration-base {
-  stroke: rgba(77, 208, 166, 0.44);
+  stroke: rgba(255, 255, 255, 0.28);
   stroke-width: 4;
   stroke-linecap: round;
   stroke-linejoin: round;
@@ -1965,14 +1965,37 @@
 .viewport-body {
   min-height: 0;
   display: grid;
-  grid-template-columns: 52px minmax(0, 1fr);
+  grid-template-columns: 88px minmax(0, 1fr);
   gap: 8px;
 }
 
 .viewport-tools {
   display: grid;
   align-content: start;
+  gap: 10px;
+}
+
+.viewport-tool-group {
+  display: grid;
   gap: 8px;
+  padding: 8px 6px 10px;
+  border: 1px solid var(--border-soft);
+  background: rgba(10, 14, 18, 0.72);
+}
+
+.viewport-tool-group-title {
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.16em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.viewport-tool-group-buttons {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
 }
 
 .viewport-tool {
@@ -1995,15 +2018,15 @@
 .viewport-tool:hover:not(:disabled) {
   color: var(--ink-strong);
   border-color: var(--surface-highlight-strong);
-  background: rgba(20, 27, 33, 0.96);
+  background: rgba(18, 18, 18, 0.96);
   transform: translateY(-1px);
 }
 
 .viewport-tool.is-active {
   color: var(--accent);
-  border-color: rgba(77, 208, 166, 0.42);
-  background: rgba(23, 35, 31, 0.96);
-  box-shadow: inset 0 0 0 1px rgba(77, 208, 166, 0.1);
+  border-color: rgba(255, 255, 255, 0.26);
+  background: rgba(12, 12, 12, 0.96);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
 
 .viewport-tool:disabled {
@@ -2102,6 +2125,22 @@
 
 .viewport-overlay.is-panning {
   cursor: grabbing;
+}
+
+.viewport-crosshair {
+  pointer-events: none;
+}
+
+.viewport-crosshair-line-shadow {
+  stroke: rgba(7, 10, 14, 0.82);
+  stroke-width: 2.4;
+  vector-effect: non-scaling-stroke;
+}
+
+.viewport-crosshair-line {
+  stroke: rgba(248, 241, 227, 0.38);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
 }
 
 .bbox-rect {
@@ -2309,7 +2348,7 @@
 
 .ui-button--index {
   min-width: 36px;
-  background: rgba(77, 208, 166, 0.08);
+  background: rgba(255, 255, 255, 0.05);
   color: var(--ink-strong);
   font-family: var(--font-heading);
 }
@@ -2484,8 +2523,8 @@
 }
 
 .file-list-item.is-active {
-  border-color: rgba(77, 208, 166, 0.34);
-  box-shadow: inset 0 0 0 1px rgba(77, 208, 166, 0.16);
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
 }
 
 .file-list-name {
@@ -2625,8 +2664,20 @@
 
   .viewport-tools {
     grid-auto-flow: column;
-    grid-auto-columns: 44px;
+    grid-auto-columns: max-content;
     justify-content: start;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .viewport-tool-group {
+    min-width: max-content;
+    padding: 8px;
+  }
+
+  .viewport-tool-group-buttons {
+    grid-auto-flow: column;
+    grid-auto-columns: 44px;
   }
 
   .plugin-download-action {

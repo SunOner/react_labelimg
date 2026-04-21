@@ -28,10 +28,12 @@ type AnnotationViewportProps = {
   selectedId: string | null
   draftRect: Rect | null
   tool: 'draw' | 'new-box' | 'sam-click' | 'sam-box'
+  isCrosshairEnabled: boolean
   showSamTools: boolean
   isSamBusy: boolean
   classOptions: string[]
   onSelectTool: (tool: 'draw' | 'new-box' | 'sam-click' | 'sam-box') => void
+  onToggleCrosshair: () => void
   onOpenDataset: () => void
   recentDatasets: Array<{ path: string; label: string }>
   onOpenRecentDataset: (path: string) => void
@@ -112,10 +114,12 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   selectedId,
   draftRect,
   tool,
+  isCrosshairEnabled,
   showSamTools,
   isSamBusy,
   classOptions,
   onSelectTool,
+  onToggleCrosshair,
   onOpenDataset,
   recentDatasets,
   onOpenRecentDataset,
@@ -144,6 +148,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 })
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
+  const [crosshairPoint, setCrosshairPoint] = useState<Point | null>(null)
   const [isPanning, setIsPanning] = useState(false)
   const [contextMenu, setContextMenu] = useState<{
     annotationId: string
@@ -233,6 +238,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 
     interactionRef.current = null
     setIsPanning(false)
+    setCrosshairPoint(null)
     setContextMenu(null)
     setPan({ x: 0, y: 0 })
     setZoom(autoFitZoom)
@@ -512,6 +518,12 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const shellTranslateX = snapCssPixel(stageOffset.x + resolvedPan.x)
   const shellTranslateY = snapCssPixel(stageOffset.y + resolvedPan.y)
   const borderHitTolerance = getBorderHitTolerance(shellWidth)
+  const crosshairStagePoint = crosshairPoint
+    ? snapPointToStagePixels(
+        mapImagePointToStage(crosshairPoint, stageImagePlacement),
+        overlayMetrics.effectiveScale,
+      )
+    : null
   const annotationGeometries = layoutAnnotationLabels(
     annotations.map((annotation) =>
       buildAnnotationGeometry(annotation, image, stageImagePlacement, overlayMetrics),
@@ -541,6 +553,9 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     Math.abs(zoom - autoFitZoom) < 0.001 &&
     Math.abs(resolvedPan.x) < 0.5 &&
     Math.abs(resolvedPan.y) < 0.5
+  const crosshairTitle = isCrosshairEnabled
+    ? 'Hide crosshair guide'
+    : 'Show crosshair guide'
 
   const handleZoomOut = () => updateZoom(zoom - ZOOM_STEP)
 
@@ -555,6 +570,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     const stagePoint = stagePointFromEvent(event)
     const point = pointFromEvent(event, image, stageImagePlacement, 'strict')
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
+    setCrosshairPoint(clampedPoint ?? point)
     const hitCandidates =
       stagePoint
         ? getAnnotationCandidatesAtStagePoint(
@@ -685,6 +701,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const handleOverlayPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
     const hoverPoint = pointFromEvent(event, image, stageImagePlacement, 'strict')
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
+    setCrosshairPoint(clampedPoint ?? hoverPoint)
     onHoverPointChange?.(clampedPoint ?? hoverPoint)
 
     const interaction = interactionRef.current
@@ -771,6 +788,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 
   const handleOverlayPointerLeave = (event: ReactPointerEvent<SVGSVGElement>) => {
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
+    setCrosshairPoint(null)
     onHoverPointChange?.(clampedPoint)
   }
 
@@ -851,52 +869,86 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 
       <div className="viewport-body">
         <div className="viewport-tools" aria-label="Viewport tools">
-          <button
-            type="button"
-            className={isDrawTool ? 'viewport-tool is-active' : 'viewport-tool'}
-            onClick={() => onSelectTool('draw')}
-            title="Draw new box (W)"
-            aria-label="Draw new box (W)"
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <rect x="4" y="4" width="12" height="12" rx="1.5" />
-              <path d="M10 2.5v3M10 14.5v3M2.5 10h3M14.5 10h3" />
-            </svg>
-          </button>
-          {showSamTools ? (
-            <>
+          <div className="viewport-tool-group" aria-label="Label tools">
+            <div className="viewport-tool-group-title">Label</div>
+            <div className="viewport-tool-group-buttons">
               <button
                 type="button"
-                className={
-                  tool === 'sam-click' ? 'viewport-tool is-active' : 'viewport-tool'
-                }
-                onClick={() => onSelectTool('sam-click')}
-                title="SAM click select"
-                aria-label="SAM click select"
-                disabled={isSamBusy}
+                className={isDrawTool ? 'viewport-tool is-active' : 'viewport-tool'}
+                onClick={() => onSelectTool('draw')}
+                title="Draw new box (W)"
+                aria-label="Draw new box (W)"
               >
                 <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <circle cx="10" cy="10" r="4.25" />
+                  <rect x="4" y="4" width="12" height="12" rx="1.5" />
                   <path d="M10 2.5v3M10 14.5v3M2.5 10h3M14.5 10h3" />
                 </svg>
               </button>
+            </div>
+          </div>
+          {showSamTools ? (
+            <div className="viewport-tool-group" aria-label="Assist tools">
+              <div className="viewport-tool-group-title">Assist</div>
+              <div className="viewport-tool-group-buttons">
+                <button
+                  type="button"
+                  className={
+                    tool === 'sam-click' ? 'viewport-tool is-active' : 'viewport-tool'
+                  }
+                  onClick={() => onSelectTool('sam-click')}
+                  title="SAM click select"
+                  aria-label="SAM click select"
+                  disabled={isSamBusy}
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true">
+                    <circle cx="10" cy="10" r="4.25" />
+                    <path d="M10 2.5v3M10 14.5v3M2.5 10h3M14.5 10h3" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  className={
+                    tool === 'sam-box' ? 'viewport-tool is-active' : 'viewport-tool'
+                  }
+                  onClick={() => onSelectTool('sam-box')}
+                  title="SAM box select"
+                  aria-label="SAM box select"
+                  disabled={isSamBusy}
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true">
+                    <rect
+                      x="4.25"
+                      y="4.25"
+                      width="11.5"
+                      height="11.5"
+                      rx="1.5"
+                    />
+                    <path d="M2.5 6.5h3M14.5 13.5h3M6.5 2.5v3M13.5 14.5v3" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          ) : null}
+          <div className="viewport-tool-group" aria-label="View tools">
+            <div className="viewport-tool-group-title">View</div>
+            <div className="viewport-tool-group-buttons">
               <button
                 type="button"
                 className={
-                  tool === 'sam-box' ? 'viewport-tool is-active' : 'viewport-tool'
+                  isCrosshairEnabled ? 'viewport-tool is-active' : 'viewport-tool'
                 }
-                onClick={() => onSelectTool('sam-box')}
-                title="SAM box select"
-                aria-label="SAM box select"
-                disabled={isSamBusy}
+                onClick={onToggleCrosshair}
+                title={crosshairTitle}
+                aria-label={crosshairTitle}
+                aria-pressed={isCrosshairEnabled}
               >
                 <svg viewBox="0 0 20 20" aria-hidden="true">
-                  <rect x="4.25" y="4.25" width="11.5" height="11.5" rx="1.5" />
-                  <path d="M2.5 6.5h3M14.5 13.5h3M6.5 2.5v3M13.5 14.5v3" />
+                  <path d="M10 2.5v4M10 13.5v4M2.5 10h4M13.5 10h4" />
+                  <circle cx="10" cy="10" r="2.8" />
                 </svg>
               </button>
-            </>
-          ) : null}
+            </div>
+          </div>
         </div>
 
         <div
@@ -950,6 +1002,38 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               onPointerLeave={handleOverlayPointerLeave}
               onContextMenu={handleOverlayContextMenu}
             >
+              {isCrosshairEnabled && crosshairStagePoint ? (
+                <g className="viewport-crosshair" pointerEvents="none">
+                  <line
+                    className="viewport-crosshair-line-shadow"
+                    x1={stageImagePlacement.x}
+                    y1={crosshairStagePoint.y}
+                    x2={stageImagePlacement.x + stageImagePlacement.width}
+                    y2={crosshairStagePoint.y}
+                  />
+                  <line
+                    className="viewport-crosshair-line-shadow"
+                    x1={crosshairStagePoint.x}
+                    y1={stageImagePlacement.y}
+                    x2={crosshairStagePoint.x}
+                    y2={stageImagePlacement.y + stageImagePlacement.height}
+                  />
+                  <line
+                    className="viewport-crosshair-line"
+                    x1={stageImagePlacement.x}
+                    y1={crosshairStagePoint.y}
+                    x2={stageImagePlacement.x + stageImagePlacement.width}
+                    y2={crosshairStagePoint.y}
+                  />
+                  <line
+                    className="viewport-crosshair-line"
+                    x1={crosshairStagePoint.x}
+                    y1={stageImagePlacement.y}
+                    x2={crosshairStagePoint.x}
+                    y2={stageImagePlacement.y + stageImagePlacement.height}
+                  />
+                </g>
+              ) : null}
               {annotationGeometries.map((geometry) => {
               const { annotation, stageRect, labelRect, labelMetrics } = geometry
               const isSelected = annotation.id === selectedId
@@ -1666,6 +1750,13 @@ function mapAnnotationToStage(
   }
 }
 
+function mapImagePointToStage(point: Point, imagePlacement: ContainRect): Point {
+  return {
+    x: imagePlacement.x + point.x * imagePlacement.scale,
+    y: imagePlacement.y + point.y * imagePlacement.scale,
+  }
+}
+
 function buildAnnotationGeometry(
   annotation: Annotation,
   image: LoadedImage,
@@ -2178,6 +2269,13 @@ function snapRectToStagePixels(rect: Rect, effectiveScale: number): Rect {
   }
 }
 
+function snapPointToStagePixels(point: Point, effectiveScale: number): Point {
+  return {
+    x: snapStageValue(point.x, effectiveScale),
+    y: snapStageValue(point.y, effectiveScale),
+  }
+}
+
 function areAnnotationViewportPropsEqual(
   previousProps: Readonly<AnnotationViewportProps>,
   nextProps: Readonly<AnnotationViewportProps>,
@@ -2191,11 +2289,13 @@ function areAnnotationViewportPropsEqual(
     previousProps.selectedId === nextProps.selectedId &&
     areRectsEqual(previousProps.draftRect, nextProps.draftRect) &&
     previousProps.tool === nextProps.tool &&
+    previousProps.isCrosshairEnabled === nextProps.isCrosshairEnabled &&
     previousProps.showSamTools === nextProps.showSamTools &&
     previousProps.isSamBusy === nextProps.isSamBusy &&
     previousProps.recentDatasets === nextProps.recentDatasets &&
     previousProps.openDatasetDisabled === nextProps.openDatasetDisabled &&
     previousProps.onSelectTool === nextProps.onSelectTool &&
+    previousProps.onToggleCrosshair === nextProps.onToggleCrosshair &&
     previousProps.onOpenDataset === nextProps.onOpenDataset &&
     previousProps.onOpenRecentDataset === nextProps.onOpenRecentDataset &&
     previousProps.onRemoveRecentDataset === nextProps.onRemoveRecentDataset &&

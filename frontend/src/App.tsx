@@ -431,6 +431,7 @@ function App() {
     useState<ToastTone>('success')
   const [isRunningSamAction, setIsRunningSamAction] = useState(false)
   const [viewportTool, setViewportTool] = useState<ViewportTool>('draw')
+  const [isViewportCrosshairEnabled, setIsViewportCrosshairEnabled] = useState(true)
   const [isOpeningSession, setIsOpeningSession] = useState(false)
   const [openingTarget, setOpeningTarget] = useState<'image' | 'dataset' | null>(
     null,
@@ -2839,6 +2840,10 @@ function App() {
     }
   })
 
+  const handleToggleViewportCrosshair = useEffectEvent(() => {
+    setIsViewportCrosshairEnabled((current) => !current)
+  })
+
   const onGlobalKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (
       hotkeyCaptureTarget ||
@@ -3556,9 +3561,11 @@ function App() {
               selectedId={selectedId}
               draftRect={draftRect}
               tool={viewportTool}
+              isCrosshairEnabled={isViewportCrosshairEnabled}
               showSamTools={isSamInteractiveReady}
               isSamBusy={isRunningSamAction}
               onSelectTool={handleSelectViewportTool}
+              onToggleCrosshair={handleToggleViewportCrosshair}
               onOpenDataset={handleOpenLocalDirectory}
               recentDatasets={recentDatasets}
               onOpenRecentDataset={handleOpenRecentDataset}
