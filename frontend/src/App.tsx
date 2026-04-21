@@ -13,6 +13,7 @@ import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { MenuItemButton } from './components/ui/MenuItemButton'
 import {
   buildLocalImageUrl,
+  fetchCacheDbSummary,
   deleteLocalSessionImage,
   downloadPluginModel,
   fetchAppState,
@@ -29,10 +30,13 @@ import {
   openLocalImagePath,
   openLocalDirectoryPathJob,
   runPluginAutoAnnotate,
+  runCacheDbAction,
   saveLocalAnnotations,
   startHuggingFaceAuth,
   updateHuggingFaceAuthConfig,
   updateAppState,
+  type CacheDbAction,
+  type CacheDbSummary,
   type HuggingFaceAuthStatus,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
@@ -236,6 +240,8 @@ type ConfirmDialogState = {
   onConfirm: () => void
 }
 
+type CacheDbBusyAction = 'refresh' | CacheDbAction
+
 type PersistedSessionSourceKind = 'image' | 'dataset'
 
 type PersistedSessionState = {
@@ -268,6 +274,72 @@ type ToastItem = {
   tone: ToastTone
   isClosing: boolean
 }
+
+const CACHE_DB_ACTION_ITEMS: Array<{
+  action: CacheDbAction
+  title: string
+  description: string
+  confirmTitle: string
+  confirmMessage: string
+  confirmLabel: string
+  confirmTone?: 'danger' | 'default'
+}> = [
+  {
+    action: 'clear-session-history',
+    title: 'Clear reopen history',
+    description:
+      'Remove recent datasets and the saved "restore last opened project" state.',
+    confirmTitle: 'Clear reopen history?',
+    confirmMessage:
+      'This removes the recent dataset list and the saved session restore state from the SQLite cache.',
+    confirmLabel: 'Clear history',
+    confirmTone: 'danger',
+  },
+  {
+    action: 'clear-dataset-cache',
+    title: 'Clear dataset index cache',
+    description:
+      'Delete cached directory manifests so datasets are indexed from disk again on the next open.',
+    confirmTitle: 'Clear dataset index cache?',
+    confirmMessage:
+      'The saved directory manifests and indexed image lists will be removed from the SQLite cache.',
+    confirmLabel: 'Clear indexes',
+    confirmTone: 'danger',
+  },
+  {
+    action: 'clear-annotation-cache',
+    title: 'Clear annotation cache',
+    description:
+      'Delete cached parsed annotations so XML/TXT files are re-read on demand.',
+    confirmTitle: 'Clear annotation cache?',
+    confirmMessage:
+      'The parsed annotation cache will be deleted. Annotation files on disk are not changed.',
+    confirmLabel: 'Clear annotations',
+    confirmTone: 'danger',
+  },
+  {
+    action: 'reset-project-cache-db',
+    title: 'Reset project cache DB',
+    description:
+      'Clear project-related cached state, dataset indexes and annotation cache while keeping auth secrets.',
+    confirmTitle: 'Reset project cache DB?',
+    confirmMessage:
+      'This clears recent/opened project history, project class mappings, dataset indexes and annotation cache from the SQLite database.',
+    confirmLabel: 'Reset cache DB',
+    confirmTone: 'danger',
+  },
+  {
+    action: 'compact-database',
+    title: 'Compact database',
+    description:
+      'Run SQLite VACUUM to reclaim disk space after cleanup operations.',
+    confirmTitle: 'Compact database now?',
+    confirmMessage:
+      'This runs SQLite VACUUM on the cache database. It can take a moment on larger files.',
+    confirmLabel: 'Compact DB',
+    confirmTone: 'default',
+  },
+]
 
 function App() {
   const [images, setImages] = useState<ImageEntry[]>([])
@@ -315,10 +387,15 @@ function App() {
     useState<ConfirmDialogState | null>(null)
   const [isClassManagerOpen, setIsClassManagerOpen] = useState(false)
   const [isHotkeysOpen, setIsHotkeysOpen] = useState(false)
+  const [isCacheDbOpen, setIsCacheDbOpen] = useState(false)
   const [isPluginsOpen, setIsPluginsOpen] = useState(false)
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
+  const [cacheDbSummary, setCacheDbSummary] = useState<CacheDbSummary | null>(null)
+  const [cacheDbError, setCacheDbError] = useState<string | null>(null)
+  const [cacheDbBusyAction, setCacheDbBusyAction] =
+    useState<CacheDbBusyAction | null>(null)
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pluginsError, setPluginsError] = useState<string | null>(null)
   const [selectedPluginTabId, setSelectedPluginTabId] = useState<string | null>(
@@ -587,6 +664,27 @@ function App() {
           ? error.message
           : 'Failed to load Hugging Face auth status',
       )
+    }
+  })
+  const refreshCacheDbSummary = useEffectEvent(async (signal?: AbortSignal) => {
+    setCacheDbError(null)
+    setCacheDbBusyAction('refresh')
+
+    try {
+      const nextSummary = await fetchCacheDbSummary(signal)
+      setCacheDbSummary(nextSummary)
+    } catch (error) {
+      if (signal?.aborted) {
+        return
+      }
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Failed to load cache database summary'
+      setCacheDbError(message)
+    } finally {
+      setCacheDbBusyAction((current) => (current === 'refresh' ? null : current))
     }
   })
   const refreshAfterHfConnect = useEffectEvent(() => {
@@ -1480,6 +1578,22 @@ function App() {
   }, [isHotkeysOpen])
 
   useEffect(() => {
+    if (!isCacheDbOpen) {
+      return
+    }
+
+    const handleCloseHotkey = (event: KeyboardEvent) => {
+      if (matchesHotkeyAction(event, 'closeOverlay')) {
+        event.preventDefault()
+        closeCacheDbSettings()
+      }
+    }
+
+    window.addEventListener('keydown', handleCloseHotkey)
+    return () => window.removeEventListener('keydown', handleCloseHotkey)
+  }, [isCacheDbOpen])
+
+  useEffect(() => {
     if (!isPluginsOpen) {
       return
     }
@@ -1844,6 +1958,18 @@ function App() {
   const closeHotkeys = () => {
     setHotkeyCaptureTarget(null)
     setIsHotkeysOpen(false)
+  }
+
+  const openCacheDbSettings = () => {
+    setOpenMenu(null)
+    setCacheDbError(null)
+    setIsCacheDbOpen(true)
+    void refreshCacheDbSummary()
+  }
+
+  const closeCacheDbSettings = () => {
+    setCacheDbError(null)
+    setIsCacheDbOpen(false)
   }
 
   const selectSidebarView = (nextView: 'main' | 'plugins') => {
@@ -2282,6 +2408,69 @@ function App() {
     setConfirmDialogState(null)
   }
 
+  const applyCacheDbActionLocally = useEffectEvent((action: CacheDbAction) => {
+    if (action === 'clear-session-history') {
+      setRecentDatasets([])
+      commitPersistedSessionState(null)
+      return
+    }
+
+    if (action === 'reset-project-cache-db') {
+      setRecentDatasets([])
+      commitPersistedSessionState(null)
+      setProjectClassesByRootPath({})
+    }
+  })
+
+  const handleRunCacheDbAction = useEffectEvent(async (action: CacheDbAction) => {
+    setCacheDbError(null)
+    setCacheDbBusyAction(action)
+
+    try {
+      const nextSummary = await runCacheDbAction(action)
+      setCacheDbSummary(nextSummary)
+      applyCacheDbActionLocally(action)
+
+      if (action === 'clear-session-history') {
+        pushToast('Cleared recent datasets and session restore state.', 'success')
+      } else if (action === 'clear-dataset-cache') {
+        pushToast('Cleared cached dataset indexes.', 'success')
+      } else if (action === 'clear-annotation-cache') {
+        pushToast('Cleared cached parsed annotations.', 'success')
+      } else if (action === 'reset-project-cache-db') {
+        pushToast('Reset project-related cache data in SQLite.', 'success')
+      } else if (action === 'compact-database') {
+        pushToast('Compacted the SQLite cache database.', 'success')
+      }
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Failed to update cache database'
+      setCacheDbError(message)
+      pushToast(message, 'error')
+    } finally {
+      setCacheDbBusyAction((current) => (current === action ? null : current))
+    }
+  })
+
+  const openCacheDbActionConfirmDialog = (action: CacheDbAction) => {
+    const item =
+      CACHE_DB_ACTION_ITEMS.find((candidate) => candidate.action === action) ?? null
+    if (!item) {
+      return
+    }
+
+    setConfirmDialogState({
+      title: item.confirmTitle,
+      message: item.confirmMessage,
+      confirmLabel: item.confirmLabel,
+      confirmTone: item.confirmTone,
+      onConfirm: () => {
+        setConfirmDialogState(null)
+        void handleRunCacheDbAction(action)
+      },
+    })
+  }
+
   const openResetHotkeysConfirmDialog = () => {
     setConfirmDialogState({
       title: 'Reset hotkeys to defaults?',
@@ -2656,6 +2845,7 @@ function App() {
       confirmDialogState ||
       isClassManagerOpen ||
       isHotkeysOpen ||
+      isCacheDbOpen ||
       isPluginsOpen
     ) {
       return
@@ -3334,6 +3524,12 @@ function App() {
                   title="Hotkeys"
                   description="View and edit keyboard shortcuts"
                   onClick={openHotkeys}
+                />
+                <MenuItemButton
+                  title="Cache Database"
+                  description="Inspect and clear the SQLite cache database"
+                  onClick={openCacheDbSettings}
+                  disabled={backendStatus !== 'online'}
                 />
               </div>
             ) : null}
@@ -4171,6 +4367,159 @@ function App() {
                 <span className="muted">No project classes configured.</span>
               )}
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {isCacheDbOpen ? (
+        <div
+          className="lightbox-backdrop"
+          onClick={closeCacheDbSettings}
+        >
+          <div
+            className="plugin-manager-lightbox cache-db-lightbox"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cache database"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="class-manager-header">
+              <div>
+                <p className="section-kicker">Settings</p>
+                <h2>Cache database</h2>
+                <p className="plugin-manager-note">
+                  SQLite storage for reopen history, dataset indexes and parsed
+                  annotation cache.
+                </p>
+              </div>
+              <div className="hotkeys-toolbar">
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={() => void refreshCacheDbSummary()}
+                  disabled={backendStatus !== 'online' || cacheDbBusyAction !== null}
+                >
+                  {cacheDbBusyAction === 'refresh' ? 'Refreshing...' : 'Refresh'}
+                </AppButton>
+                <AppButton
+                  variant="ghost"
+                  className="class-manager-close"
+                  onClick={closeCacheDbSettings}
+                >
+                  Close
+                </AppButton>
+              </div>
+            </div>
+
+            <section className="plugin-card">
+              <div className="plugin-card-title-row">
+                <h3>Overview</h3>
+                <span
+                  className={
+                    cacheDbSummary?.exists
+                      ? 'plugin-status is-installed'
+                      : 'plugin-status'
+                  }
+                >
+                  {cacheDbSummary?.exists ? 'Detected' : 'Unavailable'}
+                </span>
+              </div>
+
+              {cacheDbError ? (
+                <p className="plugin-manager-note is-error">{cacheDbError}</p>
+              ) : (
+                <p className="plugin-manager-note">
+                  The cache DB stays live while the app is running. Cleanup
+                  changes affect future restores and cache hits, not the current
+                  in-memory session.
+                </p>
+              )}
+
+              <div className="meta-grid">
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Total size</span>
+                  <strong>{formatByteSize(cacheDbSummary?.totalBytes)}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">DB file</span>
+                  <strong>{formatByteSize(cacheDbSummary?.dbBytes)}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">WAL file</span>
+                  <strong>{formatByteSize(cacheDbSummary?.walBytes)}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">SHM file</span>
+                  <strong>{formatByteSize(cacheDbSummary?.shmBytes)}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">App settings rows</span>
+                  <strong>{cacheDbSummary?.tableCounts.appSettings ?? 0}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Service secret rows</span>
+                  <strong>{cacheDbSummary?.tableCounts.serviceSecrets ?? 0}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Dataset manifests</span>
+                  <strong>{cacheDbSummary?.tableCounts.datasetManifests ?? 0}</strong>
+                </div>
+                <div className="meta-item">
+                  <span className="plugin-detail-label">Indexed images</span>
+                  <strong>{cacheDbSummary?.tableCounts.datasetImages ?? 0}</strong>
+                </div>
+                <div className="meta-item meta-item-wide">
+                  <span className="plugin-detail-label">Parsed annotations</span>
+                  <strong>{cacheDbSummary?.tableCounts.annotationCache ?? 0}</strong>
+                </div>
+              </div>
+
+              <p className="path-note" title={cacheDbSummary?.dbPath ?? ''}>
+                {cacheDbSummary?.dbPath ?? 'Database path unavailable'}
+              </p>
+            </section>
+
+            <section className="plugin-card">
+              <div className="plugin-card-title-row">
+                <h3>Cleanup actions</h3>
+              </div>
+              <div className="cache-db-action-list">
+                {CACHE_DB_ACTION_ITEMS.map((item) => {
+                  const isBusy = cacheDbBusyAction === item.action
+
+                  return (
+                    <div key={item.action} className="cache-db-action-card">
+                      <div className="cache-db-action-copy">
+                        <strong>{item.title}</strong>
+                        <p className="plugin-manager-note">{item.description}</p>
+                      </div>
+                      <AppButton
+                        variant={
+                          item.confirmTone === 'default' ? 'primary' : 'ghost'
+                        }
+                        className={
+                          item.confirmTone === 'default'
+                            ? 'cache-db-action-button'
+                            : 'cache-db-action-button is-danger'
+                        }
+                        onClick={() => openCacheDbActionConfirmDialog(item.action)}
+                        disabled={backendStatus !== 'online' || cacheDbBusyAction !== null}
+                      >
+                        {isBusy
+                          ? item.action === 'compact-database'
+                            ? 'Compacting...'
+                            : 'Running...'
+                          : item.confirmLabel}
+                      </AppButton>
+                    </div>
+                  )
+                })}
+              </div>
+              <p className="plugin-manager-note">
+                Reset project cache DB keeps Hugging Face OAuth and plugin runtime
+                secrets stored in the database.
+              </p>
+            </section>
           </div>
         </div>
       ) : null}

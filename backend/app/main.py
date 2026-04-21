@@ -247,6 +247,16 @@ class AppStatePayload(BaseModel):
     samSettings: SamSettingsPayload | None = None
 
 
+class CacheDbActionPayload(BaseModel):
+    action: Literal[
+        "clear-session-history",
+        "clear-dataset-cache",
+        "clear-annotation-cache",
+        "reset-project-cache-db",
+        "compact-database",
+    ]
+
+
 class LocalAnnotationPayload(BaseModel):
     label: str | None = None
     difficult: bool = False
@@ -396,6 +406,42 @@ def get_app_state():
 def update_app_state(payload: AppStatePayload):
     patch = payload.model_dump(exclude_unset=True, mode="json")
     return CACHE_STORE.merge_app_state(patch)
+
+
+@app.get("/api/cache-db")
+def get_cache_db_summary():
+    return CACHE_STORE.get_cache_db_summary()
+
+
+@app.post("/api/cache-db/actions")
+def run_cache_db_action(payload: CacheDbActionPayload):
+    action = payload.action
+
+    if action == "clear-session-history":
+        CACHE_STORE.delete_app_state_keys(
+            (
+                "recentDatasets",
+                "sessionState",
+            )
+        )
+    elif action == "clear-dataset-cache":
+        CACHE_STORE.clear_dataset_cache()
+    elif action == "clear-annotation-cache":
+        CACHE_STORE.clear_annotation_cache()
+    elif action == "reset-project-cache-db":
+        CACHE_STORE.delete_app_state_keys(
+            (
+                "recentDatasets",
+                "sessionState",
+                "projectClassesByRootPath",
+            )
+        )
+        CACHE_STORE.clear_dataset_cache()
+        CACHE_STORE.clear_annotation_cache()
+    elif action == "compact-database":
+        CACHE_STORE.compact_database()
+
+    return CACHE_STORE.get_cache_db_summary()
 
 
 @app.get("/api/hf-auth/status")

@@ -141,6 +141,7 @@
 .ui-button--index,
 .class-manager-lightbox,
 .plugin-manager-lightbox,
+.cache-db-lightbox,
 .hotkeys-lightbox,
 .confirm-dialog,
 .class-manager-input,
@@ -735,6 +736,7 @@
 
 .class-manager-lightbox,
 .plugin-manager-lightbox,
+.cache-db-lightbox,
 .hotkeys-lightbox {
   width: min(720px, calc(100vw - 40px));
   max-height: min(80svh, 760px);
@@ -764,6 +766,12 @@
 
 .plugin-manager-lightbox {
   width: min(960px, calc(100vw - 40px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.cache-db-lightbox {
+  width: min(880px, calc(100vw - 40px));
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -936,6 +944,48 @@
   padding: 14px;
   border: 1px solid var(--border-soft);
   background: var(--surface-raised);
+}
+
+.cache-db-action-list {
+  display: grid;
+  gap: 10px;
+}
+
+.cache-db-action-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.cache-db-action-copy {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.cache-db-action-copy strong {
+  color: var(--ink-strong);
+  font-size: 0.94rem;
+}
+
+.cache-db-action-button {
+  min-width: 148px;
+  justify-content: center;
+}
+
+.cache-db-action-button.is-danger {
+  border-color: rgba(236, 96, 96, 0.28);
+  color: #ffd2d2;
+}
+
+.cache-db-action-button.is-danger:hover:not(:disabled) {
+  border-color: rgba(236, 96, 96, 0.42);
+  background: rgba(236, 96, 96, 0.08);
+  color: #ffe3e3;
 }
 
 .plugin-card-header {
@@ -2514,6 +2564,7 @@
   }
 
   .plugin-manager-lightbox,
+  .cache-db-lightbox,
   .hotkeys-lightbox,
   .class-manager-lightbox,
   .confirm-dialog {
@@ -2524,6 +2575,15 @@
   .plugin-card-header,
   .class-manager-header {
     flex-direction: column;
+  }
+
+  .cache-db-action-card {
+    grid-template-columns: 1fr;
+  }
+
+  .cache-db-action-button {
+    width: 100%;
+    min-width: 0;
   }
 
   .hotkeys-toolbar {

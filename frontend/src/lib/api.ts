@@ -92,6 +92,31 @@ export type AppStateResponse = {
   samSettings?: SamSettingsPayload | null
 }
 
+export type CacheDbTableCounts = {
+  appSettings: number
+  serviceSecrets: number
+  datasetManifests: number
+  datasetImages: number
+  annotationCache: number
+}
+
+export type CacheDbSummary = {
+  dbPath: string
+  exists: boolean
+  dbBytes: number
+  walBytes: number
+  shmBytes: number
+  totalBytes: number
+  tableCounts: CacheDbTableCounts
+}
+
+export type CacheDbAction =
+  | 'clear-session-history'
+  | 'clear-dataset-cache'
+  | 'clear-annotation-cache'
+  | 'reset-project-cache-db'
+  | 'compact-database'
+
 export type PluginModelState = {
   filename: string
   provider: string
@@ -232,6 +257,20 @@ export async function fetchPredefinedClasses(signal?: AbortSignal) {
 
 export async function fetchAppState(signal?: AbortSignal) {
   return requestJson<AppStateResponse>('/api/app-state', { signal })
+}
+
+export async function fetchCacheDbSummary(signal?: AbortSignal) {
+  return requestJson<CacheDbSummary>('/api/cache-db', { signal })
+}
+
+export async function runCacheDbAction(action: CacheDbAction) {
+  return requestJson<CacheDbSummary>('/api/cache-db/actions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ action }),
+  })
 }
 
 export async function fetchPlugins(signal?: AbortSignal) {

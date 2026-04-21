@@ -151,6 +151,99 @@ class CacheStore:
 
         return state
 
+    def get_cache_db_summary(self):
+        wal_path = self.db_path.parent / f"{self.db_path.name}-wal"
+        shm_path = self.db_path.parent / f"{self.db_path.name}-shm"
+
+        with self._lock:
+            with self._connect() as connection:
+                app_settings_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM app_settings"
+                    ).fetchone()[0]
+                )
+                service_secrets_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM service_secrets"
+                    ).fetchone()[0]
+                )
+                dataset_manifests_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM dataset_manifests"
+                    ).fetchone()[0]
+                )
+                dataset_images_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM dataset_images"
+                    ).fetchone()[0]
+                )
+                annotation_cache_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM annotation_cache"
+                    ).fetchone()[0]
+                )
+
+        db_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+
+        return {
+            "dbPath": str(self.db_path),
+            "exists": self.db_path.exists(),
+            "dbBytes": db_bytes,
+            "walBytes": wal_bytes,
+            "shmBytes": shm_bytes,
+            "totalBytes": db_bytes + wal_bytes + shm_bytes,
+            "tableCounts": {
+                "appSettings": app_settings_count,
+                "serviceSecrets": service_secrets_count,
+                "datasetManifests": dataset_manifests_count,
+                "datasetImages": dataset_images_count,
+                "annotationCache": annotation_cache_count,
+            },
+        }
+
+    def delete_app_state_keys(self, keys: Sequence[str]):
+        if not keys:
+            return
+
+        rows = [(key,) for key in keys]
+        with self._lock:
+            with self._connect() as connection:
+                connection.executemany(
+                    "DELETE FROM app_settings WHERE key = ?",
+                    rows,
+                )
+
+        self.checkpoint_database()
+
+    def clear_dataset_cache(self):
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("DELETE FROM dataset_manifests")
+
+        self.checkpoint_database()
+
+    def clear_annotation_cache(self):
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("DELETE FROM annotation_cache")
+
+        self.checkpoint_database()
+
+    def checkpoint_database(self):
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def compact_database(self):
+        with self._lock:
+            with sqlite3.connect(self.db_path, isolation_level=None) as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("VACUUM")
+
+        self.checkpoint_database()
+
     def load_service_secret(self, key: str):
         with self._lock:
             with self._connect() as connection:
