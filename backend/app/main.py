@@ -2551,17 +2551,21 @@ def start_directory_open_job(root_path: Path):
     LOCAL_SESSION_JOBS[job.id] = job
     cached_session = build_cached_directory_session(resolved_root)
 
-    if cached_session is None:
-        session = create_local_session(
-            resolved_root,
-            resolved_root.name or "Folder session",
-        )
-    else:
-        session = cached_session
+    if cached_session is not None:
+        session_payload = serialize_session(cached_session)
         with SESSION_JOB_LOCK:
-            job.total_images = len(session.images)
-            job.session_payload = serialize_session(session)
+            job.status = "completed"
+            job.phase = "completed"
+            job.processed_images = len(cached_session.images)
+            job.total_images = len(cached_session.images)
+            job.session_payload = session_payload
             job.session_revision += 1
+        return job
+
+    session = create_local_session(
+        resolved_root,
+        resolved_root.name or "Folder session",
+    )
 
     def update_progress(
         *,
