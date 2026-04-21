@@ -275,12 +275,14 @@
 }
 
 .ui-button--primary.is-active {
-  border-color: rgba(255, 255, 255, 0.38);
-  background: #151515;
+  border-color: rgba(255, 255, 255, 0.88);
+  background: linear-gradient(180deg, #f4f7fa 0%, #d7dde3 100%);
+  color: #040404;
+  font-weight: 700;
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.06),
-    0 0 0 1px rgba(255, 255, 255, 0.12),
-    0 10px 20px rgba(0, 0, 0, 0.32);
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18),
+    0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 12px 24px rgba(0, 0, 0, 0.34);
 }
 
 .menu-item-copy {
@@ -1596,9 +1598,11 @@
   display: inline-flex;
   align-items: center;
   padding: 6px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
   background: rgba(255, 255, 255, 0.05);
   color: var(--ink-strong);
   font-size: 0.88rem;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .ui-button--list-row {
@@ -1620,8 +1624,31 @@
 }
 
 .ui-button--chip.is-active {
-  background: #111111;
-  color: var(--ink-strong);
+  border-color: rgba(255, 255, 255, 0.92);
+  background: linear-gradient(180deg, #f4f7fa 0%, #d5dbe1 100%);
+  color: #050505;
+  font-weight: 700;
+  box-shadow:
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18),
+    0 0 0 1px rgba(255, 255, 255, 0.16),
+    0 8px 16px rgba(0, 0, 0, 0.24);
+}
+
+.ui-button--list-row.is-active {
+  border-color: rgba(255, 255, 255, 0.58);
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.05) 100%
+  );
+  color: #050505;
+  box-shadow:
+    inset 3px 0 0 rgba(255, 255, 255, 0.92),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.ui-button--list-row.is-active .current-box-index {
+  color: rgba(5, 5, 5, 0.72);
 }
 
 .ui-button--ghost,
@@ -2023,10 +2050,13 @@
 }
 
 .viewport-tool.is-active {
-  color: var(--accent);
-  border-color: rgba(255, 255, 255, 0.26);
-  background: rgba(12, 12, 12, 0.96);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  color: #040404;
+  border-color: rgba(255, 255, 255, 0.92);
+  background: linear-gradient(180deg, #f4f7fa 0%, #d5dbe1 100%);
+  box-shadow:
+    inset 0 -2px 0 rgba(0, 0, 0, 0.18),
+    0 0 0 1px rgba(255, 255, 255, 0.12),
+    0 8px 18px rgba(0, 0, 0, 0.26);
 }
 
 .viewport-tool:disabled {
