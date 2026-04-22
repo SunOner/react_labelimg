@@ -326,6 +326,10 @@ class DuplicateSearchRequest(BaseModel):
     minimumSimilarityPercent: int = 92
 
 
+class BulkImageDeleteRequest(BaseModel):
+    imageIds: list[str] = []
+
+
 LOCAL_SESSIONS: dict[str, LocalSession] = {}
 LOCAL_SESSION_JOBS: dict[str, SessionOpenJob] = {}
 LOCAL_IMAGE_PATHS: dict[str, Path] = {}
@@ -927,24 +931,29 @@ def save_local_session_annotations(
     }
 
 
+@app.post("/api/local/sessions/{session_id}/images/bulk-delete")
+def bulk_delete_local_session_images(
+    session_id: str,
+    payload: BulkImageDeleteRequest,
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    image_ids = list(dict.fromkeys(payload.imageIds))
+    if not image_ids:
+        raise HTTPException(status_code=400, detail="Select at least one image")
+
+    return delete_local_session_images(session, image_ids)
+
+
 @app.delete("/api/local/sessions/{session_id}/images/{image_id}")
 def delete_local_session_image(session_id: str, image_id: str):
     session = LOCAL_SESSIONS.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    image = session.images_by_id.get(image_id)
-    if image is None:
-        raise HTTPException(status_code=404, detail="Image not found")
-
-    delete_session_image_files(image)
-    remove_image_from_matching_sessions(session.root_path, image.id)
-    CACHE_STORE.save_dataset_manifest(
-        session.root_path,
-        session.label,
-        serialize_manifest_images(session.images),
-    )
-    return serialize_session(session)
+    return delete_local_session_images(session, [image_id])
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2564,6 +2573,30 @@ def create_local_session(root_path: Path, label: str):
     return session
 
 
+def delete_local_session_images(session: LocalSession, image_ids: list[str]):
+    images_to_delete = [
+        session.images_by_id[image_id]
+        for image_id in dict.fromkeys(image_ids)
+        if image_id in session.images_by_id
+    ]
+    if not images_to_delete:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    for image in images_to_delete:
+        delete_session_image_files(image)
+
+    remove_images_from_matching_sessions(
+        session.root_path,
+        [image.id for image in images_to_delete],
+    )
+    CACHE_STORE.save_dataset_manifest(
+        session.root_path,
+        session.label,
+        serialize_manifest_images(session.images),
+    )
+    return serialize_session(session)
+
+
 def delete_session_image_files(image: SessionImage):
     try:
         if image.full_path.exists():
@@ -2598,24 +2631,33 @@ def register_session_images(images: list[SessionImage]):
         register_session_image(image)
 
 
-def remove_image_from_matching_sessions(root_path: Path, image_id: str):
+def remove_images_from_matching_sessions(root_path: Path, image_ids: list[str]):
     normalized_root_path = root_path.expanduser().resolve()
+    image_id_set = set(image_ids)
+    if not image_id_set:
+        return
 
     for session in LOCAL_SESSIONS.values():
         if session.root_path != normalized_root_path:
             continue
 
-        if image_id not in session.images_by_id:
+        if image_id_set.isdisjoint(session.images_by_id):
             continue
 
         session.images = [
             current_image
             for current_image in session.images
-            if current_image.id != image_id
+            if current_image.id not in image_id_set
         ]
-        session.images_by_id.pop(image_id, None)
+        for image_id in image_id_set:
+            session.images_by_id.pop(image_id, None)
 
-    LOCAL_IMAGE_PATHS.pop(image_id, None)
+    for image_id in image_id_set:
+        LOCAL_IMAGE_PATHS.pop(image_id, None)
+
+
+def remove_image_from_matching_sessions(root_path: Path, image_id: str):
+    remove_images_from_matching_sessions(root_path, [image_id])
 
 
 def build_cached_directory_session(root_path: Path):

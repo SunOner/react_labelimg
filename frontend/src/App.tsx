@@ -15,6 +15,7 @@ import {
   buildLocalImageUrl,
   fetchCacheDbSummary,
   deleteLocalSessionImage,
+  deleteLocalSessionImages,
   downloadPluginModel,
   fetchAppState,
   fetchApiHealth,
@@ -76,6 +77,11 @@ type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
 const PRELOAD_RADIUS = 1
 const DELETE_IMAGE_ARM_DURATION_MS = 3000
 const ANNOTATION_SAVE_DEBOUNCE_MS = 350
+const DUPLICATE_SEARCH_PAGE_SIZE = 30
+const DUPLICATE_SEARCH_HOVER_PREVIEW_WIDTH_PX = 360
+const DUPLICATE_SEARCH_HOVER_PREVIEW_HEIGHT_PX = 320
+const DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX = 16
+const DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX = 18
 const SIDEBAR_VISIBILITY_STORAGE_KEY = 'labelimg.sidebarVisible'
 const RECENT_DATASETS_STORAGE_KEY = 'labelimg.recentDatasets'
 const SESSION_STATE_STORAGE_KEY = 'labelimg.sessionState'
@@ -301,6 +307,11 @@ type DuplicateSearchPreviewImage = {
   relativePath: string
 }
 
+type DuplicateSearchHoverPreview = DuplicateSearchPreviewImage & {
+  pointerX: number
+  pointerY: number
+}
+
 const CACHE_DB_ACTION_ITEMS: Array<{
   action: CacheDbAction
   title: string
@@ -418,6 +429,8 @@ function App() {
   const [isDuplicateSearchOpen, setIsDuplicateSearchOpen] = useState(false)
   const [duplicateSearchPreviewImage, setDuplicateSearchPreviewImage] =
     useState<DuplicateSearchPreviewImage | null>(null)
+  const [duplicateSearchHoverPreview, setDuplicateSearchHoverPreview] =
+    useState<DuplicateSearchHoverPreview | null>(null)
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
@@ -480,11 +493,16 @@ function App() {
   const [duplicateSearchMatches, setDuplicateSearchMatches] = useState<
     LocalDuplicateSearchMatch[]
   >([])
+  const [duplicateSearchPage, setDuplicateSearchPage] = useState(1)
   const [duplicateSearchError, setDuplicateSearchError] = useState<string | null>(
     null,
   )
   const [duplicateSearchDeletingImageId, setDuplicateSearchDeletingImageId] =
     useState<string | null>(null)
+  const [duplicateSearchSelectedImageIds, setDuplicateSearchSelectedImageIds] =
+    useState<string[]>([])
+  const [isDuplicateSearchBulkDeleting, setIsDuplicateSearchBulkDeleting] =
+    useState(false)
   const [draggedAnnotationId, setDraggedAnnotationId] = useState<string | null>(
     null,
   )
@@ -523,10 +541,14 @@ function App() {
       setIsDuplicateSearchOpen(false)
     }
     setDuplicateSearchPreviewImage(null)
+    setDuplicateSearchHoverPreview(null)
     setDuplicateSearchRuntime(buildInitialDuplicateSearchRuntime())
     setDuplicateSearchMatches([])
+    setDuplicateSearchPage(1)
     setDuplicateSearchError(null)
     setDuplicateSearchDeletingImageId(null)
+    setDuplicateSearchSelectedImageIds([])
+    setIsDuplicateSearchBulkDeleting(false)
   }
 
   const currentImageIndex =
@@ -613,6 +635,32 @@ function App() {
       imagesById.has(match.leftImageId) && imagesById.has(match.rightImageId)
     )
   })
+  const duplicateSearchPageCount = Math.max(
+    1,
+    Math.ceil(visibleDuplicateSearchMatches.length / DUPLICATE_SEARCH_PAGE_SIZE),
+  )
+  const duplicateSearchCurrentPage = Math.min(
+    duplicateSearchPage,
+    duplicateSearchPageCount,
+  )
+  const duplicateSearchPageStartIndex =
+    (duplicateSearchCurrentPage - 1) * DUPLICATE_SEARCH_PAGE_SIZE
+  const duplicateSearchPageEndIndex = Math.min(
+    visibleDuplicateSearchMatches.length,
+    duplicateSearchPageStartIndex + DUPLICATE_SEARCH_PAGE_SIZE,
+  )
+  const duplicateSearchPageMatches = visibleDuplicateSearchMatches.slice(
+    duplicateSearchPageStartIndex,
+    duplicateSearchPageEndIndex,
+  )
+  const duplicateSearchSelectedImageIdSet = new Set(
+    duplicateSearchSelectedImageIds,
+  )
+  const isDuplicateSearchDeleteBusy =
+    duplicateSearchDeletingImageId !== null || isDuplicateSearchBulkDeleting
+  const duplicateSearchHoverPreviewStyle = duplicateSearchHoverPreview
+    ? buildDuplicateSearchHoverPreviewStyle(duplicateSearchHoverPreview)
+    : null
   const displayedDuplicateSearchThreshold =
     duplicateSearchRuntime.status === 'idle'
       ? Math.round(duplicateSearchThresholdValue)
@@ -1740,6 +1788,21 @@ function App() {
   }, [duplicateSearchPreviewImage])
 
   useEffect(() => {
+    if (duplicateSearchPage === duplicateSearchCurrentPage) {
+      return
+    }
+
+    setDuplicateSearchPage(duplicateSearchCurrentPage)
+  }, [duplicateSearchCurrentPage, duplicateSearchPage])
+
+  useEffect(() => {
+    setDuplicateSearchSelectedImageIds((current) => {
+      const next = current.filter((imageId) => imageIdSetRef.current.has(imageId))
+      return next.length === current.length ? current : next
+    })
+  }, [images])
+
+  useEffect(() => {
     const jobId = duplicateSearchRuntime.jobId
     if (!jobId) {
       return
@@ -2150,11 +2213,34 @@ function App() {
   }
 
   const openDuplicateSearchImageLightbox = useEffectEvent((entry: ImageEntry) => {
+    setDuplicateSearchHoverPreview(null)
     setDuplicateSearchPreviewImage({
       url: entry.url,
       name: entry.name,
       relativePath: entry.relativePath,
     })
+  })
+
+  const showDuplicateSearchHoverPreview = useEffectEvent((
+    entry: ImageEntry,
+    pointerX: number,
+    pointerY: number,
+  ) => {
+    if (duplicateSearchPreviewImage) {
+      return
+    }
+
+    setDuplicateSearchHoverPreview({
+      url: entry.url,
+      name: entry.name,
+      relativePath: entry.relativePath,
+      pointerX,
+      pointerY,
+    })
+  })
+
+  const hideDuplicateSearchHoverPreview = useEffectEvent(() => {
+    setDuplicateSearchHoverPreview(null)
   })
 
   const openClassManager = () => {
@@ -2177,6 +2263,7 @@ function App() {
   }
 
   const closeDuplicateSearch = () => {
+    setDuplicateSearchHoverPreview(null)
     setDuplicateSearchPreviewImage(null)
     setIsDuplicateSearchOpen(false)
     setDuplicateSearchError(null)
@@ -2256,7 +2343,10 @@ function App() {
     const minimumSimilarityPercent = Math.round(duplicateSearchThresholdValue)
     setDuplicateSearchError(null)
     setDuplicateSearchDeletingImageId(null)
+    setDuplicateSearchSelectedImageIds([])
+    setIsDuplicateSearchBulkDeleting(false)
     setDuplicateSearchMatches([])
+    setDuplicateSearchPage(1)
     setDuplicateSearchRuntime({
       jobId: null,
       revision: 0,
@@ -3071,30 +3161,71 @@ function App() {
     replaceImageAnnotations(currentEntry.id, [], { selectedAnnotationId: null })
   }
 
-  const deleteSessionImageById = useEffectEvent(async (
-    imageId: string,
+  const resolvePreferredImageRelativePathAfterDeleting = (
+    deletedImageIds: Set<string>,
+    preferredImageRelativePath?: string | null,
+  ) => {
+    if (preferredImageRelativePath !== undefined) {
+      return preferredImageRelativePath
+    }
+
+    if (currentEntry && !deletedImageIds.has(currentEntry.id)) {
+      return currentEntry.relativePath
+    }
+
+    const currentIndex = currentEntry
+      ? images.findIndex((entry) => entry.id === currentEntry.id)
+      : -1
+
+    for (let index = currentIndex + 1; index < images.length; index += 1) {
+      const candidate = images[index]
+      if (candidate && !deletedImageIds.has(candidate.id)) {
+        return candidate.relativePath
+      }
+    }
+
+    for (let index = currentIndex - 1; index >= 0; index -= 1) {
+      const candidate = images[index]
+      if (candidate && !deletedImageIds.has(candidate.id)) {
+        return candidate.relativePath
+      }
+    }
+
+    return (
+      images.find((entry) => !deletedImageIds.has(entry.id))?.relativePath ?? null
+    )
+  }
+
+  const deleteSessionImagesById = useEffectEvent(async (
+    imageIds: string[],
     preferredImageRelativePath?: string | null,
   ) => {
     if (!currentSessionId || !isDatasetSession) {
       throw new Error('Open a dataset to delete images.')
     }
 
-    const imageToDelete = images.find((entry) => entry.id === imageId) ?? null
-    if (!imageToDelete) {
-      throw new Error('Image not found in the current session.')
+    const uniqueImageIds = [...new Set(imageIds)]
+    const imagesToDelete = uniqueImageIds.flatMap((imageId) => {
+      const imageToDelete = imagesById.get(imageId) ?? null
+      return imageToDelete ? [imageToDelete] : []
+    })
+    if (imagesToDelete.length === 0) {
+      throw new Error('Selected images are no longer available in the current session.')
     }
 
-    const imageIndex = images.findIndex((entry) => entry.id === imageId)
     const nextPreferredImageRelativePath =
-      preferredImageRelativePath !== undefined
-        ? preferredImageRelativePath
-        : currentEntry?.id === imageId
-          ? images[imageIndex + 1]?.relativePath ??
-            images[imageIndex - 1]?.relativePath ??
-            null
-          : currentEntry?.relativePath ?? null
+      resolvePreferredImageRelativePathAfterDeleting(
+        new Set(imagesToDelete.map((image) => image.id)),
+        preferredImageRelativePath,
+      )
 
-    const session = await deleteLocalSessionImage(currentSessionId, imageToDelete.id)
+    const session =
+      imagesToDelete.length === 1
+        ? await deleteLocalSessionImage(currentSessionId, imagesToDelete[0].id)
+        : await deleteLocalSessionImages(
+            currentSessionId,
+            imagesToDelete.map((image) => image.id),
+          )
 
     applyLocalSession(session, {
       preferredImageRelativePath: nextPreferredImageRelativePath,
@@ -3105,6 +3236,21 @@ function App() {
         ...persistedSessionState,
         currentImageRelativePath: null,
       })
+    }
+
+    return imagesToDelete
+  })
+
+  const deleteSessionImageById = useEffectEvent(async (
+    imageId: string,
+    preferredImageRelativePath?: string | null,
+  ) => {
+    const [imageToDelete] = await deleteSessionImagesById(
+      [imageId],
+      preferredImageRelativePath,
+    )
+    if (!imageToDelete) {
+      throw new Error('Image not found in the current session.')
     }
 
     pushToast(`Deleted ${imageToDelete.relativePath}.`, 'success')
@@ -3131,6 +3277,9 @@ function App() {
 
     try {
       await deleteSessionImageById(imageId, preferredImageRelativePath)
+      setDuplicateSearchSelectedImageIds((current) =>
+        current.filter((selectedImageId) => selectedImageId !== imageId),
+      )
     } catch (error) {
       setDuplicateSearchError(
         error instanceof Error ? error.message : 'Failed to delete image',
@@ -3139,6 +3288,67 @@ function App() {
       setDuplicateSearchDeletingImageId((current) =>
         current === imageId ? null : current,
       )
+    }
+  })
+
+  const setDuplicateSearchImageSelected = useEffectEvent((
+    imageId: string,
+    isSelected: boolean,
+  ) => {
+    setDuplicateSearchSelectedImageIds((current) => {
+      const alreadySelected = current.includes(imageId)
+      if (alreadySelected === isSelected) {
+        return current
+      }
+
+      if (isSelected) {
+        return [...current, imageId]
+      }
+
+      return current.filter((selectedImageId) => selectedImageId !== imageId)
+    })
+  })
+
+  const handleDeleteSelectedDuplicateSearchImages = useEffectEvent(async (
+    imageIds: string[],
+  ) => {
+    if (!isDatasetSession) {
+      setDuplicateSearchError('Only dataset sessions support deleting duplicate images.')
+      return
+    }
+
+    const candidateImageIds = [...new Set(imageIds)].filter((imageId) =>
+      imagesById.has(imageId),
+    )
+    if (candidateImageIds.length === 0) {
+      setDuplicateSearchSelectedImageIds([])
+      return
+    }
+
+    setIsDuplicateSearchBulkDeleting(true)
+    setDuplicateSearchError(null)
+
+    try {
+      const deletedImages = await deleteSessionImagesById(candidateImageIds)
+      const deletedImageIdSet = new Set(deletedImages.map((image) => image.id))
+      setDuplicateSearchSelectedImageIds((current) =>
+        current.filter((imageId) => !deletedImageIdSet.has(imageId)),
+      )
+
+      if (deletedImages.length === 1) {
+        pushToast(`Deleted ${deletedImages[0].relativePath}.`, 'success')
+      } else {
+        pushToast(
+          `Deleted ${deletedImages.length.toLocaleString()} images.`,
+          'success',
+        )
+      }
+    } catch (error) {
+      setDuplicateSearchError(
+        error instanceof Error ? error.message : 'Failed to delete selected images',
+      )
+    } finally {
+      setIsDuplicateSearchBulkDeleting(false)
     }
   })
 
@@ -4601,7 +4811,11 @@ function App() {
                   variant="ghost"
                   className="class-manager-close"
                   onClick={() => void startDuplicateSearch()}
-                  disabled={!canSearchDuplicates || duplicateSearchRuntime.status === 'running'}
+                  disabled={
+                    !canSearchDuplicates ||
+                    duplicateSearchRuntime.status === 'running' ||
+                    isDuplicateSearchDeleteBusy
+                  }
                 >
                   {duplicateSearchRuntime.status === 'running'
                     ? 'Scanning...'
@@ -4732,185 +4946,372 @@ function App() {
             </section>
 
             <section className="plugin-card duplicate-search-results-card">
-              <div className="plugin-card-title-row">
-                <h3>Live matches</h3>
-                <span className="plugin-status">
-                  {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
-                </span>
+              <div className="duplicate-search-results-header">
+                <div className="plugin-card-title-row">
+                  <h3>Live matches</h3>
+                  <span className="plugin-status">
+                    {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
+                  </span>
+                </div>
+
+                {isDatasetSession ? (
+                  <div className="duplicate-search-selection-bar">
+                    <span className="duplicate-search-selection-copy">
+                      {duplicateSearchSelectedImageIds.length > 0
+                        ? `${duplicateSearchSelectedImageIds.length.toLocaleString()} images selected for bulk delete`
+                        : 'Mark duplicate images with the checkbox to delete them in one batch.'}
+                    </span>
+                    <div className="duplicate-search-selection-actions">
+                      <AppButton
+                        variant="ghost"
+                        className="duplicate-search-selection-button"
+                        onClick={() => setDuplicateSearchSelectedImageIds([])}
+                        disabled={
+                          duplicateSearchSelectedImageIds.length === 0 ||
+                          isDuplicateSearchDeleteBusy
+                        }
+                      >
+                        Clear
+                      </AppButton>
+                      <AppButton
+                        variant="ghost"
+                        className="duplicate-search-selection-button is-danger"
+                        onClick={() => {
+                          const selectedImageIds = duplicateSearchSelectedImageIds.filter(
+                            (imageId) => imagesById.has(imageId),
+                          )
+                          if (selectedImageIds.length === 0) {
+                            setDuplicateSearchSelectedImageIds([])
+                            return
+                          }
+
+                          const selectedCount = selectedImageIds.length
+                          setConfirmDialogState({
+                            title:
+                              selectedCount === 1
+                                ? 'Delete selected image?'
+                                : `Delete ${selectedCount.toLocaleString()} selected images?`,
+                            message:
+                              selectedCount === 1
+                                ? 'The selected image and its annotation sidecar will be removed from the dataset.'
+                                : `${selectedCount.toLocaleString()} selected images and their annotation sidecars will be removed from the dataset.`,
+                            confirmLabel:
+                              selectedCount === 1
+                                ? 'Delete image'
+                                : `Delete ${selectedCount.toLocaleString()} images`,
+                            confirmTone: 'danger',
+                            onConfirm: () => {
+                              setConfirmDialogState(null)
+                              void handleDeleteSelectedDuplicateSearchImages(
+                                selectedImageIds,
+                              )
+                            },
+                          })
+                        }}
+                        disabled={
+                          duplicateSearchSelectedImageIds.length === 0 ||
+                          isDuplicateSearchDeleteBusy
+                        }
+                      >
+                        Delete selected
+                      </AppButton>
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {visibleDuplicateSearchMatches.length > 0 ? (
-                <div className="duplicate-search-grid">
-                  {visibleDuplicateSearchMatches.map((match) => {
-                    const leftEntry = imagesById.get(match.leftImageId)
-                    const rightEntry = imagesById.get(match.rightImageId)
-                    if (!leftEntry || !rightEntry) {
-                      return null
-                    }
+                <>
+                  <div className="duplicate-search-grid">
+                    {duplicateSearchPageMatches.map((match) => {
+                      const leftEntry = imagesById.get(match.leftImageId)
+                      const rightEntry = imagesById.get(match.rightImageId)
+                      if (!leftEntry || !rightEntry) {
+                        return null
+                      }
 
-                    const isDeletingLeft =
-                      duplicateSearchDeletingImageId === match.leftImageId
-                    const isDeletingRight =
-                      duplicateSearchDeletingImageId === match.rightImageId
+                      const isDeletingLeft =
+                        duplicateSearchDeletingImageId === match.leftImageId
+                      const isDeletingRight =
+                        duplicateSearchDeletingImageId === match.rightImageId
+                      const isLeftSelected = duplicateSearchSelectedImageIdSet.has(
+                        match.leftImageId,
+                      )
+                      const isRightSelected = duplicateSearchSelectedImageIdSet.has(
+                        match.rightImageId,
+                      )
 
-                    return (
-                      <article key={match.id} className="duplicate-search-card">
-                        <div className="duplicate-search-card-main">
-                          <div className="duplicate-search-image-column">
-                            <button
-                              type="button"
-                              className="duplicate-search-preview"
-                              onClick={() => openDuplicateSearchImageLightbox(leftEntry)}
-                            >
-                              <span className="duplicate-search-preview-frame">
-                                <img
-                                  src={leftEntry.url}
-                                  alt={match.leftRelativePath}
-                                  loading="lazy"
-                                />
-                              </span>
-                              <span className="duplicate-search-preview-copy">
-                                <strong>{match.leftName}</strong>
-                                <span>{match.leftRelativePath}</span>
-                              </span>
-                            </button>
-                            <AppButton
-                              variant="ghost"
-                              className="duplicate-search-delete-button"
-                              onClick={() =>
-                                void handleDeleteDuplicateResultImage(
-                                  match.leftImageId,
-                                  match.rightImageId,
-                                )
-                              }
-                              title={isDeletingLeft ? 'Deleting image...' : 'Delete image'}
-                              aria-label={`Delete image ${match.leftRelativePath}`}
-                              disabled={
-                                !isDatasetSession ||
-                                duplicateSearchDeletingImageId !== null
-                              }
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                <path
-                                  d="M3.5 4.5h9"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M6 2.75h4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                                <path
-                                  d="M6.75 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M9.25 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                              </svg>
-                            </AppButton>
+                      return (
+                        <article key={match.id} className="duplicate-search-card">
+                          <div className="duplicate-search-card-header">
+                            <strong className="duplicate-search-score-value">
+                              {formatDuplicateSimilarity(match.similarityPercent)}
+                            </strong>
+                            <span className="duplicate-search-score-transform">
+                              {formatDuplicateTransform(match.relativeTransform)}
+                            </span>
                           </div>
+                          <div className="duplicate-search-card-main">
+                            <div className="duplicate-search-image-column">
+                              <button
+                                type="button"
+                                className="duplicate-search-preview"
+                                onMouseEnter={(event) =>
+                                  showDuplicateSearchHoverPreview(
+                                    leftEntry,
+                                    event.clientX,
+                                    event.clientY,
+                                  )
+                                }
+                                onMouseMove={(event) =>
+                                  showDuplicateSearchHoverPreview(
+                                    leftEntry,
+                                    event.clientX,
+                                    event.clientY,
+                                  )
+                                }
+                                onMouseLeave={() => hideDuplicateSearchHoverPreview()}
+                                onClick={() => openDuplicateSearchImageLightbox(leftEntry)}
+                              >
+                                <span className="duplicate-search-preview-frame">
+                                  <img
+                                    src={leftEntry.url}
+                                    alt={match.leftRelativePath}
+                                    loading="lazy"
+                                  />
+                                </span>
+                                <span className="duplicate-search-preview-copy">
+                                  <strong>{match.leftName}</strong>
+                                  <span>{match.leftRelativePath}</span>
+                                </span>
+                              </button>
+                              <div className="duplicate-search-image-actions">
+                                <AppButton
+                                  variant="ghost"
+                                  className="duplicate-search-delete-button"
+                                  onClick={() =>
+                                    void handleDeleteDuplicateResultImage(
+                                      match.leftImageId,
+                                      match.rightImageId,
+                                    )
+                                  }
+                                  title={isDeletingLeft ? 'Deleting image...' : 'Delete image'}
+                                  aria-label={`Delete image ${match.leftRelativePath}`}
+                                  disabled={
+                                    !isDatasetSession || isDuplicateSearchDeleteBusy
+                                  }
+                                >
+                                  <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                    <path
+                                      d="M3.5 4.5h9"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M6 2.75h4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                    <path
+                                      d="M6.75 6.5v4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.2"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M9.25 6.5v4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.2"
+                                      strokeLinecap="round"
+                                    />
+                                  </svg>
+                                </AppButton>
+                                <label className="duplicate-search-select-toggle">
+                                  <input
+                                    type="checkbox"
+                                    checked={isLeftSelected}
+                                    title="Select image for bulk delete"
+                                    aria-label={`Select image ${match.leftRelativePath} for bulk delete`}
+                                    onChange={(event) =>
+                                      setDuplicateSearchImageSelected(
+                                        match.leftImageId,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    disabled={
+                                      !isDatasetSession || isDuplicateSearchDeleteBusy
+                                    }
+                                  />
+                                </label>
+                              </div>
+                            </div>
 
-                          <div className="duplicate-search-card-center">
-                            <div className="duplicate-search-score">
-                              <strong>
-                                {formatDuplicateSimilarity(match.similarityPercent)}
-                              </strong>
-                              <span>
-                                {formatDuplicateTransform(match.relativeTransform)}
-                              </span>
+                            <div className="duplicate-search-image-column">
+                              <button
+                                type="button"
+                                className="duplicate-search-preview"
+                                onMouseEnter={(event) =>
+                                  showDuplicateSearchHoverPreview(
+                                    rightEntry,
+                                    event.clientX,
+                                    event.clientY,
+                                  )
+                                }
+                                onMouseMove={(event) =>
+                                  showDuplicateSearchHoverPreview(
+                                    rightEntry,
+                                    event.clientX,
+                                    event.clientY,
+                                  )
+                                }
+                                onMouseLeave={() => hideDuplicateSearchHoverPreview()}
+                                onClick={() => openDuplicateSearchImageLightbox(rightEntry)}
+                              >
+                                <span className="duplicate-search-preview-frame">
+                                  <img
+                                    src={rightEntry.url}
+                                    alt={match.rightRelativePath}
+                                    loading="lazy"
+                                  />
+                                </span>
+                                <span className="duplicate-search-preview-copy">
+                                  <strong>{match.rightName}</strong>
+                                  <span>{match.rightRelativePath}</span>
+                                </span>
+                              </button>
+                              <div className="duplicate-search-image-actions">
+                                <AppButton
+                                  variant="ghost"
+                                  className="duplicate-search-delete-button"
+                                  onClick={() =>
+                                    void handleDeleteDuplicateResultImage(
+                                      match.rightImageId,
+                                      match.leftImageId,
+                                    )
+                                  }
+                                  title={isDeletingRight ? 'Deleting image...' : 'Delete image'}
+                                  aria-label={`Delete image ${match.rightRelativePath}`}
+                                  disabled={
+                                    !isDatasetSession || isDuplicateSearchDeleteBusy
+                                  }
+                                >
+                                  <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                                    <path
+                                      d="M3.5 4.5h9"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M6 2.75h4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.35"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                    <path
+                                      d="M6.75 6.5v4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.2"
+                                      strokeLinecap="round"
+                                    />
+                                    <path
+                                      d="M9.25 6.5v4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.2"
+                                      strokeLinecap="round"
+                                    />
+                                  </svg>
+                                </AppButton>
+                                <label className="duplicate-search-select-toggle">
+                                  <input
+                                    type="checkbox"
+                                    checked={isRightSelected}
+                                    title="Select image for bulk delete"
+                                    aria-label={`Select image ${match.rightRelativePath} for bulk delete`}
+                                    onChange={(event) =>
+                                      setDuplicateSearchImageSelected(
+                                        match.rightImageId,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    disabled={
+                                      !isDatasetSession || isDuplicateSearchDeleteBusy
+                                    }
+                                  />
+                                </label>
+                              </div>
                             </div>
                           </div>
+                        </article>
+                      )
+                    })}
+                  </div>
 
-                          <div className="duplicate-search-image-column">
-                            <button
-                              type="button"
-                              className="duplicate-search-preview"
-                              onClick={() => openDuplicateSearchImageLightbox(rightEntry)}
-                            >
-                              <span className="duplicate-search-preview-frame">
-                                <img
-                                  src={rightEntry.url}
-                                  alt={match.rightRelativePath}
-                                  loading="lazy"
-                                />
-                              </span>
-                              <span className="duplicate-search-preview-copy">
-                                <strong>{match.rightName}</strong>
-                                <span>{match.rightRelativePath}</span>
-                              </span>
-                            </button>
-                            <AppButton
-                              variant="ghost"
-                              className="duplicate-search-delete-button"
-                              onClick={() =>
-                                void handleDeleteDuplicateResultImage(
-                                  match.rightImageId,
-                                  match.leftImageId,
-                                )
-                              }
-                              title={isDeletingRight ? 'Deleting image...' : 'Delete image'}
-                              aria-label={`Delete image ${match.rightRelativePath}`}
-                              disabled={
-                                !isDatasetSession ||
-                                duplicateSearchDeletingImageId !== null
-                              }
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                                <path
-                                  d="M3.5 4.5h9"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M6 2.75h4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M5 4.5v7.25c0 .41.34.75.75.75h4.5c.41 0 .75-.34.75-.75V4.5"
-                                  stroke="currentColor"
-                                  strokeWidth="1.35"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                />
-                                <path
-                                  d="M6.75 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                                <path
-                                  d="M9.25 6.5v4"
-                                  stroke="currentColor"
-                                  strokeWidth="1.2"
-                                  strokeLinecap="round"
-                                />
-                              </svg>
-                            </AppButton>
-                          </div>
-                        </div>
-                      </article>
-                    )
-                  })}
-                </div>
+                  <div className="duplicate-search-pagination">
+                    <div className="duplicate-search-pagination-status">
+                      <strong>
+                        Showing{' '}
+                        {duplicateSearchPageStartIndex + 1}
+                        -
+                        {duplicateSearchPageEndIndex}
+                      </strong>
+                      <span>
+                        of {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
+                      </span>
+                      {duplicateSearchSelectedImageIds.length > 0 ? (
+                        <span>
+                          · Selected{' '}
+                          {duplicateSearchSelectedImageIds.length.toLocaleString()}{' '}
+                          images
+                        </span>
+                      ) : null}
+                      <span>
+                        · Page {duplicateSearchCurrentPage} of{' '}
+                        {duplicateSearchPageCount}
+                      </span>
+                    </div>
+                    <div className="duplicate-search-pagination-actions">
+                      <AppButton
+                        variant="ghost"
+                        className="duplicate-search-page-button"
+                        onClick={() =>
+                          setDuplicateSearchPage((current) => Math.max(1, current - 1))
+                        }
+                        disabled={duplicateSearchCurrentPage <= 1}
+                      >
+                        Prev
+                      </AppButton>
+                      <AppButton
+                        variant="ghost"
+                        className="duplicate-search-page-button"
+                        onClick={() =>
+                          setDuplicateSearchPage((current) =>
+                            Math.min(duplicateSearchPageCount, current + 1),
+                          )
+                        }
+                        disabled={duplicateSearchCurrentPage >= duplicateSearchPageCount}
+                      >
+                        Next
+                      </AppButton>
+                    </div>
+                  </div>
+                </>
               ) : duplicateSearchRuntime.status === 'completed' ? (
                 <p className="plugin-manager-note">
                   No pairs reached {duplicateSearchRuntime.minimumSimilarityPercent}%.
@@ -4921,6 +5322,27 @@ function App() {
                 </p>
               )}
             </section>
+          </div>
+        </div>
+      ) : null}
+
+      {duplicateSearchHoverPreview && !duplicateSearchPreviewImage ? (
+        <div
+          className="duplicate-search-hover-preview"
+          style={duplicateSearchHoverPreviewStyle ?? undefined}
+          aria-hidden="true"
+        >
+          <div className="duplicate-search-hover-stage">
+            <img
+              src={duplicateSearchHoverPreview.url}
+              alt=""
+            />
+          </div>
+          <div className="duplicate-search-hover-copy">
+            <strong>{duplicateSearchHoverPreview.name}</strong>
+            <span title={duplicateSearchHoverPreview.relativePath}>
+              {duplicateSearchHoverPreview.relativePath}
+            </span>
           </div>
         </div>
       ) : null}
@@ -6436,6 +6858,54 @@ function formatProgressPercentFromRatio(ratio?: number | null) {
   }
 
   return `${Math.max(0, Math.min(100, Math.round(ratio * 100)))}%`
+}
+
+function buildDuplicateSearchHoverPreviewStyle(
+  preview: DuplicateSearchHoverPreview,
+) {
+  const viewportWidth =
+    typeof window === 'undefined'
+      ? DUPLICATE_SEARCH_HOVER_PREVIEW_WIDTH_PX +
+        DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX * 2
+      : window.innerWidth
+  const viewportHeight =
+    typeof window === 'undefined'
+      ? DUPLICATE_SEARCH_HOVER_PREVIEW_HEIGHT_PX +
+        DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX * 2
+      : window.innerHeight
+
+  const fitsRight =
+    preview.pointerX +
+      DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX +
+      DUPLICATE_SEARCH_HOVER_PREVIEW_WIDTH_PX <=
+    viewportWidth - DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX
+  const fitsBottom =
+    preview.pointerY +
+      DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX +
+      DUPLICATE_SEARCH_HOVER_PREVIEW_HEIGHT_PX <=
+    viewportHeight - DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX
+
+  const left = fitsRight
+    ? preview.pointerX + DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX
+    : Math.max(
+        DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX,
+        preview.pointerX -
+          DUPLICATE_SEARCH_HOVER_PREVIEW_WIDTH_PX -
+          DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX,
+      )
+  const top = fitsBottom
+    ? preview.pointerY + DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX
+    : Math.max(
+        DUPLICATE_SEARCH_HOVER_PREVIEW_PADDING_PX,
+        preview.pointerY -
+          DUPLICATE_SEARCH_HOVER_PREVIEW_HEIGHT_PX -
+          DUPLICATE_SEARCH_HOVER_PREVIEW_OFFSET_PX,
+      )
+
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+  }
 }
 
 function buildInitialDuplicateSearchRuntime(): DuplicateSearchRuntime {

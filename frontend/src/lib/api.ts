@@ -593,6 +593,24 @@ export async function deleteLocalSessionImage(
   )
 }
 
+export async function deleteLocalSessionImages(
+  sessionId: string,
+  imageIds: string[],
+) {
+  return requestJson<LocalSessionResponse>(
+    `/api/local/sessions/${sessionId}/images/bulk-delete`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        imageIds,
+      }),
+    },
+  )
+}
+
 export async function runPluginAutoAnnotate(
   pluginId: string,
   payload: PluginAutoAnnotateRequest,
