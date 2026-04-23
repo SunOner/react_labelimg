@@ -44,11 +44,14 @@ export type LocalImageAnnotationsResponse = {
   format?: string | null
   count: number
   annotations: LocalAnnotation[]
+  removedDuplicateCount?: number
 }
 
 export type SaveLocalAnnotationsResponse = {
   format?: string | null
   count: number
+  annotations?: LocalAnnotation[] | null
+  removedDuplicateCount?: number
   savedAt?: string | null
 }
 

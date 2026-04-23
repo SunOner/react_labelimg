@@ -12,6 +12,7 @@ import secrets
 import shlex
 import shutil
 import site
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,8 @@ IMMUTABLE_IMAGE_HEADERS = {
 }
 FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS = 0.01
 FINGERPRINT_WARMUP_BUSY_WAIT_SECONDS = 0.35
+ANNOTATION_DEDUPLICATION_PRECISION_DIGITS = 4
+CACHE_OPERATION_WARNING_INTERVAL_SECONDS = 15.0
 
 
 @dataclass(slots=True)
@@ -278,6 +281,7 @@ class CacheDbActionPayload(BaseModel):
 
 
 class LocalAnnotationPayload(BaseModel):
+    id: str | None = None
     label: str | None = None
     sourceClassIndex: int | None = None
     hasUnknownClass: bool = False
@@ -350,6 +354,7 @@ PLUGIN_RUNTIME_INSTALL_LOCK = Lock()
 PLUGIN_RUNTIME_CACHE: dict[str, dict[str, Any]] = {}
 PLUGIN_RUNTIME_LOCK = Lock()
 CACHE_STORE = CacheStore(CACHE_DB_PATH)
+LAST_CACHE_OPERATION_WARNING_AT = 0.0
 PLUGIN_DEFINITIONS = {
     "sam-3-1": PluginDefinition(
         id="sam-3-1",
@@ -906,6 +911,11 @@ def read_local_session_annotations(session_id: str, image_id: str):
         raise HTTPException(status_code=404, detail="Image not found")
 
     annotations = load_image_annotations(session, image)
+    annotations, removed_duplicate_count = deduplicate_image_annotations(
+        session,
+        image,
+        annotations,
+    )
     image.annotation_count = len(annotations)
     CACHE_STORE.update_dataset_annotation_metadata(
         session.root_path,
@@ -918,6 +928,7 @@ def read_local_session_annotations(session_id: str, image_id: str):
         "format": image.annotation_format,
         "count": image.annotation_count,
         "annotations": annotations,
+        "removedDuplicateCount": removed_duplicate_count,
     }
 
 
@@ -936,6 +947,7 @@ def save_local_session_annotations(
         raise HTTPException(status_code=404, detail="Image not found")
 
     annotations = normalize_annotation_payloads(payload.annotations)
+    annotations, removed_duplicate_count = deduplicate_annotation_payloads(annotations)
     save_image_annotations(
         session,
         image,
@@ -946,6 +958,8 @@ def save_local_session_annotations(
     return {
         "format": image.annotation_format,
         "count": image.annotation_count,
+        "annotations": annotations if removed_duplicate_count > 0 else None,
+        "removedDuplicateCount": removed_duplicate_count,
         "savedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
@@ -2679,8 +2693,29 @@ def remove_image_from_matching_sessions(root_path: Path, image_id: str):
     remove_images_from_matching_sessions(root_path, [image_id])
 
 
+def log_cache_operation_warning(message: str, exc: Exception):
+    global LAST_CACHE_OPERATION_WARNING_AT
+
+    now = time.monotonic()
+    if (
+        now - LAST_CACHE_OPERATION_WARNING_AT
+        < CACHE_OPERATION_WARNING_INTERVAL_SECONDS
+    ):
+        return
+
+    LAST_CACHE_OPERATION_WARNING_AT = now
+    LOGGER.warning("%s: %s", message, exc)
+
+
 def build_cached_directory_session(root_path: Path):
-    manifest = CACHE_STORE.load_dataset_manifest(root_path)
+    try:
+        manifest = CACHE_STORE.load_dataset_manifest(root_path)
+    except sqlite3.Error as exc:
+        log_cache_operation_warning(
+            "Dataset manifest cache read failed; rescanning from disk",
+            exc,
+        )
+        return None
     if manifest is None:
         return None
 
@@ -3002,9 +3037,18 @@ def schedule_session_fingerprint_warmup(session: LocalSession):
     )
     if len(current_images) < 2:
         return
-    if CACHE_STORE.count_image_fingerprints_for_dataset(session.root_path) >= len(
-        current_images
-    ):
+    try:
+        cached_fingerprint_count = CACHE_STORE.count_image_fingerprints_for_dataset(
+            session.root_path
+        )
+    except sqlite3.Error as exc:
+        log_cache_operation_warning(
+            "Fingerprint cache availability check failed; skipping warmup",
+            exc,
+        )
+        return
+
+    if cached_fingerprint_count >= len(current_images):
         return
 
     ensure_fingerprint_warmup_worker()
@@ -3191,27 +3235,41 @@ def load_or_build_duplicate_image_signature(root_path: Path, image: SessionImage
     if current_stat.st_size != image.file_size:
         raise RuntimeError(f"Image size changed while preparing fingerprint: {image.full_path}")
 
-    cached_signature = CACHE_STORE.load_image_fingerprint(
-        root_path=root_path,
-        image_id=image.id,
-        relative_path=image.relative_path,
-        full_path=image.full_path,
-        file_size=image.file_size,
-        mtime_ns=image.mtime_ns,
-    )
+    try:
+        cached_signature = CACHE_STORE.load_image_fingerprint(
+            root_path=root_path,
+            image_id=image.id,
+            relative_path=image.relative_path,
+            full_path=image.full_path,
+            file_size=image.file_size,
+            mtime_ns=image.mtime_ns,
+        )
+    except sqlite3.Error as exc:
+        log_cache_operation_warning(
+            "Duplicate-search fingerprint cache read failed; continuing without cache",
+            exc,
+        )
+        cached_signature = None
+
     if cached_signature is not None:
         return cached_signature, True
 
     signature = build_duplicate_image_signature(image.full_path)
-    CACHE_STORE.save_image_fingerprint(
-        root_path=root_path,
-        image_id=image.id,
-        relative_path=image.relative_path,
-        full_path=image.full_path,
-        file_size=image.file_size,
-        mtime_ns=image.mtime_ns,
-        signature=signature,
-    )
+    try:
+        CACHE_STORE.save_image_fingerprint(
+            root_path=root_path,
+            image_id=image.id,
+            relative_path=image.relative_path,
+            full_path=image.full_path,
+            file_size=image.file_size,
+            mtime_ns=image.mtime_ns,
+            signature=signature,
+        )
+    except sqlite3.Error as exc:
+        log_cache_operation_warning(
+            "Duplicate-search fingerprint cache write failed; continuing without cache",
+            exc,
+        )
     return signature, False
 
 
@@ -3509,8 +3567,10 @@ def normalize_annotation_payloads(
         label = (annotation.label or "object").strip() or "object"
         normalized_annotations.append(
             {
-                "id": uuid4().hex,
+                "id": annotation.id or uuid4().hex,
                 "label": label,
+                "sourceClassIndex": annotation.sourceClassIndex,
+                "hasUnknownClass": bool(annotation.hasUnknownClass),
                 "difficult": bool(annotation.difficult),
                 "x": max(coordinates[0], 0.0),
                 "y": max(coordinates[1], 0.0),
@@ -3520,6 +3580,60 @@ def normalize_annotation_payloads(
         )
 
     return normalized_annotations
+
+
+def deduplicate_annotation_payloads(annotations: list[dict[str, Any]]):
+    deduplicated_annotations: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    removed_duplicate_count = 0
+
+    for annotation in annotations:
+        annotation_key = build_annotation_deduplication_key(annotation)
+        if annotation_key in seen_keys:
+            removed_duplicate_count += 1
+            continue
+
+        seen_keys.add(annotation_key)
+        deduplicated_annotations.append(dict(annotation))
+
+    return deduplicated_annotations, removed_duplicate_count
+
+
+def build_annotation_deduplication_key(annotation: dict[str, Any]):
+    return (
+        str(annotation.get("label") or "object").strip() or "object",
+        bool(annotation.get("difficult")),
+        round(float(annotation.get("x") or 0.0), ANNOTATION_DEDUPLICATION_PRECISION_DIGITS),
+        round(float(annotation.get("y") or 0.0), ANNOTATION_DEDUPLICATION_PRECISION_DIGITS),
+        round(
+            float(annotation.get("width") or 0.0),
+            ANNOTATION_DEDUPLICATION_PRECISION_DIGITS,
+        ),
+        round(
+            float(annotation.get("height") or 0.0),
+            ANNOTATION_DEDUPLICATION_PRECISION_DIGITS,
+        ),
+    )
+
+
+def deduplicate_image_annotations(
+    session: LocalSession,
+    image: SessionImage,
+    annotations: list[dict[str, Any]],
+):
+    deduplicated_annotations, removed_duplicate_count = deduplicate_annotation_payloads(
+        annotations,
+    )
+    if removed_duplicate_count <= 0:
+        return annotations, 0
+
+    save_image_annotations(
+        session,
+        image,
+        deduplicated_annotations,
+        preferred_classes=[],
+    )
+    return deduplicated_annotations, removed_duplicate_count
 
 
 def save_image_annotations(

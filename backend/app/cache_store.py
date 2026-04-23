@@ -22,6 +22,8 @@ DEFAULT_APP_STATE = {
     },
 }
 
+CACHE_DB_CONNECT_RETRY_DELAYS_SECONDS = (0.0, 0.05, 0.15)
+
 
 class CacheStore:
     def __init__(self, db_path: Path):
@@ -31,12 +33,44 @@ class CacheStore:
         self._initialize()
 
     def _connect(self):
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        last_error: sqlite3.OperationalError | None = None
+
+        for attempt_index, retry_delay in enumerate(
+            CACHE_DB_CONNECT_RETRY_DELAYS_SECONDS,
+            start=1,
+        ):
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+
+            try:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(str(self.db_path), timeout=30.0)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA foreign_keys=ON")
+                return connection
+            except (sqlite3.OperationalError, OSError) as exc:
+                operational_error = (
+                    exc
+                    if isinstance(exc, sqlite3.OperationalError)
+                    else sqlite3.OperationalError(str(exc))
+                )
+                last_error = operational_error
+                error_text = str(operational_error).lower()
+                if (
+                    "unable to open database file" not in error_text
+                    and "no such file or directory" not in error_text
+                    and "permission denied" not in error_text
+                ):
+                    raise
+                if attempt_index < len(CACHE_DB_CONNECT_RETRY_DELAYS_SECONDS):
+                    continue
+
+        assert last_error is not None
+        raise sqlite3.OperationalError(
+            f"{last_error} (db_path={self.db_path})"
+        ) from last_error
 
     def _initialize(self):
         with self._lock:

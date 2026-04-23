@@ -41,6 +41,7 @@ import {
   type CacheDbAction,
   type CacheDbSummary,
   type HuggingFaceAuthStatus,
+  type LocalAnnotation as ApiLocalAnnotation,
   type LocalDuplicateSearchJobResponse,
   type LocalDuplicateSearchMatch,
   type LocalSessionJobResponse,
@@ -1075,6 +1076,61 @@ function App() {
     )
   })
 
+  const buildDisplayAnnotations = useEffectEvent((
+    rawAnnotations: ApiLocalAnnotation[],
+    projectClassesForDisplay: string[],
+  ): Annotation[] =>
+    rawAnnotations.map((annotation) => {
+      const { label, color } = resolveAnnotationDisplayState(
+        annotation,
+        projectClassesForDisplay,
+      )
+      return {
+        ...annotation,
+        label,
+        color,
+      }
+    }))
+
+  const applyAutomaticAnnotationDeduplication = useEffectEvent((
+    imageId: string,
+    rawAnnotations: ApiLocalAnnotation[] | null | undefined,
+    removedDuplicateCount: number,
+    format?: string | null,
+  ) => {
+    if (!rawAnnotations || removedDuplicateCount <= 0) {
+      return
+    }
+
+    const nextAnnotations = buildDisplayAnnotations(rawAnnotations, projectClasses)
+    commitAnnotationsByImage((current) => ({
+      ...current,
+      [imageId]: nextAnnotations,
+    }))
+    updateImageAnnotationMetadata(
+      imageId,
+      countLabelingEligibleAnnotations(nextAnnotations, projectClasses),
+      format ?? undefined,
+    )
+
+    if (
+      currentEntry?.id === imageId &&
+      selectedId !== null &&
+      !nextAnnotations.some((annotation) => annotation.id === selectedId)
+    ) {
+      setSelectedId(null)
+    }
+
+    const imageEntry = imagesById.get(imageId)
+    const imageLabel = imageEntry?.relativePath ?? 'the current image'
+    pushToast(
+      removedDuplicateCount === 1
+        ? `Removed 1 duplicate box from ${imageLabel}.`
+        : `Removed ${removedDuplicateCount.toLocaleString()} duplicate boxes from ${imageLabel}.`,
+      'info',
+    )
+  })
+
   const scheduleAnnotationSave = useEffectEvent((
     imageId: string,
     nextAnnotations: Annotation[],
@@ -1114,6 +1170,12 @@ function App() {
           updateImageAnnotationMetadata(
             imageId,
             payload.count,
+            payload.format ?? undefined,
+          )
+          applyAutomaticAnnotationDeduplication(
+            imageId,
+            payload.annotations,
+            payload.removedDuplicateCount ?? 0,
             payload.format ?? undefined,
           )
         })
@@ -1346,17 +1408,10 @@ function App() {
           return
         }
 
-        const nextAnnotations = payload.annotations.map((annotation) => {
-          const { label, color } = resolveAnnotationDisplayState(
-            annotation,
-            projectClasses,
-          )
-          return {
-            ...annotation,
-            label,
-            color,
-          }
-        })
+        const nextAnnotations = buildDisplayAnnotations(
+          payload.annotations,
+          projectClasses,
+        )
 
         setImages((current) =>
           current.map((imageEntry) =>
@@ -1372,6 +1427,8 @@ function App() {
           ),
         )
 
+        const hasExistingLocalAnnotations =
+          annotationsByImageRef.current[entry.id] !== undefined
         commitAnnotationsByImage((current) => {
           if (current[entry.id] !== undefined) {
             return current
@@ -1382,6 +1439,14 @@ function App() {
             [entry.id]: nextAnnotations,
           }
         })
+        if (!hasExistingLocalAnnotations) {
+          applyAutomaticAnnotationDeduplication(
+            entry.id,
+            payload.annotations,
+            payload.removedDuplicateCount ?? 0,
+            payload.format ?? undefined,
+          )
+        }
 
         annotationLoadStateRef.current[entry.id] = 'ready'
       })
