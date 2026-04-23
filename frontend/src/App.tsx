@@ -4953,72 +4953,72 @@ function App() {
                     {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
                   </span>
                 </div>
-
-                {isDatasetSession ? (
-                  <div className="duplicate-search-selection-bar">
-                    <span className="duplicate-search-selection-copy">
-                      {duplicateSearchSelectedImageIds.length > 0
-                        ? `${duplicateSearchSelectedImageIds.length.toLocaleString()} images selected for bulk delete`
-                        : 'Mark duplicate images with the checkbox to delete them in one batch.'}
-                    </span>
-                    <div className="duplicate-search-selection-actions">
-                      <AppButton
-                        variant="ghost"
-                        className="duplicate-search-selection-button"
-                        onClick={() => setDuplicateSearchSelectedImageIds([])}
-                        disabled={
-                          duplicateSearchSelectedImageIds.length === 0 ||
-                          isDuplicateSearchDeleteBusy
-                        }
-                      >
-                        Clear
-                      </AppButton>
-                      <AppButton
-                        variant="ghost"
-                        className="duplicate-search-selection-button is-danger"
-                        onClick={() => {
-                          const selectedImageIds = duplicateSearchSelectedImageIds.filter(
-                            (imageId) => imagesById.has(imageId),
-                          )
-                          if (selectedImageIds.length === 0) {
-                            setDuplicateSearchSelectedImageIds([])
-                            return
-                          }
-
-                          const selectedCount = selectedImageIds.length
-                          setConfirmDialogState({
-                            title:
-                              selectedCount === 1
-                                ? 'Delete selected image?'
-                                : `Delete ${selectedCount.toLocaleString()} selected images?`,
-                            message:
-                              selectedCount === 1
-                                ? 'The selected image and its annotation sidecar will be removed from the dataset.'
-                                : `${selectedCount.toLocaleString()} selected images and their annotation sidecars will be removed from the dataset.`,
-                            confirmLabel:
-                              selectedCount === 1
-                                ? 'Delete image'
-                                : `Delete ${selectedCount.toLocaleString()} images`,
-                            confirmTone: 'danger',
-                            onConfirm: () => {
-                              setConfirmDialogState(null)
-                              void handleDeleteSelectedDuplicateSearchImages(
-                                selectedImageIds,
-                              )
-                            },
-                          })
-                        }}
-                        disabled={
-                          duplicateSearchSelectedImageIds.length === 0 ||
-                          isDuplicateSearchDeleteBusy
-                        }
-                      >
-                        Delete selected
-                      </AppButton>
-                    </div>
-                  </div>
-                ) : null}
               </div>
+
+              {isDatasetSession ? (
+                <div className="duplicate-search-selection-bar">
+                  <span className="duplicate-search-selection-copy">
+                    {duplicateSearchSelectedImageIds.length > 0
+                      ? `${duplicateSearchSelectedImageIds.length.toLocaleString()} images selected for bulk delete`
+                      : 'Mark duplicate images with the checkbox to delete them in one batch.'}
+                  </span>
+                  <div className="duplicate-search-selection-actions">
+                    <AppButton
+                      variant="ghost"
+                      className="duplicate-search-selection-button"
+                      onClick={() => setDuplicateSearchSelectedImageIds([])}
+                      disabled={
+                        duplicateSearchSelectedImageIds.length === 0 ||
+                        isDuplicateSearchDeleteBusy
+                      }
+                    >
+                      Clear
+                    </AppButton>
+                    <AppButton
+                      variant="ghost"
+                      className="duplicate-search-selection-button is-danger"
+                      onClick={() => {
+                        const selectedImageIds = duplicateSearchSelectedImageIds.filter(
+                          (imageId) => imagesById.has(imageId),
+                        )
+                        if (selectedImageIds.length === 0) {
+                          setDuplicateSearchSelectedImageIds([])
+                          return
+                        }
+
+                        const selectedCount = selectedImageIds.length
+                        setConfirmDialogState({
+                          title:
+                            selectedCount === 1
+                              ? 'Delete selected image?'
+                              : `Delete ${selectedCount.toLocaleString()} selected images?`,
+                          message:
+                            selectedCount === 1
+                              ? 'The selected image and its annotation sidecar will be removed from the dataset.'
+                              : `${selectedCount.toLocaleString()} selected images and their annotation sidecars will be removed from the dataset.`,
+                          confirmLabel:
+                            selectedCount === 1
+                              ? 'Delete image'
+                              : `Delete ${selectedCount.toLocaleString()} images`,
+                          confirmTone: 'danger',
+                          onConfirm: () => {
+                            setConfirmDialogState(null)
+                            void handleDeleteSelectedDuplicateSearchImages(
+                              selectedImageIds,
+                            )
+                          },
+                        })
+                      }}
+                      disabled={
+                        duplicateSearchSelectedImageIds.length === 0 ||
+                        isDuplicateSearchDeleteBusy
+                      }
+                    >
+                      Delete selected
+                    </AppButton>
+                  </div>
+                </div>
+              ) : null}
 
               {visibleDuplicateSearchMatches.length > 0 ? (
                 <>
@@ -5040,9 +5040,13 @@ function App() {
                       const isRightSelected = duplicateSearchSelectedImageIdSet.has(
                         match.rightImageId,
                       )
+                      const isMatchSelected = isLeftSelected || isRightSelected
 
                       return (
-                        <article key={match.id} className="duplicate-search-card">
+                        <article
+                          key={match.id}
+                          className={`duplicate-search-card${isMatchSelected ? ' is-selected' : ''}`}
+                        >
                           <div className="duplicate-search-card-header">
                             <strong className="duplicate-search-score-value">
                               {formatDuplicateSimilarity(match.similarityPercent)}
@@ -5052,7 +5056,9 @@ function App() {
                             </span>
                           </div>
                           <div className="duplicate-search-card-main">
-                            <div className="duplicate-search-image-column">
+                            <div
+                              className={`duplicate-search-image-column${isLeftSelected ? ' is-selected' : ''}`}
+                            >
                               <button
                                 type="button"
                                 className="duplicate-search-preview"
@@ -5135,7 +5141,9 @@ function App() {
                                     />
                                   </svg>
                                 </AppButton>
-                                <label className="duplicate-search-select-toggle">
+                                <label
+                                  className={`duplicate-search-select-toggle${isLeftSelected ? ' is-selected' : ''}`}
+                                >
                                   <input
                                     type="checkbox"
                                     checked={isLeftSelected}
@@ -5155,7 +5163,9 @@ function App() {
                               </div>
                             </div>
 
-                            <div className="duplicate-search-image-column">
+                            <div
+                              className={`duplicate-search-image-column${isRightSelected ? ' is-selected' : ''}`}
+                            >
                               <button
                                 type="button"
                                 className="duplicate-search-preview"
@@ -5238,7 +5248,9 @@ function App() {
                                     />
                                   </svg>
                                 </AppButton>
-                                <label className="duplicate-search-select-toggle">
+                                <label
+                                  className={`duplicate-search-select-toggle${isRightSelected ? ' is-selected' : ''}`}
+                                >
                                   <input
                                     type="checkbox"
                                     checked={isRightSelected}

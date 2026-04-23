@@ -153,6 +153,7 @@ class SessionOpenJob:
 class DuplicateSearchJob:
     id: str
     session_id: str
+    root_path: str
     status: Literal["running", "completed", "failed"]
     phase: Literal["hashing", "comparing", "completed", "failed"]
     minimum_similarity_percent: int
@@ -797,7 +798,11 @@ def start_local_duplicate_search(
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if len(session.images) < 2:
+    image_snapshot = filter_current_session_images(
+        session.images,
+        context="starting duplicate search",
+    )
+    if len(image_snapshot) < 2:
         raise HTTPException(
             status_code=400,
             detail="At least two images are required to search for duplicates",
@@ -808,7 +813,21 @@ def start_local_duplicate_search(
         0,
         min(100, int(request_payload.minimumSimilarityPercent)),
     )
-    job = start_duplicate_search_job(session, minimum_similarity_percent)
+    reusable_job = find_reusable_duplicate_search_job(
+        session,
+        minimum_similarity_percent,
+        len(image_snapshot),
+    )
+    if reusable_job is not None:
+        return {
+            "jobId": reusable_job.id,
+        }
+
+    job = start_duplicate_search_job(
+        session,
+        minimum_similarity_percent,
+        image_snapshot,
+    )
     return {
         "jobId": job.id,
     }
@@ -2665,11 +2684,24 @@ def build_cached_directory_session(root_path: Path):
     if manifest is None:
         return None
 
-    session = create_local_session(root_path, manifest["label"])
-    session.images = [
+    images = [
         build_cached_session_image(root_path, manifest_image)
         for manifest_image in manifest["images"]
     ]
+    stale_image = next(
+        (image for image in images if not is_session_image_file_current(image)),
+        None,
+    )
+    if stale_image is not None:
+        LOGGER.info(
+            "Ignoring stale cached dataset manifest for %s because %s is missing or changed",
+            root_path,
+            stale_image.full_path,
+        )
+        return None
+
+    session = create_local_session(root_path, manifest["label"])
+    session.images = images
     session.images_by_id = {image.id: image for image in session.images}
     register_session_images(session.images)
     schedule_session_fingerprint_warmup(session)
@@ -2688,6 +2720,36 @@ def build_cached_session_image(root_path: Path, manifest_image: dict[str, Any]):
         annotation_path=Path(annotation_path) if annotation_path else None,
         annotation_format=manifest_image.get("annotation_format"),
         annotation_count=int(manifest_image.get("annotation_count") or 0),
+    )
+
+
+def filter_current_session_images(
+    images: list[SessionImage],
+    *,
+    context: str,
+):
+    current_images = [
+        image for image in images if is_session_image_file_current(image)
+    ]
+    stale_count = len(images) - len(current_images)
+    if stale_count > 0:
+        LOGGER.info(
+            "Ignoring %s stale images while %s",
+            stale_count,
+            context,
+        )
+    return current_images
+
+
+def is_session_image_file_current(image: SessionImage):
+    try:
+        current_stat = image.full_path.stat()
+    except OSError:
+        return False
+
+    return (
+        current_stat.st_mtime_ns == image.mtime_ns
+        and current_stat.st_size == image.file_size
     )
 
 
@@ -2880,14 +2942,42 @@ def serialize_manifest_images(images: list[SessionImage]):
     ]
 
 
+def find_reusable_duplicate_search_job(
+    session: LocalSession,
+    minimum_similarity_percent: int,
+    total_images: int,
+):
+    root_path = str(session.root_path)
+    with DUPLICATE_SEARCH_LOCK:
+        reusable_jobs = [
+            job
+            for job in DUPLICATE_SEARCH_JOBS.values()
+            if job.status == "running"
+            and job.root_path == root_path
+            and job.minimum_similarity_percent == minimum_similarity_percent
+            and job.total_images == total_images
+        ]
+        if not reusable_jobs:
+            return None
+
+        reusable_job = max(
+            reusable_jobs,
+            key=lambda job: (job.processed_images, job.processed_pairs),
+        )
+        reusable_job.session_id = session.id
+        reusable_job.revision += 1
+        return reusable_job
+
+
 def start_duplicate_search_job(
     session: LocalSession,
     minimum_similarity_percent: int,
+    image_snapshot: list[SessionImage],
 ):
-    image_snapshot = list(session.images)
     job = DuplicateSearchJob(
         id=uuid4().hex,
         session_id=session.id,
+        root_path=str(session.root_path),
         status="running",
         phase="hashing",
         minimum_similarity_percent=minimum_similarity_percent,
@@ -2906,16 +2996,20 @@ def start_duplicate_search_job(
 
 
 def schedule_session_fingerprint_warmup(session: LocalSession):
-    if len(session.images) < 2:
+    current_images = filter_current_session_images(
+        session.images,
+        context="warming duplicate-search fingerprints",
+    )
+    if len(current_images) < 2:
         return
     if CACHE_STORE.count_image_fingerprints_for_dataset(session.root_path) >= len(
-        session.images
+        current_images
     ):
         return
 
     ensure_fingerprint_warmup_worker()
     with FINGERPRINT_WARMUP_CONDITION:
-        for image in session.images:
+        for image in current_images:
             if image.id in FINGERPRINT_WARMUP_IN_PROGRESS:
                 continue
             if image.id in FINGERPRINT_WARMUP_PENDING:
@@ -2954,6 +3048,11 @@ def run_fingerprint_warmup_worker():
             _, cache_hit = load_or_build_duplicate_image_signature(root_path, image)
             if not cache_hit:
                 time.sleep(FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS)
+        except FileNotFoundError:
+            LOGGER.info(
+                "Background fingerprint warmup skipped missing image %s",
+                image.full_path,
+            )
         except Exception:
             LOGGER.warning(
                 "Background fingerprint warmup skipped %s",
@@ -2993,6 +3092,12 @@ def run_duplicate_search_job(
                 signature, _ = load_or_build_duplicate_image_signature(root_path, image)
             except HTTPException:
                 raise
+            except FileNotFoundError:
+                LOGGER.info(
+                    "Skipping missing duplicate-search image %s",
+                    image.full_path,
+                )
+                signature = None
             except Exception:
                 LOGGER.warning(
                     "Skipping duplicate-search signature for %s",

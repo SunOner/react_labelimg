@@ -109,6 +109,9 @@ class CacheStore:
 
                     CREATE INDEX IF NOT EXISTS idx_image_fingerprints_dataset
                     ON image_fingerprints(dataset_key);
+
+                    CREATE INDEX IF NOT EXISTS idx_image_fingerprints_file_identity
+                    ON image_fingerprints(full_path, file_size, mtime_ns);
                     """
                 )
 
@@ -261,8 +264,15 @@ class CacheStore:
                     connection.execute(
                         """
                         SELECT COUNT(*)
-                        FROM image_fingerprints
-                        WHERE dataset_key = ?
+                        FROM dataset_images AS image
+                        WHERE image.dataset_key = ?
+                          AND EXISTS (
+                              SELECT 1
+                              FROM image_fingerprints AS fingerprint
+                              WHERE fingerprint.full_path = image.full_path
+                                AND fingerprint.file_size = image.file_size
+                                AND fingerprint.mtime_ns = image.mtime_ns
+                          )
                         """,
                         (dataset_key,),
                     ).fetchone()[0]
@@ -609,14 +619,13 @@ class CacheStore:
         mtime_ns: int,
     ):
         dataset_key = self.dataset_key_for_path(root_path)
+        signature_json = None
 
         with self._lock:
             with self._connect() as connection:
                 row = connection.execute(
                     """
                     SELECT
-                        dataset_key,
-                        relative_path,
                         full_path,
                         file_size,
                         mtime_ns,
@@ -627,22 +636,58 @@ class CacheStore:
                     (image_id,),
                 ).fetchone()
 
-        if row is None:
-            return None
+                if self._image_fingerprint_row_matches(
+                    row,
+                    full_path=full_path,
+                    file_size=file_size,
+                    mtime_ns=mtime_ns,
+                ):
+                    signature_json = row["signature_json"]
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT
+                            full_path,
+                            file_size,
+                            mtime_ns,
+                            signature_json
+                        FROM image_fingerprints
+                        WHERE full_path = ?
+                          AND file_size = ?
+                          AND mtime_ns = ?
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (str(full_path), int(file_size), int(mtime_ns)),
+                    ).fetchone()
 
-        if row["dataset_key"] != dataset_key:
-            return None
-        if row["relative_path"] != relative_path:
-            return None
-        if row["full_path"] != str(full_path):
-            return None
-        if int(row["file_size"]) != int(file_size):
-            return None
-        if int(row["mtime_ns"]) != int(mtime_ns):
+                    if self._image_fingerprint_row_matches(
+                        row,
+                        full_path=full_path,
+                        file_size=file_size,
+                        mtime_ns=mtime_ns,
+                    ):
+                        signature_json = row["signature_json"]
+                        try:
+                            self._write_image_fingerprint_json(
+                                connection,
+                                dataset_key=dataset_key,
+                                image_id=image_id,
+                                relative_path=relative_path,
+                                full_path=full_path,
+                                file_size=file_size,
+                                mtime_ns=mtime_ns,
+                                signature_json=signature_json,
+                                updated_at=time.time(),
+                            )
+                        except sqlite3.IntegrityError:
+                            pass
+
+        if signature_json is None:
             return None
 
         try:
-            return json.loads(row["signature_json"])
+            return json.loads(signature_json)
         except Exception:
             return None
 
@@ -659,41 +704,20 @@ class CacheStore:
     ):
         dataset_key = self.dataset_key_for_path(root_path)
         now = time.time()
+        signature_json = json.dumps(signature, ensure_ascii=False)
 
         with self._lock:
             with self._connect() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO image_fingerprints (
-                        image_id,
-                        dataset_key,
-                        relative_path,
-                        full_path,
-                        file_size,
-                        mtime_ns,
-                        signature_json,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(image_id) DO UPDATE SET
-                        dataset_key = excluded.dataset_key,
-                        relative_path = excluded.relative_path,
-                        full_path = excluded.full_path,
-                        file_size = excluded.file_size,
-                        mtime_ns = excluded.mtime_ns,
-                        signature_json = excluded.signature_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        image_id,
-                        dataset_key,
-                        relative_path,
-                        str(full_path),
-                        int(file_size),
-                        int(mtime_ns),
-                        json.dumps(signature, ensure_ascii=False),
-                        now,
-                    ),
+                self._write_image_fingerprint_json(
+                    connection,
+                    dataset_key=dataset_key,
+                    image_id=image_id,
+                    relative_path=relative_path,
+                    full_path=full_path,
+                    file_size=file_size,
+                    mtime_ns=mtime_ns,
+                    signature_json=signature_json,
+                    updated_at=now,
                 )
 
     def delete_image_fingerprint(self, image_id: str):
@@ -713,6 +737,71 @@ class CacheStore:
         if os.name == "nt":
             return normalized_path.lower()
         return normalized_path
+
+    @staticmethod
+    def _image_fingerprint_row_matches(
+        row: sqlite3.Row | None,
+        *,
+        full_path: Path,
+        file_size: int,
+        mtime_ns: int,
+    ):
+        if row is None:
+            return False
+        if row["full_path"] != str(full_path):
+            return False
+        if int(row["file_size"]) != int(file_size):
+            return False
+        if int(row["mtime_ns"]) != int(mtime_ns):
+            return False
+        return True
+
+    @staticmethod
+    def _write_image_fingerprint_json(
+        connection: sqlite3.Connection,
+        *,
+        dataset_key: str,
+        image_id: str,
+        relative_path: str,
+        full_path: Path,
+        file_size: int,
+        mtime_ns: int,
+        signature_json: str,
+        updated_at: float,
+    ):
+        connection.execute(
+            """
+            INSERT INTO image_fingerprints (
+                image_id,
+                dataset_key,
+                relative_path,
+                full_path,
+                file_size,
+                mtime_ns,
+                signature_json,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                dataset_key = excluded.dataset_key,
+                relative_path = excluded.relative_path,
+                full_path = excluded.full_path,
+                file_size = excluded.file_size,
+                mtime_ns = excluded.mtime_ns,
+                signature_json = excluded.signature_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                image_id,
+                dataset_key,
+                relative_path,
+                str(full_path),
+                int(file_size),
+                int(mtime_ns),
+                signature_json,
+                updated_at,
+            ),
+        )
 
     @staticmethod
     def _optional_path_text(path: Path | None):
