@@ -24,7 +24,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend ./backend
 COPY main.py LICENSE README.md ./
-COPY data ./data
 COPY models ./models
 COPY --from=frontend-builder /src/frontend/dist ./frontend/dist
 
