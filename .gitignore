@@ -51,3 +51,5 @@ ehthumbs.db
 Thumbs.db
 /data/plugin-runtime-sources
 /models/plugins
+/datasets/*
+!/datasets/.gitkeep

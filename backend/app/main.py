@@ -911,9 +911,7 @@ def read_local_session_annotations(session_id: str, image_id: str):
         raise HTTPException(status_code=404, detail="Image not found")
 
     annotations = load_image_annotations(session, image)
-    annotations, removed_duplicate_count = deduplicate_image_annotations(
-        session,
-        image,
+    annotations, removed_duplicate_count = deduplicate_annotation_payloads(
         annotations,
     )
     image.annotation_count = len(annotations)
@@ -3825,7 +3823,6 @@ def write_pascal_voc_annotations(
     annotations: list[dict[str, Any]],
 ):
     image_width, image_height = read_image_size(image.full_path)
-    annotation_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
         '<?xml version="1.0" encoding="utf-8"?>',
@@ -3863,7 +3860,7 @@ def write_pascal_voc_annotations(
         )
 
     lines.append('</annotation>')
-    annotation_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_text_atomically(annotation_path, "\n".join(lines) + "\n")
 
 
 def annotation_to_pascal_voc_box(
@@ -3899,9 +3896,8 @@ def annotation_to_pascal_voc_box(
 
 
 def write_yolo_classes(classes_path: Path, class_names: list[str]):
-    classes_path.parent.mkdir(parents=True, exist_ok=True)
     contents = "\n".join(class_names)
-    classes_path.write_text(f"{contents}\n" if contents else "", encoding="utf-8")
+    write_text_atomically(classes_path, f"{contents}\n" if contents else "")
 
 
 def write_yolo_annotations(
@@ -3911,7 +3907,6 @@ def write_yolo_annotations(
     class_names: list[str],
 ):
     image_width, image_height = read_image_size(image_path)
-    annotation_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
     for annotation in annotations:
@@ -3937,7 +3932,48 @@ def write_yolo_annotations(
         )
 
     contents = "\n".join(lines)
-    annotation_path.write_text(f"{contents}\n" if contents else "", encoding="utf-8")
+    write_text_atomically(annotation_path, f"{contents}\n" if contents else "")
+
+
+def write_text_atomically(path: Path, contents: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temp_path = Path(temp_name)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as file:
+            file.write(contents)
+            file.flush()
+            os.fsync(file.fileno())
+
+        temp_path.replace(path)
+        sync_directory(path.parent)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def sync_directory(path: Path):
+    if os.name == "nt":
+        return
+
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def clamp_int(value: int, minimum: int, maximum: int):
@@ -4211,6 +4247,15 @@ def natural_sort_key(value: str):
 
 
 def choose_local_directory():
+    if file_dialogs_disabled():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Native file dialogs are disabled in this runtime. "
+                "Open a mounted backend path such as /datasets instead."
+            ),
+        )
+
     dialog = load_tkinter_dialogs()
     root = dialog["root_factory"]()
     try:
@@ -4220,6 +4265,15 @@ def choose_local_directory():
 
 
 def choose_local_image():
+    if file_dialogs_disabled():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Native file dialogs are disabled in this runtime. "
+                "Open a mounted backend path such as /datasets/image.jpg instead."
+            ),
+        )
+
     dialog = load_tkinter_dialogs()
     root = dialog["root_factory"]()
     filetypes = [
@@ -4235,6 +4289,11 @@ def choose_local_image():
         )
     finally:
         root.destroy()
+
+
+def file_dialogs_disabled():
+    value = os.environ.get("LABELIMG_DISABLE_FILE_DIALOGS", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_tkinter_dialogs() -> dict[str, Any]:

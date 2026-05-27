@@ -75,7 +75,27 @@ import type {
 
 type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
 
-const PRELOAD_RADIUS = 1
+type PendingImageLoad = {
+  promise: Promise<void>
+  cancel: () => void
+}
+
+type ImagePreload = {
+  promise: Promise<{ width: number; height: number }>
+  cancel: () => void
+}
+
+type QueuedAnnotationSave = {
+  sessionId: string
+  imageId: string
+  annotations: Annotation[]
+  projectClasses: string[]
+  revision: number
+}
+
+const IMAGE_PRELOAD_BACKWARD_RADIUS = 2
+const IMAGE_PRELOAD_FORWARD_RADIUS = 8
+const ANNOTATION_PRELOAD_RADIUS = 1
 const DELETE_IMAGE_ARM_DURATION_MS = 3000
 const ANNOTATION_SAVE_DEBOUNCE_MS = 350
 const DUPLICATE_SEARCH_PAGE_SIZE = 30
@@ -485,6 +505,7 @@ function App() {
     total: number
   } | null>(null)
   const [sessionError, setSessionError] = useState<string | null>(null)
+  const [pathOpenDraft, setPathOpenDraft] = useState('/datasets')
   const [armedDeleteImageId, setArmedDeleteImageId] = useState<string | null>(null)
   const [isDeletingCurrentImage, setIsDeletingCurrentImage] = useState(false)
   const [duplicateSearchThresholdDraft, setDuplicateSearchThresholdDraft] =
@@ -513,8 +534,9 @@ function App() {
   const menuBarRef = useRef<HTMLElement | null>(null)
   const imageResourcesRef = useRef<Record<string, ImageResource>>({})
   const annotationsByImageRef = useRef<Record<string, Annotation[]>>({})
+  const currentSessionIdRef = useRef<string | null>(null)
   const imageIdSetRef = useRef<Set<string>>(new Set())
-  const pendingLoadsRef = useRef<Record<string, Promise<void>>>({})
+  const pendingLoadsRef = useRef<Record<string, PendingImageLoad>>({})
   const pendingAnnotationLoadsRef = useRef<Record<string, Promise<void>>>({})
   const annotationLoadStateRef = useRef<
     Record<string, 'idle' | 'loading' | 'ready' | 'error'>
@@ -533,6 +555,8 @@ function App() {
   const deleteImageArmTimeoutRef = useRef<number | null>(null)
   const annotationSaveTimeoutsRef = useRef<Record<string, number>>({})
   const annotationSaveRevisionRef = useRef<Record<string, number>>({})
+  const queuedAnnotationSavesRef = useRef<Record<string, QueuedAnnotationSave>>({})
+  const annotationSavePromisesRef = useRef<Record<string, Promise<void>>>({})
   const toastTimeoutsRef = useRef<Record<string, number>>({})
   const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
   const pluginToastKeysRef = useRef<Record<string, string>>({})
@@ -872,6 +896,10 @@ function App() {
   })
 
   useEffect(() => {
+    currentSessionIdRef.current = currentSessionId
+  }, [currentSessionId])
+
+  useEffect(() => {
     viewportHoverPointRef.current = null
   }, [currentEntry?.id])
 
@@ -1044,6 +1072,7 @@ function App() {
         window.clearTimeout(timeoutId)
         delete annotationSaveTimeoutsRef.current[imageId]
       }
+      delete queuedAnnotationSavesRef.current[imageId]
       delete annotationSaveRevisionRef.current[imageId]
       return
     }
@@ -1053,7 +1082,46 @@ function App() {
     }
     annotationSaveTimeoutsRef.current = {}
     annotationSaveRevisionRef.current = {}
+    queuedAnnotationSavesRef.current = {}
   }
+
+  const cancelPendingImageLoad = (imageId: string) => {
+    const pendingLoad = pendingLoadsRef.current[imageId]
+    if (!pendingLoad) {
+      return
+    }
+
+    pendingLoad.cancel()
+    delete pendingLoadsRef.current[imageId]
+  }
+
+  const cancelPendingImageLoads = (imageIds?: Iterable<string>) => {
+    const ids = imageIds ?? Object.keys(pendingLoadsRef.current)
+    for (const imageId of ids) {
+      cancelPendingImageLoad(imageId)
+    }
+  }
+
+  const retainImageResourceBuffer = useEffectEvent((retainedImageIds: Set<string>) => {
+    for (const imageId of Object.keys(pendingLoadsRef.current)) {
+      if (!retainedImageIds.has(imageId)) {
+        cancelPendingImageLoad(imageId)
+      }
+    }
+
+    const currentResources = imageResourcesRef.current
+    const nextResourceEntries = Object.entries(currentResources).filter(([imageId]) =>
+      retainedImageIds.has(imageId),
+    )
+
+    if (nextResourceEntries.length === Object.keys(currentResources).length) {
+      return
+    }
+
+    const nextResources = Object.fromEntries(nextResourceEntries)
+    imageResourcesRef.current = nextResources
+    setImageResources(nextResources)
+  })
 
   const updateImageAnnotationMetadata = useEffectEvent((
     imageId: string,
@@ -1097,6 +1165,9 @@ function App() {
     rawAnnotations: ApiLocalAnnotation[] | null | undefined,
     removedDuplicateCount: number,
     format?: string | null,
+    options: {
+      persist?: boolean
+    } = {},
   ) => {
     if (!rawAnnotations || removedDuplicateCount <= 0) {
       return
@@ -1121,6 +1192,10 @@ function App() {
       setSelectedId(null)
     }
 
+    if (options.persist) {
+      scheduleAnnotationSave(imageId, nextAnnotations)
+    }
+
     const imageEntry = imagesById.get(imageId)
     const imageLabel = imageEntry?.relativePath ?? 'the current image'
     pushToast(
@@ -1130,6 +1205,141 @@ function App() {
       'info',
     )
   })
+
+  const isQueuedAnnotationSaveActive = (queuedSave: QueuedAnnotationSave) => {
+    return (
+      currentSessionIdRef.current === queuedSave.sessionId &&
+      imageIdSetRef.current.has(queuedSave.imageId)
+    )
+  }
+
+  const runQueuedAnnotationSave = useEffectEvent(
+    async (queuedSave: QueuedAnnotationSave) => {
+      try {
+        const payload = await saveLocalAnnotations(
+          queuedSave.sessionId,
+          queuedSave.imageId,
+          queuedSave.annotations,
+          queuedSave.projectClasses,
+        )
+
+        const newerQueuedSave = queuedAnnotationSavesRef.current[queuedSave.imageId]
+        if (
+          !isQueuedAnnotationSaveActive(queuedSave) ||
+          (newerQueuedSave && newerQueuedSave.revision > queuedSave.revision)
+        ) {
+          return
+        }
+
+        updateImageAnnotationMetadata(
+          queuedSave.imageId,
+          payload.count,
+          payload.format ?? undefined,
+        )
+        applyAutomaticAnnotationDeduplication(
+          queuedSave.imageId,
+          payload.annotations,
+          payload.removedDuplicateCount ?? 0,
+          payload.format ?? undefined,
+        )
+      } catch (error) {
+        const newerQueuedSave = queuedAnnotationSavesRef.current[queuedSave.imageId]
+        if (
+          isQueuedAnnotationSaveActive(queuedSave) &&
+          (!newerQueuedSave || newerQueuedSave.revision <= queuedSave.revision)
+        ) {
+          pushToast(
+            error instanceof Error
+              ? error.message
+              : 'Failed to save annotations',
+            'error',
+          )
+        }
+        throw error
+      }
+    },
+  )
+
+  const flushAnnotationSave = async (imageId: string): Promise<void> => {
+    const timeoutId = annotationSaveTimeoutsRef.current[imageId]
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId)
+      delete annotationSaveTimeoutsRef.current[imageId]
+    }
+
+    const runningSave = annotationSavePromisesRef.current[imageId]
+    if (runningSave) {
+      try {
+        await runningSave
+      } catch (error) {
+        if (!queuedAnnotationSavesRef.current[imageId]) {
+          throw error
+        }
+      }
+    }
+
+    const queuedSave = queuedAnnotationSavesRef.current[imageId]
+    if (!queuedSave) {
+      return
+    }
+
+    delete queuedAnnotationSavesRef.current[imageId]
+    const savePromise = runQueuedAnnotationSave(queuedSave)
+    annotationSavePromisesRef.current[imageId] = savePromise
+
+    try {
+      await savePromise
+    } finally {
+      if (annotationSavePromisesRef.current[imageId] === savePromise) {
+        delete annotationSavePromisesRef.current[imageId]
+      }
+    }
+
+    if (queuedAnnotationSavesRef.current[imageId]) {
+      await flushAnnotationSave(imageId)
+    }
+  }
+
+  const flushPendingAnnotationSaves = async (imageIds?: Iterable<string>) => {
+    const ids =
+      imageIds !== undefined
+        ? [...new Set(imageIds)]
+        : [
+            ...new Set([
+              ...Object.keys(annotationSaveTimeoutsRef.current),
+              ...Object.keys(queuedAnnotationSavesRef.current),
+              ...Object.keys(annotationSavePromisesRef.current),
+            ]),
+          ]
+
+    if (ids.length === 0) {
+      return
+    }
+
+    await Promise.all(ids.map((imageId) => flushAnnotationSave(imageId)))
+  }
+
+  const flushPendingAnnotationSavesForSessionChange = async () => {
+    try {
+      await flushPendingAnnotationSaves()
+      return true
+    } catch (error) {
+      setSessionError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to save pending annotations',
+      )
+      return false
+    }
+  }
+
+  const hasPendingAnnotationSaves = () => {
+    return (
+      Object.keys(annotationSaveTimeoutsRef.current).length > 0 ||
+      Object.keys(queuedAnnotationSavesRef.current).length > 0 ||
+      Object.keys(annotationSavePromisesRef.current).length > 0
+    )
+  }
 
   const scheduleAnnotationSave = useEffectEvent((
     imageId: string,
@@ -1153,44 +1363,19 @@ function App() {
       window.clearTimeout(existingTimeoutId)
     }
 
+    queuedAnnotationSavesRef.current[imageId] = {
+      sessionId,
+      imageId,
+      annotations: persistedAnnotations,
+      projectClasses: preferredClasses,
+      revision: nextRevision,
+    }
+
     annotationSaveTimeoutsRef.current[imageId] = window.setTimeout(() => {
       delete annotationSaveTimeoutsRef.current[imageId]
-
-      void saveLocalAnnotations(
-        sessionId,
-        imageId,
-        persistedAnnotations,
-        preferredClasses,
-      )
-        .then((payload) => {
-          if (annotationSaveRevisionRef.current[imageId] !== nextRevision) {
-            return
-          }
-
-          updateImageAnnotationMetadata(
-            imageId,
-            payload.count,
-            payload.format ?? undefined,
-          )
-          applyAutomaticAnnotationDeduplication(
-            imageId,
-            payload.annotations,
-            payload.removedDuplicateCount ?? 0,
-            payload.format ?? undefined,
-          )
-        })
-        .catch((error) => {
-          if (annotationSaveRevisionRef.current[imageId] !== nextRevision) {
-            return
-          }
-
-          pushToast(
-            error instanceof Error
-              ? error.message
-              : 'Failed to save annotations',
-            'error',
-          )
-        })
+      void flushAnnotationSave(imageId).catch(() => {
+        // The queue runner already surfaced the save failure to the user.
+      })
     }, ANNOTATION_SAVE_DEBOUNCE_MS)
   })
 
@@ -1226,8 +1411,9 @@ function App() {
 
   const resetSessionState = (nextImages: ImageEntry[], nextSessionLabel: string) => {
     sessionVersionRef.current += 1
+    currentSessionIdRef.current = null
     imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
-    pendingLoadsRef.current = {}
+    cancelPendingImageLoads()
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
     imageResourcesRef.current = {}
@@ -1261,7 +1447,7 @@ function App() {
 
     const pendingLoad = pendingLoadsRef.current[entry.id]
     if (pendingLoad) {
-      return pendingLoad
+      return pendingLoad.promise
     }
 
     commitImageResources((current) => ({
@@ -1274,7 +1460,8 @@ function App() {
     }))
 
     const sessionVersion = sessionVersionRef.current
-    const promise = preloadImage(entry.url)
+    const preload = preloadImage(entry.url)
+    const promise = preload.promise
       .then((size) => {
         if (
           sessionVersion !== sessionVersionRef.current ||
@@ -1294,7 +1481,11 @@ function App() {
           }
         })
       })
-      .catch(() => {
+      .catch((error) => {
+        if (isImagePreloadAbort(error)) {
+          return
+        }
+
         if (
           sessionVersion !== sessionVersionRef.current ||
           !imageIdSetRef.current.has(entry.id)
@@ -1312,12 +1503,15 @@ function App() {
         }))
       })
       .finally(() => {
-        if (pendingLoadsRef.current[entry.id] === promise) {
+        if (pendingLoadsRef.current[entry.id]?.cancel === preload.cancel) {
           delete pendingLoadsRef.current[entry.id]
         }
       })
 
-    pendingLoadsRef.current[entry.id] = promise
+    pendingLoadsRef.current[entry.id] = {
+      promise,
+      cancel: preload.cancel,
+    }
     return promise
   })
 
@@ -1325,11 +1519,27 @@ function App() {
     return () => {
       isMountedRef.current = false
       sessionVersionRef.current += 1
-      pendingLoadsRef.current = {}
+      currentSessionIdRef.current = null
+      imageIdSetRef.current = new Set()
+      cancelPendingImageLoads()
       pendingAnnotationLoadsRef.current = {}
       annotationLoadStateRef.current = {}
       clearScheduledAnnotationSave()
     }
+  }, [])
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!hasPendingAnnotationSaves()) {
+        return
+      }
+
+      event.preventDefault()
+      event.returnValue = ''
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
   }, [])
 
   useEffect(() => {
@@ -1445,6 +1655,7 @@ function App() {
             payload.annotations,
             payload.removedDuplicateCount ?? 0,
             payload.format ?? undefined,
+            { persist: true },
           )
         }
 
@@ -2195,8 +2406,21 @@ function App() {
       return
     }
 
-    for (const entry of getBufferedEntries(images, currentImageIndex, PRELOAD_RADIUS)) {
+    const imagePreloadEntries = getBufferedEntries(images, currentImageIndex, {
+      backwardRadius: IMAGE_PRELOAD_BACKWARD_RADIUS,
+      forwardRadius: IMAGE_PRELOAD_FORWARD_RADIUS,
+    })
+    const annotationPreloadEntries = getBufferedEntries(images, currentImageIndex, {
+      backwardRadius: ANNOTATION_PRELOAD_RADIUS,
+      forwardRadius: ANNOTATION_PRELOAD_RADIUS,
+    })
+    retainImageResourceBuffer(new Set(imagePreloadEntries.map((entry) => entry.id)))
+
+    for (const entry of imagePreloadEntries) {
       void ensureImageResource(entry)
+    }
+
+    for (const entry of annotationPreloadEntries) {
       void ensureAnnotationsLoaded(entry)
     }
   }, [currentEntry, currentImageIndex, images])
@@ -2270,7 +2494,11 @@ function App() {
     setCurrentImageEntry(nextEntry)
   }
 
-  const clearSession = () => {
+  const clearSession = async () => {
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
     setOpenMenu(null)
     resetDuplicateSearchState(true)
     commitPersistedSessionState(null)
@@ -3278,6 +3506,8 @@ function App() {
       throw new Error('Selected images are no longer available in the current session.')
     }
 
+    await flushPendingAnnotationSaves(imagesToDelete.map((image) => image.id))
+
     const nextPreferredImageRelativePath =
       resolvePreferredImageRelativePathAfterDeleting(
         new Set(imagesToDelete.map((image) => image.id)),
@@ -3618,8 +3848,10 @@ function App() {
       for (const imageId of removedImageIds) {
         clearScheduledAnnotationSave(imageId)
       }
+      cancelPendingImageLoads(removedImageIds)
 
       imageIdSetRef.current = nextImageIdSet
+      currentSessionIdRef.current = sessionId
       setCurrentSessionRootPath(session.rootPath ?? null)
 
       if (
@@ -3684,8 +3916,9 @@ function App() {
     }
 
     sessionVersionRef.current += 1
+    currentSessionIdRef.current = sessionId
     imageIdSetRef.current = nextImageIdSet
-    pendingLoadsRef.current = {}
+    cancelPendingImageLoads()
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
     imageResourcesRef.current = {}
@@ -3746,6 +3979,10 @@ function App() {
   })
 
   const handleOpenLocalImage = async () => {
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
     setOpenMenu(null)
     setSessionError(null)
     setOpeningTarget('image')
@@ -3768,6 +4005,10 @@ function App() {
   }
 
   const handleOpenLocalDirectory = useEffectEvent(async () => {
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
     setOpenMenu(null)
     setSessionError(null)
     setOpeningTarget('dataset')
@@ -3803,7 +4044,89 @@ function App() {
     }
   })
 
+  const handleOpenPathImage = async () => {
+    const path = pathOpenDraft.trim()
+    if (!path) {
+      setSessionError('Enter a backend path first')
+      return
+    }
+
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
+    setOpenMenu(null)
+    setSessionError(null)
+    setOpeningTarget('image')
+    setSessionLoadProgress(null)
+    setIsOpeningSession(true)
+
+    try {
+      const session = await openLocalImagePath(path)
+      if (!session.cancelled) {
+        applyLocalSession(session, {
+          persistedState: buildPersistedSessionState(session, 'image'),
+        })
+      }
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Failed to open image')
+    } finally {
+      setIsOpeningSession(false)
+      setOpeningTarget(null)
+    }
+  }
+
+  const handleOpenPathDirectory = useEffectEvent(async () => {
+    const path = pathOpenDraft.trim()
+    if (!path) {
+      setSessionError('Enter a backend path first')
+      return
+    }
+
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
+    setOpenMenu(null)
+    setSessionError(null)
+    setOpeningTarget('dataset')
+    setSessionLoadProgress({
+      phase: 'indexing',
+      processed: 0,
+      total: 0,
+    })
+    setIsOpeningSession(true)
+
+    try {
+      const job = await openLocalDirectoryPathJob(path)
+      if (!job.cancelled && job.jobId) {
+        await waitForSessionJob(
+          job.jobId,
+          setSessionLoadProgress,
+          (session) => {
+            applyLocalSession(session, {
+              persistedState: buildPersistedSessionState(session, 'dataset'),
+            })
+          },
+          rememberRecentDataset,
+        )
+      }
+    } catch (error) {
+      setSessionError(
+        error instanceof Error ? error.message : 'Failed to open directory',
+      )
+    } finally {
+      setIsOpeningSession(false)
+      setOpeningTarget(null)
+      setSessionLoadProgress(null)
+    }
+  })
+
   const handleOpenRecentDataset = useEffectEvent(async (path: string) => {
+    if (!(await flushPendingAnnotationSavesForSessionChange())) {
+      return
+    }
+
     setSessionError(null)
     setOpeningTarget('dataset')
     setSessionLoadProgress({
@@ -4032,10 +4355,48 @@ function App() {
                   onClick={() => void handleOpenLocalDirectory()}
                   disabled={isOpeningSession || backendStatus !== 'online'}
                 />
+                <div className="path-open-panel" role="group" aria-label="Open by path">
+                  <label className="path-open-label" htmlFor="path-open-input">
+                    Backend path
+                  </label>
+                  <input
+                    id="path-open-input"
+                    className="path-open-input"
+                    type="text"
+                    value={pathOpenDraft}
+                    onChange={(event) => setPathOpenDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        void handleOpenPathDirectory()
+                      }
+                    }}
+                    disabled={isOpeningSession || backendStatus !== 'online'}
+                    spellCheck={false}
+                  />
+                  <div className="path-open-actions">
+                    <AppButton
+                      variant="menu-trigger"
+                      className="path-open-action"
+                      onClick={() => void handleOpenPathImage()}
+                      disabled={isOpeningSession || backendStatus !== 'online'}
+                    >
+                      Image
+                    </AppButton>
+                    <AppButton
+                      variant="menu-trigger"
+                      className="path-open-action"
+                      onClick={() => void handleOpenPathDirectory()}
+                      disabled={isOpeningSession || backendStatus !== 'online'}
+                    >
+                      Directory
+                    </AppButton>
+                  </div>
+                </div>
                 <MenuItemButton
                   title="Close Session"
                   description="Clear the current dataset from the browser"
-                  onClick={clearSession}
+                  onClick={() => void clearSession()}
                   disabled={!hasSession}
                 />
               </div>
@@ -6690,24 +7051,91 @@ async function waitForSessionJob(
   }
 }
 
-async function preloadImage(url: string): Promise<{ width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const image = new Image()
-    image.decoding = 'async'
-    image.onload = () =>
-      resolve({
-        width: image.naturalWidth,
-        height: image.naturalHeight,
-      })
-    image.onerror = () => reject(new Error('Failed to load image'))
-    image.src = url
-  })
+function preloadImage(url: string): ImagePreload {
+  let image: HTMLImageElement | null = new Image()
+  let isSettled = false
+  let rejectPreload: ((error: Error) => void) | null = null
+
+  const cleanup = () => {
+    if (image) {
+      image.onload = null
+      image.onerror = null
+      image.removeAttribute('src')
+    }
+    image = null
+    rejectPreload = null
+  }
+
+  const promise = new Promise<{ width: number; height: number }>(
+    (resolve, reject) => {
+      rejectPreload = reject
+
+      if (!image) {
+        reject(new Error('Failed to initialize image preload'))
+        return
+      }
+
+      image.decoding = 'async'
+      image.onload = () => {
+        if (!image || isSettled) {
+          return
+        }
+
+        isSettled = true
+        const size = {
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+        }
+        cleanup()
+        resolve(size)
+      }
+      image.onerror = () => {
+        if (!image || isSettled) {
+          return
+        }
+
+        isSettled = true
+        cleanup()
+        reject(new Error('Failed to load image'))
+      }
+      image.src = url
+    },
+  )
+
+  return {
+    promise,
+    cancel: () => {
+      if (isSettled) {
+        return
+      }
+
+      isSettled = true
+      const reject = rejectPreload
+      cleanup()
+
+      const error = new Error('Image preload cancelled')
+      error.name = 'AbortError'
+      reject?.(error)
+    },
+  }
+}
+
+function isImagePreloadAbort(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    error.name === 'AbortError'
+  )
 }
 
 function getBufferedEntries(
   images: ImageEntry[],
   currentIndex: number,
-  radius: number,
+  options: {
+    backwardRadius: number
+    forwardRadius: number
+  },
 ) {
   const buffered: ImageEntry[] = []
   const currentEntry = images[currentIndex]
@@ -6715,15 +7143,17 @@ function getBufferedEntries(
     buffered.push(currentEntry)
   }
 
-  for (let offset = 1; offset <= radius; offset += 1) {
-    const previousEntry = images[currentIndex - offset]
-    if (previousEntry) {
-      buffered.push(previousEntry)
-    }
-
+  for (let offset = 1; offset <= options.forwardRadius; offset += 1) {
     const nextEntry = images[currentIndex + offset]
     if (nextEntry) {
       buffered.push(nextEntry)
+    }
+  }
+
+  for (let offset = 1; offset <= options.backwardRadius; offset += 1) {
+    const previousEntry = images[currentIndex - offset]
+    if (previousEntry) {
+      buffered.push(previousEntry)
     }
   }
 

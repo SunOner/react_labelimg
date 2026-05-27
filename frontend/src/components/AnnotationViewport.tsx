@@ -137,6 +137,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 }: AnnotationViewportProps) {
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
   const stageViewportRef = useRef<HTMLDivElement | null>(null)
+  const imageElementRef = useRef<SVGImageElement | null>(null)
   const overlayRef = useRef<SVGSVGElement | null>(null)
   const contextMenuRef = useRef<HTMLDivElement | null>(null)
   const contextSubmenuCloseTimeoutRef = useRef<number | null>(null)
@@ -199,6 +200,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 
   useEffect(() => {
     return () => {
+      imageElementRef.current?.removeAttribute('href')
       resizeObserverRef.current?.disconnect()
       if (contextSubmenuCloseTimeoutRef.current !== null) {
         window.clearTimeout(contextSubmenuCloseTimeoutRef.current)
@@ -451,6 +453,18 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       : isError
         ? `Failed to load ${imageLabel ?? 'image'}`
         : 'No image loaded'
+
+    if (isLoading) {
+      return (
+        <section
+          className="viewport viewport-empty viewport-loading"
+          aria-label={emptyStateLabel}
+          aria-busy="true"
+        >
+          <span className="visually-hidden">{emptyStateLabel}</span>
+        </section>
+      )
+    }
 
     return (
       <section
@@ -977,6 +991,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                 height={stageImagePlacement.height}
               />
               <image
+                ref={imageElementRef}
                 className="viewport-image"
                 href={image.url}
                 x={stageImagePlacement.x}
