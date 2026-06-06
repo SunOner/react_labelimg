@@ -23,6 +23,33 @@ export type LocalSessionResponse = {
   images?: LocalSessionImage[]
 }
 
+export type LocalSessionClassInfo = {
+  label: string
+  sourceClassIndex?: number | null
+  hasUnknownClass?: boolean
+  annotationCount: number
+  imageCount: number
+}
+
+export type LocalSessionAnnotationFormatInfo = {
+  format: string
+  imageCount: number
+}
+
+export type LocalSessionInfoResponse = {
+  sessionId: string
+  sessionLabel: string
+  rootPath: string
+  imageCount: number
+  annotatedImageCount: number
+  emptyImageCount: number
+  annotationCount: number
+  difficultAnnotationCount: number
+  unknownClassCount: number
+  annotationFormats: LocalSessionAnnotationFormatInfo[]
+  classes: LocalSessionClassInfo[]
+}
+
 export type LocalSessionJobStartResponse = {
   cancelled: boolean
   jobId?: string
@@ -560,6 +587,12 @@ export async function fetchLocalDuplicateSearchJob(
 export async function fetchLocalAnnotations(sessionId: string, imageId: string) {
   return requestJson<LocalImageAnnotationsResponse>(
     `/api/local/sessions/${sessionId}/annotations/${imageId}`,
+  )
+}
+
+export async function fetchLocalSessionInfo(sessionId: string) {
+  return requestJson<LocalSessionInfoResponse>(
+    `/api/local/sessions/${sessionId}/info`,
   )
 }
 

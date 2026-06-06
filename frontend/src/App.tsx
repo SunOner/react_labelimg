@@ -24,6 +24,7 @@ import {
   fetchLocalAnnotations,
   fetchLocalDuplicateSearchJob,
   fetchLocalSessionJob,
+  fetchLocalSessionInfo,
   fetchPlugins,
   fetchPredefinedClasses,
   installPluginRuntime,
@@ -45,6 +46,7 @@ import {
   type LocalAnnotation as ApiLocalAnnotation,
   type LocalDuplicateSearchJobResponse,
   type LocalDuplicateSearchMatch,
+  type LocalSessionInfoResponse,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
   type PluginAutoAnnotateResult,
@@ -75,6 +77,8 @@ import type {
 } from './types'
 
 type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
+type SidebarView = 'main' | 'info' | 'plugins'
+type ProjectInfoStatus = 'idle' | 'loading' | 'error'
 
 type PendingImageLoad = {
   promise: Promise<void>
@@ -416,7 +420,12 @@ function App() {
   const [isSidebarVisible, setIsSidebarVisible] = useState(
     readStoredSidebarVisibility,
   )
-  const [sidebarView, setSidebarView] = useState<'main' | 'plugins'>('main')
+  const [sidebarView, setSidebarView] = useState<SidebarView>('main')
+  const [projectInfo, setProjectInfo] =
+    useState<LocalSessionInfoResponse | null>(null)
+  const [projectInfoStatus, setProjectInfoStatus] =
+    useState<ProjectInfoStatus>('idle')
+  const [projectInfoError, setProjectInfoError] = useState<string | null>(null)
   const [recentDatasets, setRecentDatasets] = useState(readStoredRecentDatasets)
   const [persistedSessionState, setPersistedSessionState] = useState<
     PersistedSessionState | null
@@ -672,6 +681,131 @@ function App() {
     },
     {},
   )
+  const localClassImageUsageCounts = useMemo(() => {
+    const counts: Record<string, number> = {}
+
+    for (const imageAnnotations of Object.values(annotationsByImage)) {
+      const imageLabels = new Set<string>()
+      for (const annotation of imageAnnotations) {
+        if (isAnnotationUsableInLabeling(annotation, projectClasses)) {
+          imageLabels.add(annotation.label)
+        }
+      }
+      for (const label of imageLabels) {
+        counts[label] = (counts[label] ?? 0) + 1
+      }
+    }
+
+    return counts
+  }, [annotationsByImage, projectClasses])
+  const projectInfoClassRows = useMemo(() => {
+    const rowsByLabel = new Map<
+      string,
+      {
+        label: string
+        annotationCount: number
+        imageCount: number
+        color: string
+        isUnknown: boolean
+      }
+    >()
+
+    const addRow = (
+      label: string,
+      annotationCount: number,
+      imageCount: number,
+      isUnknown = false,
+    ) => {
+      const normalizedLabel = label.trim() || 'object'
+      const current = rowsByLabel.get(normalizedLabel)
+      if (current) {
+        current.annotationCount += annotationCount
+        current.imageCount += imageCount
+        current.isUnknown = current.isUnknown || isUnknown
+        return
+      }
+
+      rowsByLabel.set(normalizedLabel, {
+        label: normalizedLabel,
+        annotationCount,
+        imageCount,
+        color: labelToColor(normalizedLabel),
+        isUnknown,
+      })
+    }
+
+    if (projectInfo) {
+      for (const item of projectInfo.classes) {
+        addRow(
+          resolveProjectClassLabel(item, projectClasses),
+          item.annotationCount,
+          item.imageCount,
+          !isAnnotationUsableInLabeling(item, projectClasses),
+        )
+      }
+    } else {
+      for (const label of classList) {
+        addRow(
+          label,
+          classUsageCounts[label] ?? 0,
+          localClassImageUsageCounts[label] ?? 0,
+        )
+      }
+    }
+
+    for (const label of projectClasses) {
+      if (!rowsByLabel.has(label)) {
+        addRow(label, 0, 0)
+      }
+    }
+
+    return [...rowsByLabel.values()].sort((left, right) => {
+      if (right.annotationCount !== left.annotationCount) {
+        return right.annotationCount - left.annotationCount
+      }
+      return left.label.localeCompare(right.label)
+    })
+  }, [
+    classList,
+    classUsageCounts,
+    localClassImageUsageCounts,
+    projectClasses,
+    projectInfo,
+  ])
+  const projectInfoFormatRows = useMemo(() => {
+    if (projectInfo) {
+      return projectInfo.annotationFormats
+    }
+
+    const formatCounts = images.reduce<Record<string, number>>((current, entry) => {
+      const format = entry.annotationFormat || 'none'
+      current[format] = (current[format] ?? 0) + 1
+      return current
+    }, {})
+
+    return Object.entries(formatCounts).map(([format, imageCount]) => ({
+      format,
+      imageCount,
+    }))
+  }, [images, projectInfo])
+  const projectImageCount = projectInfo?.imageCount ?? images.length
+  const projectAnnotatedImageCount =
+    projectInfo?.annotatedImageCount ??
+    images.filter((entry) => entry.annotationCount > 0).length
+  const projectEmptyImageCount =
+    projectInfo?.emptyImageCount ??
+    Math.max(0, images.length - projectAnnotatedImageCount)
+  const projectAnnotationCount =
+    projectInfo?.annotationCount ??
+    images.reduce((total, entry) => total + entry.annotationCount, 0)
+  const projectDifficultAnnotationCount =
+    projectInfo?.difficultAnnotationCount ??
+    usableSessionAnnotations.filter((annotation) => annotation.difficult).length
+  const projectUnknownClassCount =
+    projectInfo?.unknownClassCount ??
+    sessionAnnotations.filter(
+      (annotation) => !isAnnotationUsableInLabeling(annotation, projectClasses),
+    ).length
   const hasSession = images.length > 0
   const canSearchDuplicates =
     backendStatus === 'online' && currentSessionId !== null && images.length > 1
@@ -925,6 +1059,20 @@ function App() {
   useEffect(() => {
     setFileSearchQuery('')
   }, [currentSessionId])
+
+  useEffect(() => {
+    setProjectInfo(null)
+    setProjectInfoStatus('idle')
+    setProjectInfoError(null)
+  }, [currentSessionId])
+
+  useEffect(() => {
+    if (sidebarView !== 'info') {
+      return
+    }
+
+    void refreshProjectInfo()
+  }, [currentSessionId, sidebarView])
 
   useEffect(() => {
     viewportHoverPointRef.current = null
@@ -1345,6 +1493,45 @@ function App() {
 
     await Promise.all(ids.map((imageId) => flushAnnotationSave(imageId)))
   }
+
+  const refreshProjectInfo = useEffectEvent(async () => {
+    const sessionId = currentSessionIdRef.current
+    if (!sessionId) {
+      setProjectInfo(null)
+      setProjectInfoStatus('idle')
+      setProjectInfoError(null)
+      return
+    }
+
+    setProjectInfoStatus('loading')
+    setProjectInfoError(null)
+
+    try {
+      await flushPendingAnnotationSaves()
+      if (currentSessionIdRef.current !== sessionId) {
+        return
+      }
+
+      const nextProjectInfo = await fetchLocalSessionInfo(sessionId)
+      if (currentSessionIdRef.current !== sessionId) {
+        return
+      }
+
+      setProjectInfo(nextProjectInfo)
+      setProjectInfoStatus('idle')
+    } catch (error) {
+      if (currentSessionIdRef.current !== sessionId) {
+        return
+      }
+
+      setProjectInfoStatus('error')
+      setProjectInfoError(
+        error instanceof Error
+          ? error.message
+          : 'Failed to load project info',
+      )
+    }
+  })
 
   const flushPendingAnnotationSavesForSessionChange = async () => {
     try {
@@ -2628,14 +2815,22 @@ function App() {
     setIsCacheDbOpen(false)
   }
 
-  const selectSidebarView = (nextView: 'main' | 'plugins') => {
+  const selectSidebarView = (nextView: SidebarView) => {
     setSidebarView(nextView)
     if (nextView === 'plugins') {
       setPluginsError(null)
       setHfAuthError(null)
       void refreshPlugins()
       void refreshHfAuthStatus()
+    } else if (nextView === 'info' && sidebarView === 'info') {
+      void refreshProjectInfo()
     }
+  }
+
+  const openProjectInfo = () => {
+    setOpenMenu(null)
+    setIsSidebarVisible(true)
+    selectSidebarView('info')
   }
 
   const openPluginsManager = () => {
@@ -4560,6 +4755,16 @@ function App() {
           <div className="menu-root">
             <AppButton
               variant="menu-trigger"
+              isActive={isSidebarVisible && sidebarView === 'info'}
+              onClick={openProjectInfo}
+            >
+              Info
+            </AppButton>
+          </div>
+
+          <div className="menu-root">
+            <AppButton
+              variant="menu-trigger"
               isActive={openMenu === 'plugins'}
               onClick={() =>
                 setOpenMenu((current) => (current === 'plugins' ? null : 'plugins'))
@@ -4679,6 +4884,14 @@ function App() {
                 onClick={() => selectSidebarView('main')}
               >
                 Main Menu
+              </AppButton>
+              <AppButton
+                variant="chip"
+                isActive={sidebarView === 'info'}
+                className="panel-sidebar-tab"
+                onClick={() => selectSidebarView('info')}
+              >
+                Info
               </AppButton>
               <AppButton
                 variant="chip"
@@ -5079,6 +5292,151 @@ function App() {
                   )}
                 </section>
               </>
+            ) : sidebarView === 'info' ? (
+              <div className="sidebar-info-view">
+                <section className="panel-section">
+                  <div className="project-info-heading-row">
+                    <div className="project-info-heading-copy">
+                      <p className="section-kicker">Project info</p>
+                      <h2>Info</h2>
+                    </div>
+                    <AppButton
+                      variant="ghost"
+                      className="project-info-refresh"
+                      onClick={() => void refreshProjectInfo()}
+                      disabled={!currentSessionId || projectInfoStatus === 'loading'}
+                    >
+                      {projectInfoStatus === 'loading' ? 'Refreshing...' : 'Refresh'}
+                    </AppButton>
+                  </div>
+
+                  {hasSession ? (
+                    <div className="meta-list">
+                      <div className="meta-line meta-line-value-only">
+                        <strong className="meta-value" title={sessionLabel}>
+                          {sessionLabel}
+                        </strong>
+                      </div>
+                      <div className="meta-line">
+                        <span>Root</span>
+                        <strong
+                          className="meta-value"
+                          title={projectInfo?.rootPath ?? currentSessionRootPath ?? ''}
+                        >
+                          {projectInfo?.rootPath ??
+                            currentSessionRootPath ??
+                            'No project root'}
+                        </strong>
+                      </div>
+                      <div className="meta-line">
+                        <span>Status</span>
+                        <strong className="meta-value">
+                          {projectInfoStatus === 'loading'
+                            ? 'Scanning'
+                            : projectInfo
+                              ? 'Ready'
+                              : 'Local'}
+                        </strong>
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="muted">Open a dataset to see project info.</span>
+                  )}
+
+                  {projectInfoError ? (
+                    <p className="project-info-error">{projectInfoError}</p>
+                  ) : null}
+                </section>
+
+                {hasSession ? (
+                  <>
+                    <section className="panel-section">
+                      <h2>Images</h2>
+                      <div className="project-info-stat-list">
+                        <div className="project-info-stat">
+                          <span>Images</span>
+                          <strong>{projectImageCount.toLocaleString()}</strong>
+                        </div>
+                        <div className="project-info-stat">
+                          <span>Annotated</span>
+                          <strong>{projectAnnotatedImageCount.toLocaleString()}</strong>
+                        </div>
+                        <div className="project-info-stat">
+                          <span>Empty</span>
+                          <strong>{projectEmptyImageCount.toLocaleString()}</strong>
+                        </div>
+                        <div className="project-info-stat">
+                          <span>Boxes</span>
+                          <strong>{projectAnnotationCount.toLocaleString()}</strong>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section className="panel-section">
+                      <h2>Classes</h2>
+                      {projectInfoClassRows.length > 0 ? (
+                        <div className="project-info-class-list">
+                          {projectInfoClassRows.map((row) => (
+                            <div
+                              key={row.label}
+                              className={[
+                                'project-info-class-row',
+                                row.isUnknown ? 'is-unknown' : '',
+                              ]
+                                .filter(Boolean)
+                                .join(' ')}
+                            >
+                              <span
+                                className="project-info-class-swatch"
+                                style={{ backgroundColor: row.color }}
+                                aria-hidden="true"
+                              />
+                              <span className="project-info-class-name" title={row.label}>
+                                {row.label}
+                                {row.isUnknown ? ' · unknown' : ''}
+                              </span>
+                              <span className="project-info-class-count">
+                                {row.annotationCount.toLocaleString()} boxes
+                              </span>
+                              <span className="project-info-class-images">
+                                {row.imageCount.toLocaleString()} images
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="muted">No classes in this project.</span>
+                      )}
+                    </section>
+
+                    <section className="panel-section">
+                      <h2>Annotations</h2>
+                      <div className="meta-list">
+                        {projectInfoFormatRows.map((row) => (
+                          <div className="meta-line" key={row.format}>
+                            <span>{formatAnnotationFormatLabel(row.format)}</span>
+                            <strong className="meta-value">
+                              {row.imageCount.toLocaleString()}
+                            </strong>
+                          </div>
+                        ))}
+                        <div className="meta-line">
+                          <span>Difficult</span>
+                          <strong className="meta-value">
+                            {projectDifficultAnnotationCount.toLocaleString()}
+                          </strong>
+                        </div>
+                        <div className="meta-line">
+                          <span>Unknown</span>
+                          <strong className="meta-value">
+                            {projectUnknownClassCount.toLocaleString()}
+                          </strong>
+                        </div>
+                      </div>
+                    </section>
+                  </>
+                ) : null}
+              </div>
             ) : (
               <div className="sidebar-plugins-view">
                 <div className="sidebar-plugins-toolbar">
@@ -7332,6 +7690,19 @@ function formatPluginRuntimeProfileLabel(
     return 'CPU'
   }
   return 'Auto'
+}
+
+function formatAnnotationFormatLabel(format: string) {
+  switch (format) {
+    case 'yolo':
+      return 'YOLO'
+    case 'voc':
+      return 'Pascal VOC'
+    case 'none':
+      return 'No file'
+    default:
+      return format || 'Unknown'
+  }
 }
 
 function formatPluginRuntimeInstallStep(step?: string | null) {

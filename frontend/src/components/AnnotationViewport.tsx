@@ -18,6 +18,11 @@ const MAX_ZOOM = 8
 const ZOOM_STEP = 0.25
 const BOX_DRAG_ARM_THRESHOLD_PX = 4
 const CONTEXT_SUBMENU_CLOSE_DELAY_MS = 180
+const LABEL_LOCAL_STACK_ROWS = 3
+const LABEL_IMAGE_OVERLAP_SCORE = 70
+const LABEL_BOX_OVERLAP_SCORE = 420
+const LABEL_OCCUPIED_OVERLAP_SCORE = 2400
+const LABEL_CENTER_DISTANCE_SCORE = 2.2
 
 type AnnotationViewportProps = {
   image: LoadedImage | null
@@ -150,6 +155,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
   const [crosshairPoint, setCrosshairPoint] = useState<Point | null>(null)
+  const [hoverStagePoint, setHoverStagePoint] = useState<Point | null>(null)
   const [isPanning, setIsPanning] = useState(false)
   const [contextMenu, setContextMenu] = useState<{
     annotationId: string
@@ -543,6 +549,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
       buildAnnotationGeometry(annotation, image, stageImagePlacement, overlayMetrics),
     ),
     overlayMetrics,
+    stageImagePlacement,
   )
   const contextMenuPosition = contextMenu
     ? {
@@ -585,6 +592,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
     const point = pointFromEvent(event, image, stageImagePlacement, 'strict')
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
     setCrosshairPoint(clampedPoint ?? point)
+    setHoverStagePoint(stagePoint)
     const hitCandidates =
       stagePoint
         ? getAnnotationCandidatesAtStagePoint(
@@ -713,6 +721,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   }
 
   const handleOverlayPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
+    setHoverStagePoint(stagePointFromEvent(event))
     const hoverPoint = pointFromEvent(event, image, stageImagePlacement, 'strict')
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
     setCrosshairPoint(clampedPoint ?? hoverPoint)
@@ -803,6 +812,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   const handleOverlayPointerLeave = (event: ReactPointerEvent<SVGSVGElement>) => {
     const clampedPoint = pointFromEvent(event, image, stageImagePlacement, 'clamp')
     setCrosshairPoint(null)
+    setHoverStagePoint(null)
     onHoverPointChange?.(clampedPoint)
   }
 
@@ -1052,6 +1062,19 @@ export const AnnotationViewport = memo(function AnnotationViewport({
               {annotationGeometries.map((geometry) => {
               const { annotation, stageRect, labelRect, labelMetrics } = geometry
               const isSelected = annotation.id === selectedId
+              const isLabelFaded = hoverStagePoint
+                ? isPointNearRect(
+                    labelRect,
+                    hoverStagePoint,
+                    overlayMetrics.labelFadeRadius,
+                  )
+                : false
+              const labelClassName = isLabelFaded
+                ? 'bbox-label is-faded'
+                : 'bbox-label'
+              const connectorClassName = isLabelFaded
+                ? 'bbox-tag-connector is-faded'
+                : 'bbox-tag-connector'
               const connector = getLabelConnector(labelRect, stageRect)
 
               return (
@@ -1069,7 +1092,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     pointerEvents="none"
                   />
                   <line
-                    className="bbox-tag-connector"
+                    className={connectorClassName}
                     x1={connector.start.x}
                     y1={connector.start.y}
                     x2={connector.end.x}
@@ -1078,6 +1101,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                     pointerEvents="none"
                   />
                   <g
+                    className={labelClassName}
                     transform={`translate(${labelRect.x}, ${labelRect.y})`}
                     pointerEvents="none"
                   >
@@ -1440,6 +1464,28 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max)
 }
 
+function clampLabelX(
+  x: number,
+  labelWidth: number,
+  overlayMetrics: OverlayMetrics,
+) {
+  const minX = overlayMetrics.edgeInset
+  const maxX = Math.max(minX, STAGE_WIDTH - overlayMetrics.edgeInset - labelWidth)
+
+  return clamp(x, minX, maxX)
+}
+
+function clampLabelY(
+  y: number,
+  labelHeight: number,
+  overlayMetrics: OverlayMetrics,
+) {
+  const minY = overlayMetrics.edgeInset
+  const maxY = Math.max(minY, STAGE_HEIGHT - overlayMetrics.edgeInset - labelHeight)
+
+  return clamp(y, minY, maxY)
+}
+
 function withOpacity(color: string, opacity: number) {
   const hex = color.replace('#', '')
 
@@ -1792,20 +1838,14 @@ function buildAnnotationGeometry(
     overlayMetrics.effectiveScale,
   )
   const labelX = snapStageValue(
-    clamp(
-      stageRect.x,
-      overlayMetrics.edgeInset,
-      Math.max(
-        overlayMetrics.edgeInset,
-        STAGE_WIDTH - overlayMetrics.edgeInset - labelWidth,
-      ),
-    ),
+    clampLabelX(stageRect.x, labelWidth, overlayMetrics),
     overlayMetrics.effectiveScale,
   )
   const labelY = snapStageValue(
-    Math.max(
-      overlayMetrics.edgeInset,
+    clampLabelY(
       stageRect.y - labelMetrics.tagHeight - labelMetrics.labelGap,
+      labelMetrics.tagHeight,
+      overlayMetrics,
     ),
     overlayMetrics.effectiveScale,
   )
@@ -1883,6 +1923,7 @@ function getAnnotationCandidatesAtStagePoint(
 function layoutAnnotationLabels(
   geometries: AnnotationGeometry[],
   overlayMetrics: OverlayMetrics,
+  imageRect: Rect,
 ) {
   const positionedGeometries = [...geometries]
   const occupiedLabelRects: Rect[] = []
@@ -1901,7 +1942,12 @@ function layoutAnnotationLabels(
     )
 
   for (const { geometry, index } of placementOrder) {
-    const labelRect = placeLabelRect(geometry, occupiedLabelRects, overlayMetrics)
+    const labelRect = placeLabelRect(
+      geometry,
+      occupiedLabelRects,
+      overlayMetrics,
+      imageRect,
+    )
     positionedGeometries[index] = {
       ...geometry,
       labelRect,
@@ -1916,68 +1962,119 @@ function placeLabelRect(
   geometry: AnnotationGeometry,
   occupiedLabelRects: Rect[],
   overlayMetrics: OverlayMetrics,
+  imageRect: Rect,
 ) {
   const slotStep = geometry.labelRect.height + geometry.labelMetrics.labelGap
-  const minY = overlayMetrics.edgeInset
-  const maxY = STAGE_HEIGHT - overlayMetrics.edgeInset - geometry.labelRect.height
-  const aboveY = clamp(
-    geometry.stageRect.y - geometry.labelRect.height - geometry.labelMetrics.labelGap,
-    minY,
-    maxY,
-  )
-  const belowY = clamp(
-    geometry.stageRect.y + geometry.labelMetrics.labelGap,
-    minY,
-    maxY,
-  )
   const candidateRects: Rect[] = []
   const seenKeys = new Set<string>()
-  const maxRows = Math.max(1, Math.ceil(STAGE_HEIGHT / Math.max(slotStep, 1)) + 1)
 
-  const addCandidate = (y: number) => {
-    const clampedY = snapStageValue(clamp(y, minY, maxY), overlayMetrics.effectiveScale)
-    const key = `${geometry.labelRect.x}:${clampedY}`
+  const addCandidate = (x: number, y: number) => {
+    const rect = {
+      ...geometry.labelRect,
+      x: snapStageValue(
+        clampLabelX(x, geometry.labelRect.width, overlayMetrics),
+        overlayMetrics.effectiveScale,
+      ),
+      y: snapStageValue(
+        clampLabelY(y, geometry.labelRect.height, overlayMetrics),
+        overlayMetrics.effectiveScale,
+      ),
+    }
+    const key = `${rect.x}:${rect.y}`
     if (seenKeys.has(key)) {
       return
     }
     seenKeys.add(key)
-    candidateRects.push({
-      ...geometry.labelRect,
-      y: clampedY,
-    })
+    candidateRects.push(rect)
   }
 
-  for (let level = 0; level < maxRows; level += 1) {
-    addCandidate(aboveY - slotStep * level)
+  const addDirectionalStack = (x: number, y: number, direction: -1 | 1) => {
+    for (let level = 0; level <= LABEL_LOCAL_STACK_ROWS; level += 1) {
+      addCandidate(x, y + slotStep * level * direction)
+    }
   }
 
-  for (let level = 0; level < maxRows; level += 1) {
-    addCandidate(belowY + slotStep * level)
+  const addLocalVerticalStack = (x: number, y: number) => {
+    addCandidate(x, y)
+    for (let level = 1; level <= LABEL_LOCAL_STACK_ROWS; level += 1) {
+      addCandidate(x, y - slotStep * level)
+      addCandidate(x, y + slotStep * level)
+    }
   }
 
-  const freeCandidate = candidateRects.find(
-    (candidate) =>
-      !occupiedLabelRects.some((occupiedRect) =>
-        rectsOverlap(candidate, occupiedRect),
-      ),
-  )
-  if (freeCandidate) {
-    return freeCandidate
+  const labelWidth = geometry.labelRect.width
+  const labelHeight = geometry.labelRect.height
+  const labelGap = geometry.labelMetrics.labelGap
+  const box = geometry.stageRect
+  const alignedXs = [
+    box.x + box.width / 2 - labelWidth / 2,
+    box.x,
+    box.x + box.width - labelWidth,
+  ]
+  const aboveBoxY = box.y - labelHeight - labelGap
+  const belowBoxY = box.y + box.height + labelGap
+  const sideLabelY = box.y + box.height / 2 - labelHeight / 2
+  const isNearLeftImageEdge =
+    box.x - imageRect.x <= overlayMetrics.labelEdgeEscapeBand
+  const isNearRightImageEdge =
+    imageRect.x + imageRect.width - (box.x + box.width) <=
+    overlayMetrics.labelEdgeEscapeBand
+
+  for (const x of alignedXs) {
+    addDirectionalStack(x, aboveBoxY, -1)
+    addDirectionalStack(x, belowBoxY, 1)
+  }
+
+  if (isNearLeftImageEdge) {
+    addLocalVerticalStack(box.x - labelWidth - labelGap, sideLabelY)
+  }
+
+  if (isNearRightImageEdge) {
+    addLocalVerticalStack(box.x + box.width + labelGap, sideLabelY)
   }
 
   return (
-    candidateRects.reduce((bestRect, candidate) => {
-      const overlapScore = occupiedLabelRects.reduce(
-        (total, occupiedRect) => total + getRectOverlapArea(candidate, occupiedRect),
-        0,
-      )
-      const bestScore = occupiedLabelRects.reduce(
-        (total, occupiedRect) => total + getRectOverlapArea(bestRect, occupiedRect),
-        0,
-      )
+    candidateRects
+      .map((candidate, index) => ({
+        rect: candidate,
+        score: getLabelPlacementScore(
+          candidate,
+          geometry,
+          imageRect,
+          occupiedLabelRects,
+          index,
+        ),
+      }))
+      .sort((left, right) => left.score - right.score)[0]?.rect ?? geometry.labelRect
+  )
+}
 
-      return overlapScore < bestScore ? candidate : bestRect
-    }) ?? geometry.labelRect
+function getLabelPlacementScore(
+  labelRect: Rect,
+  geometry: AnnotationGeometry,
+  imageRect: Rect,
+  occupiedLabelRects: Rect[],
+  order: number,
+) {
+  const labelArea = Math.max(labelRect.width * labelRect.height, 1)
+  const occupiedOverlapRatio =
+    occupiedLabelRects.reduce(
+      (total, occupiedRect) => total + getRectOverlapArea(labelRect, occupiedRect),
+      0,
+    ) / labelArea
+  const imageOverlapRatio = getRectOverlapArea(labelRect, imageRect) / labelArea
+  const boxOverlapRatio = getRectOverlapArea(labelRect, geometry.stageRect) / labelArea
+  const connector = getLabelConnector(labelRect, geometry.stageRect)
+  const connectorDistance = getPointDistance(connector.start, connector.end)
+  const centerDistance = getRectCenterDistance(labelRect, geometry.stageRect)
+
+  return (
+    occupiedOverlapRatio * LABEL_OCCUPIED_OVERLAP_SCORE +
+    imageOverlapRatio * LABEL_IMAGE_OVERLAP_SCORE +
+    boxOverlapRatio * LABEL_BOX_OVERLAP_SCORE +
+    connectorDistance +
+    centerDistance * LABEL_CENTER_DISTANCE_SCORE +
+    order * 0.001
   )
 }
 
@@ -2048,12 +2145,12 @@ function isPointWithinRect(rect: Rect, point: Point) {
   )
 }
 
-function rectsOverlap(left: Rect, right: Rect) {
-  return !(
-    left.x + left.width <= right.x ||
-    right.x + right.width <= left.x ||
-    left.y + left.height <= right.y ||
-    right.y + right.height <= left.y
+function isPointNearRect(rect: Rect, point: Point, distance: number) {
+  return (
+    point.x >= rect.x - distance &&
+    point.x <= rect.x + rect.width + distance &&
+    point.y >= rect.y - distance &&
+    point.y <= rect.y + rect.height + distance
   )
 }
 
@@ -2070,6 +2167,13 @@ function getRectOverlapArea(left: Rect, right: Rect) {
   }
 
   return overlapWidth * overlapHeight
+}
+
+function getRectCenterDistance(left: Rect, right: Rect) {
+  return Math.hypot(
+    left.x + left.width / 2 - (right.x + right.width / 2),
+    left.y + left.height / 2 - (right.y + right.height / 2),
+  )
 }
 
 function getLabelConnector(labelRect: Rect, stageRect: Rect) {
@@ -2175,6 +2279,8 @@ type OverlayMetrics = {
   labelGap: number
   edgeInset: number
   minTagWidth: number
+  labelFadeRadius: number
+  labelEdgeEscapeBand: number
 }
 
 function getAnnotationLabelMetrics(
@@ -2231,6 +2337,8 @@ function getOverlayMetrics(
   const minTagWidthPx = 56 * zoomVisualScale
   const tagRadiusPx = clamp(2 * zoomVisualScale, 2, 4)
   const labelGapPx = 6 * clamp(Math.pow(zoom, 0.3), 1, 1.45)
+  const labelFadeRadiusPx = 28
+  const labelEdgeEscapeBandPx = 18
   const edgeInsetPx = 4
 
   return {
@@ -2244,6 +2352,8 @@ function getOverlayMetrics(
     labelGap: toStageUnits(labelGapPx),
     edgeInset: toStageUnits(edgeInsetPx),
     minTagWidth: toStageUnits(minTagWidthPx),
+    labelFadeRadius: toStageUnits(labelFadeRadiusPx),
+    labelEdgeEscapeBand: toStageUnits(labelEdgeEscapeBandPx),
   }
 }
 

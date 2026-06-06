@@ -900,6 +900,15 @@ def read_local_session_image(session_id: str, image_id: str):
     return build_cached_image_response(image.full_path)
 
 
+@app.get("/api/local/sessions/{session_id}/info")
+def read_local_session_info(session_id: str):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return build_local_session_info(session)
+
+
 @app.get("/api/local/sessions/{session_id}/annotations/{image_id}")
 def read_local_session_annotations(session_id: str, image_id: str):
     session = LOCAL_SESSIONS.get(session_id)
@@ -3503,6 +3512,102 @@ def iter_annotation_bases(image_path: Path, session_root: Path):
         suffix = absolute_parts[index + 1 :]
         for label_dir in LABEL_DIRECTORY_NAMES:
             yield from add_candidate(Path(*prefix, label_dir, *suffix))
+
+
+def build_local_session_info(session: LocalSession):
+    class_counts: dict[str, dict[str, Any]] = {}
+    format_counts = {"yolo": 0, "voc": 0, "none": 0}
+    annotated_image_count = 0
+    annotation_count = 0
+    difficult_annotation_count = 0
+    unknown_class_count = 0
+
+    for image in session.images:
+        annotation_format = image.annotation_format or "none"
+        format_counts[annotation_format] = format_counts.get(annotation_format, 0) + 1
+
+        annotations = load_image_annotations(session, image)
+        annotations, _removed_duplicate_count = deduplicate_annotation_payloads(
+            annotations,
+        )
+
+        if annotations:
+            annotated_image_count += 1
+
+        image_class_keys: set[str] = set()
+        for annotation in annotations:
+            label = str(annotation.get("label") or "object").strip() or "object"
+            source_class_index = annotation.get("sourceClassIndex")
+            has_unknown_class = bool(annotation.get("hasUnknownClass"))
+            if isinstance(source_class_index, int):
+                class_key = f"index:{source_class_index}"
+            else:
+                class_key = f"label:{label}"
+                source_class_index = None
+
+            class_info = class_counts.setdefault(
+                class_key,
+                {
+                    "label": label,
+                    "sourceClassIndex": source_class_index,
+                    "hasUnknownClass": has_unknown_class,
+                    "annotationCount": 0,
+                    "imageIds": set(),
+                },
+            )
+            class_info["annotationCount"] += 1
+            class_info["imageIds"].add(image.id)
+            image_class_keys.add(class_key)
+
+            if bool(annotation.get("difficult")):
+                difficult_annotation_count += 1
+            if has_unknown_class:
+                unknown_class_count += 1
+
+        annotation_count += len(annotations)
+        image.annotation_count = len(annotations)
+        for class_key in image_class_keys:
+            class_counts[class_key]["imageCount"] = len(
+                class_counts[class_key]["imageIds"],
+            )
+
+    classes = []
+    for class_info in class_counts.values():
+        classes.append(
+            {
+                "label": class_info["label"],
+                "sourceClassIndex": class_info["sourceClassIndex"],
+                "hasUnknownClass": class_info["hasUnknownClass"],
+                "annotationCount": class_info["annotationCount"],
+                "imageCount": len(class_info["imageIds"]),
+            }
+        )
+
+    classes.sort(
+        key=lambda item: (
+            -int(item["annotationCount"]),
+            str(item["label"]).casefold(),
+        ),
+    )
+
+    return {
+        "sessionId": session.id,
+        "sessionLabel": session.label,
+        "rootPath": str(session.root_path),
+        "imageCount": len(session.images),
+        "annotatedImageCount": annotated_image_count,
+        "emptyImageCount": max(0, len(session.images) - annotated_image_count),
+        "annotationCount": annotation_count,
+        "difficultAnnotationCount": difficult_annotation_count,
+        "unknownClassCount": unknown_class_count,
+        "annotationFormats": [
+            {"format": annotation_format, "imageCount": count}
+            for annotation_format, count in format_counts.items()
+            if count > 0
+        ],
+        "classes": classes,
+    }
+
 
 def load_image_annotations(session: LocalSession, image: SessionImage):
     if image.annotation_path is None or image.annotation_format is None:
