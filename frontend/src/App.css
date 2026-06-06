@@ -3355,6 +3355,70 @@
   padding-right: 2px;
 }
 
+.dataset-file-search {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.dataset-file-search-header {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  line-height: 1;
+}
+
+.dataset-file-search-header strong {
+  min-width: max-content;
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+
+.dataset-file-search-control {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.dataset-file-search-input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-input);
+  color: var(--ink-strong);
+  font: inherit;
+  font-size: 0.78rem;
+}
+
+.dataset-file-search-input:focus {
+  outline: 2px solid rgba(255, 255, 255, 0.16);
+  border-color: var(--accent);
+}
+
+.dataset-file-search-clear {
+  min-height: 30px;
+  padding: 0 8px;
+  font-size: 0.72rem;
+}
+
+.file-list-empty {
+  margin: 0;
+  padding: 8px 6px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  color: var(--ink-soft);
+  font-size: 0.78rem;
+}
+
 .dataset-delete-image-button {
   width: 100%;
   min-height: 54px;

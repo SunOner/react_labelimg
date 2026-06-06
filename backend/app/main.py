@@ -2616,10 +2616,7 @@ def delete_local_session_images(session: LocalSession, image_ids: list[str]):
     for image in images_to_delete:
         delete_session_image_files(image)
 
-    remove_images_from_matching_sessions(
-        session.root_path,
-        [image.id for image in images_to_delete],
-    )
+    remove_images_from_matching_sessions(session.root_path, images_to_delete)
     CACHE_STORE.save_dataset_manifest(
         session.root_path,
         session.label,
@@ -2662,33 +2659,61 @@ def register_session_images(images: list[SessionImage]):
         register_session_image(image)
 
 
-def remove_images_from_matching_sessions(root_path: Path, image_ids: list[str]):
+def remove_images_from_matching_sessions(
+    root_path: Path,
+    images_to_remove: list[SessionImage],
+):
     normalized_root_path = root_path.expanduser().resolve()
-    image_id_set = set(image_ids)
-    if not image_id_set:
+    image_id_set = {image.id for image in images_to_remove}
+    image_path_set = {image.full_path for image in images_to_remove}
+    if not image_id_set and not image_path_set:
         return
 
+    removed_image_ids: set[str] = set()
     for session in LOCAL_SESSIONS.values():
         if session.root_path != normalized_root_path:
             continue
 
-        if image_id_set.isdisjoint(session.images_by_id):
+        next_images: list[SessionImage] = []
+        session_removed_ids: list[str] = []
+        for current_image in session.images:
+            if (
+                current_image.id in image_id_set
+                or current_image.full_path in image_path_set
+            ):
+                session_removed_ids.append(current_image.id)
+                continue
+
+            next_images.append(current_image)
+
+        if not session_removed_ids:
             continue
 
-        session.images = [
-            current_image
-            for current_image in session.images
-            if current_image.id not in image_id_set
-        ]
-        for image_id in image_id_set:
+        session.images = next_images
+        for image_id in session_removed_ids:
             session.images_by_id.pop(image_id, None)
+        removed_image_ids.update(session_removed_ids)
 
-    for image_id in image_id_set:
+    for image_id in image_id_set | removed_image_ids:
         LOCAL_IMAGE_PATHS.pop(image_id, None)
 
 
 def remove_image_from_matching_sessions(root_path: Path, image_id: str):
-    remove_images_from_matching_sessions(root_path, [image_id])
+    session_image = next(
+        (
+            image
+            for session in LOCAL_SESSIONS.values()
+            if session.root_path == root_path.expanduser().resolve()
+            for image in session.images
+            if image.id == image_id
+        ),
+        None,
+    )
+    if session_image is not None:
+        remove_images_from_matching_sessions(root_path, [session_image])
+        return
+
+    LOCAL_IMAGE_PATHS.pop(image_id, None)
 
 
 def log_cache_operation_warning(message: str, exc: Exception):

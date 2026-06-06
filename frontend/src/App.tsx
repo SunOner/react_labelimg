@@ -2,6 +2,7 @@ import {
   startTransition,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
 } from 'react'
@@ -506,6 +507,7 @@ function App() {
   } | null>(null)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [pathOpenDraft, setPathOpenDraft] = useState('/datasets')
+  const [fileSearchQuery, setFileSearchQuery] = useState('')
   const [armedDeleteImageId, setArmedDeleteImageId] = useState<string | null>(null)
   const [isDeletingCurrentImage, setIsDeletingCurrentImage] = useState(false)
   const [duplicateSearchThresholdDraft, setDuplicateSearchThresholdDraft] =
@@ -582,6 +584,27 @@ function App() {
       : images.length > 0
         ? 0
         : -1
+  const normalizedFileSearchQuery = fileSearchQuery.trim().toLowerCase()
+  const fileListItems = useMemo(() => {
+    const allItems = images.map((entry, index) => ({
+      image: entry,
+      sourceIndex: index,
+    }))
+
+    if (!normalizedFileSearchQuery) {
+      return allItems
+    }
+
+    const searchTerms = normalizedFileSearchQuery.split(/\s+/).filter(Boolean)
+    return allItems.filter(({ image: entry }) => {
+      const searchablePath = `${entry.relativePath} ${entry.name}`.toLowerCase()
+      return searchTerms.every((term) => searchablePath.includes(term))
+    })
+  }, [images, normalizedFileSearchQuery])
+  const hasActiveFileSearch = normalizedFileSearchQuery.length > 0
+  const fileSearchResultText = hasActiveFileSearch
+    ? `${fileListItems.length.toLocaleString()}/${images.length.toLocaleString()}`
+    : images.length.toLocaleString()
   const currentEntry =
     currentImageIndex >= 0
       ? (images[currentImageIndex] ?? null)
@@ -897,6 +920,10 @@ function App() {
 
   useEffect(() => {
     currentSessionIdRef.current = currentSessionId
+  }, [currentSessionId])
+
+  useEffect(() => {
+    setFileSearchQuery('')
   }, [currentSessionId])
 
   useEffect(() => {
@@ -3457,6 +3484,7 @@ function App() {
   const resolvePreferredImageRelativePathAfterDeleting = (
     deletedImageIds: Set<string>,
     preferredImageRelativePath?: string | null,
+    candidateImages: ImageEntry[] = images,
   ) => {
     if (preferredImageRelativePath !== undefined) {
       return preferredImageRelativePath
@@ -3467,25 +3495,34 @@ function App() {
     }
 
     const currentIndex = currentEntry
-      ? images.findIndex((entry) => entry.id === currentEntry.id)
+      ? candidateImages.findIndex((entry) => entry.id === currentEntry.id)
       : -1
+    const searchImages = currentIndex >= 0 ? candidateImages : images
+    const searchIndex =
+      currentIndex >= 0
+        ? currentIndex
+        : currentEntry
+          ? searchImages.findIndex((entry) => entry.id === currentEntry.id)
+          : -1
 
-    for (let index = currentIndex + 1; index < images.length; index += 1) {
-      const candidate = images[index]
+    for (let index = searchIndex + 1; index < searchImages.length; index += 1) {
+      const candidate = searchImages[index]
       if (candidate && !deletedImageIds.has(candidate.id)) {
         return candidate.relativePath
       }
     }
 
-    for (let index = currentIndex - 1; index >= 0; index -= 1) {
-      const candidate = images[index]
+    for (let index = searchIndex - 1; index >= 0; index -= 1) {
+      const candidate = searchImages[index]
       if (candidate && !deletedImageIds.has(candidate.id)) {
         return candidate.relativePath
       }
     }
 
     return (
-      images.find((entry) => !deletedImageIds.has(entry.id))?.relativePath ?? null
+      searchImages.find((entry) => !deletedImageIds.has(entry.id))?.relativePath ??
+      images.find((entry) => !deletedImageIds.has(entry.id))?.relativePath ??
+      null
     )
   }
 
@@ -3508,10 +3545,16 @@ function App() {
 
     await flushPendingAnnotationSaves(imagesToDelete.map((image) => image.id))
 
+    const currentDeleteCandidateImages = fileListItems.some(
+      (entry) => entry.image.id === currentEntry?.id,
+    )
+      ? fileListItems.map((entry) => entry.image)
+      : images
     const nextPreferredImageRelativePath =
       resolvePreferredImageRelativePathAfterDeleting(
         new Set(imagesToDelete.map((image) => image.id)),
         preferredImageRelativePath,
+        currentDeleteCandidateImages,
       )
 
     const session =
@@ -3844,9 +3887,21 @@ function App() {
       const removedImageIds = [...imageIdSetRef.current].filter(
         (imageId) => !nextImageIdSet.has(imageId),
       )
+      const removedImageIdSet = new Set(removedImageIds)
+      const currentImageId = currentImageEntry?.id ?? null
+      const preferredEntry =
+        preferredImageIndex >= 0 ? (nextImages[preferredImageIndex] ?? null) : null
+      const retainedCurrentEntry = currentImageId
+        ? (nextImages.find((entry) => entry.id === currentImageId) ?? null)
+        : null
+      const nextCurrentEntry =
+        preferredEntry ?? retainedCurrentEntry ?? nextImages[0] ?? null
+      const didCurrentImageChange = currentImageId !== (nextCurrentEntry?.id ?? null)
 
       for (const imageId of removedImageIds) {
         clearScheduledAnnotationSave(imageId)
+        delete pendingAnnotationLoadsRef.current[imageId]
+        delete annotationLoadStateRef.current[imageId]
       }
       cancelPendingImageLoads(removedImageIds)
 
@@ -3855,15 +3910,11 @@ function App() {
       setCurrentSessionRootPath(session.rootPath ?? null)
 
       if (
-        preferredImageRelativePath &&
-        preferredImageIndex >= 0
+        !preferredImageRelativePath ||
+        preferredImageIndex >= 0 ||
+        nextImages.length === 0
       ) {
-        if (
-          pendingPreferredImageRelativePathRef.current === preferredImageRelativePath
-        ) {
-          pendingPreferredImageRelativePathRef.current = null
-        }
-        setCurrentImageEntry(nextImages[preferredImageIndex] ?? null)
+        pendingPreferredImageRelativePathRef.current = null
       }
 
       annotationLoadStateRef.current = Object.fromEntries(
@@ -3888,17 +3939,7 @@ function App() {
             ...entry,
           }))
         })
-        setCurrentImageEntry((current) => {
-          if (!current) {
-            return nextImages[0] ?? null
-          }
-
-          return (
-            nextImages.find((entry) => entry.id === current.id) ??
-            nextImages[0] ??
-            null
-          )
-        })
+        setCurrentImageEntry(nextCurrentEntry)
         setImageResources((current) =>
           Object.fromEntries(
             Object.entries(current).filter(([imageId]) => nextImageIdSet.has(imageId)),
@@ -3911,6 +3952,19 @@ function App() {
         )
         setSessionLabel(nextSessionLabel)
         setSessionError(null)
+        if (didCurrentImageChange) {
+          setSelectedId(null)
+          updateDrawStart(null)
+          setDraftRect(null)
+        }
+        if (armedDeleteImageId && !nextImageIdSet.has(armedDeleteImageId)) {
+          clearDeleteImageArm()
+        }
+        if (removedImageIdSet.size > 0) {
+          setDuplicateSearchSelectedImageIds((current) =>
+            current.filter((imageId) => nextImageIdSet.has(imageId)),
+          )
+        }
       })
       return
     }
@@ -4672,11 +4726,49 @@ function App() {
                     </div>
                   </div>
                   {images.length > 0 ? (
-                    <VirtualFileList
-                      images={images}
-                      currentIndex={currentImageIndex}
-                      onSelectIndex={selectImageIndex}
-                    />
+                    <>
+                      <div className="dataset-file-search" role="search">
+                        <div className="dataset-file-search-header">
+                          <span>Files</span>
+                          <strong aria-live="polite">{fileSearchResultText}</strong>
+                        </div>
+                        <div className="dataset-file-search-control">
+                          <input
+                            className="dataset-file-search-input"
+                            type="search"
+                            value={fileSearchQuery}
+                            onChange={(event) =>
+                              setFileSearchQuery(event.target.value)
+                            }
+                            placeholder="Search files"
+                            aria-label="Search files"
+                            autoComplete="off"
+                            spellCheck={false}
+                          />
+                          {fileSearchQuery ? (
+                            <AppButton
+                              variant="menu-trigger"
+                              className="dataset-file-search-clear"
+                              onClick={() => setFileSearchQuery('')}
+                              aria-label="Clear file search"
+                              title="Clear file search"
+                            >
+                              Clear
+                            </AppButton>
+                          ) : null}
+                        </div>
+                      </div>
+                      {fileListItems.length > 0 ? (
+                        <VirtualFileList
+                          entries={fileListItems}
+                          currentImageId={currentEntry?.id ?? null}
+                          scrollResetKey={`${normalizedFileSearchQuery}:${fileListItems.length}`}
+                          onSelectIndex={selectImageIndex}
+                        />
+                      ) : (
+                        <p className="file-list-empty">No matching files</p>
+                      )}
+                    </>
                   ) : null}
                   {isDatasetSession && currentEntry ? (
                     <AppButton
