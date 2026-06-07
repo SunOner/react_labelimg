@@ -41,17 +41,52 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
 
-      - name: Build and publish image
+      - name: Build image for smoke test
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          tags: labelimg-next:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+
+          container_id="$(docker run --rm -d -p 127.0.0.1:18000:8000 labelimg-next:ci)"
+
+          cleanup() {
+            docker rm -f "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:18000/api/health >/tmp/labelimg-health.json; then
+              grep -q '"status":"ok"' /tmp/labelimg-health.json
+              curl -fsS http://127.0.0.1:18000/ >/tmp/labelimg-index.html
+              grep -qi '<!doctype html' /tmp/labelimg-index.html
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs "$container_id"
+          exit 1
+
+      - name: Build and publish image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

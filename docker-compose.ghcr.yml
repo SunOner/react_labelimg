@@ -1,0 +1,19 @@
+services:
+  labelimg-next:
+    image: ghcr.io/sunoner/react_labelimg:${LABELIMG_IMAGE_TAG:-main}
+    pull_policy: always
+    ports:
+      - "${LABELIMG_PORT:-8000}:8000"
+    environment:
+      LABELIMG_DISABLE_FILE_DIALOGS: "1"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+      - type: bind
+        source: ./models/plugins
+        target: /app/models/plugins
+      - type: bind
+        source: ${LABELIMG_DATASETS_DIR:-./datasets}
+        target: /datasets
+    restart: unless-stopped

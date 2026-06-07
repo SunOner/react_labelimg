@@ -50,6 +50,7 @@ tmp.*
 ehthumbs.db
 Thumbs.db
 /data/plugin-runtime-sources
-/models/plugins
+/models/plugins/*
+!/models/plugins/.gitkeep
 /datasets/*
 !/datasets/.gitkeep

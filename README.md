@@ -4,22 +4,59 @@
 
 ## Start
 
-### Docker
+### Docker: prebuilt image
+
+Use the published GitHub Container Registry image when you only want to run the
+app and do not need to rebuild it from source.
+
+```bash
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
+cp .env.example .env
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up
+```
+
+On Windows PowerShell:
+
+```powershell
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
+Copy-Item .env.example .env
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up
+```
+
+The default image tag is `main`:
+
+```bash
+ghcr.io/sunoner/react_labelimg:main
+```
+
+The Docker workflow publishes `main` and `latest` for default branch builds.
+Tagged releases such as `v0.1.0` publish version tags such as `0.1.0` and
+`0.1`.
+
+### Docker: build from source
 
 Docker is the simplest way to run the app on Windows and Ubuntu. It builds the
 React frontend, installs the FastAPI backend dependencies and serves everything
 from one container.
 
-Copy the example environment file and set the host folder that contains your
-images:
+Clone the repository, copy the example environment file and set the host folder
+that contains your images:
 
 ```bash
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
 cp .env.example .env
 ```
 
 On Windows PowerShell:
 
 ```powershell
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
 Copy-Item .env.example .env
 ```
 
@@ -51,14 +88,11 @@ Stop the app:
 docker compose down
 ```
 
-Build a release image manually:
+Build a local image manually:
 
 ```bash
-docker build -t labelimg-next:0.1.0 .
+docker build -t labelimg-next:local .
 ```
-
-Tagged GitHub releases such as `v0.1.0` are also built by the Docker workflow
-and published to GitHub Container Registry as `ghcr.io/<owner>/<repo>:0.1.0`.
 
 ### Local Python/Node
 
