@@ -84,6 +84,8 @@ type ViewportTool = 'draw' | 'new-box' | 'sam-click' | 'sam-box'
 type SidebarView = 'main' | 'info' | 'plugins'
 type ProjectInfoStatus = 'idle' | 'loading' | 'error'
 
+const SIDEBAR_TAB_VIEWS: readonly SidebarView[] = ['main', 'plugins']
+
 type PendingImageLoad = {
   promise: Promise<void>
   cancel: () => void
@@ -176,6 +178,13 @@ const HOTKEY_ACTIONS = [
     title: 'Next image',
     description: 'Go to the next image',
     defaultBindings: ['D', 'ArrowRight'],
+  },
+  {
+    id: 'switchSidebarTab',
+    section: 'Navigation',
+    title: 'Switch sidebar tab',
+    description: 'Switch between Main Menu and Plugins',
+    defaultBindings: ['Tab'],
   },
   {
     id: 'deleteSelection',
@@ -2950,6 +2959,13 @@ function App() {
     }
   }
 
+  const selectNextSidebarTab = () => {
+    const currentIndex = SIDEBAR_TAB_VIEWS.indexOf(sidebarView)
+    const nextIndex =
+      currentIndex >= 0 ? (currentIndex + 1) % SIDEBAR_TAB_VIEWS.length : 0
+    selectSidebarView(SIDEBAR_TAB_VIEWS[nextIndex] ?? 'main')
+  }
+
   const openProjectInfo = () => {
     setOpenMenu(null)
     setIsSidebarVisible(true)
@@ -4295,6 +4311,16 @@ function App() {
     if (matchesHotkeyAction(event, 'nextImage')) {
       event.preventDefault()
       goNextImage()
+      return
+    }
+
+    if (matchesHotkeyAction(event, 'switchSidebarTab')) {
+      if (!isSidebarVisible) {
+        return
+      }
+
+      event.preventDefault()
+      selectNextSidebarTab()
     }
   })
 

@@ -2390,7 +2390,24 @@
   display: grid;
   gap: 4px;
   max-height: min(22svh, 220px);
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.34) rgba(255, 255, 255, 0.04);
+}
+
+.current-box-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.current-box-list::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.current-box-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.28);
+  border: 2px solid rgba(5, 5, 5, 0.92);
 }
 
 .current-box-row {
