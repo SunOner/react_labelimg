@@ -2626,6 +2626,9 @@ def delete_local_session_images(session: LocalSession, image_ids: list[str]):
         delete_session_image_files(image)
 
     remove_images_from_matching_sessions(session.root_path, images_to_delete)
+    deleted_image_ids = {image.id for image in images_to_delete}
+    prune_duplicate_search_jobs_for_deleted_images(session.root_path, deleted_image_ids)
+    remove_pending_fingerprint_warmup_images(deleted_image_ids)
     CACHE_STORE.save_dataset_manifest(
         session.root_path,
         session.label,
@@ -2705,6 +2708,15 @@ def remove_images_from_matching_sessions(
 
     for image_id in image_id_set | removed_image_ids:
         LOCAL_IMAGE_PATHS.pop(image_id, None)
+
+
+def remove_pending_fingerprint_warmup_images(image_ids: set[str]):
+    if not image_ids:
+        return
+
+    with FINGERPRINT_WARMUP_CONDITION:
+        for image_id in image_ids:
+            FINGERPRINT_WARMUP_PENDING.pop(image_id, None)
 
 
 def remove_image_from_matching_sessions(root_path: Path, image_id: str):
@@ -3208,6 +3220,12 @@ def run_duplicate_search_job(
                                 return
                             active_job.phase = "comparing"
                             active_job.processed_pairs = processed_pairs
+                            if not is_duplicate_search_match_active(
+                                active_job.session_id,
+                                left_image.id,
+                                current_image.id,
+                            ):
+                                continue
                             active_job.matches.append(
                                 {
                                     "id": uuid4().hex,
@@ -3320,6 +3338,47 @@ def filter_duplicate_search_matches_for_active_session(
         if match.get("leftImageId") in active_image_ids
         and match.get("rightImageId") in active_image_ids
     ]
+
+
+def prune_duplicate_search_jobs_for_deleted_images(
+    root_path: Path,
+    deleted_image_ids: set[str],
+):
+    if not deleted_image_ids:
+        return
+
+    normalized_root_path = str(root_path.expanduser().resolve())
+    with DUPLICATE_SEARCH_LOCK:
+        for job in DUPLICATE_SEARCH_JOBS.values():
+            if job.root_path != normalized_root_path:
+                continue
+
+            next_matches = [
+                match
+                for match in job.matches
+                if match.get("leftImageId") not in deleted_image_ids
+                and match.get("rightImageId") not in deleted_image_ids
+            ]
+            if len(next_matches) == len(job.matches):
+                continue
+
+            job.matches = next_matches
+            job.revision += 1
+
+
+def is_duplicate_search_match_active(
+    session_id: str,
+    left_image_id: str,
+    right_image_id: str,
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        return False
+
+    return (
+        left_image_id in session.images_by_id
+        and right_image_id in session.images_by_id
+    )
 
 
 def build_duplicate_image_signature(image_path: Path):

@@ -338,6 +338,12 @@ type DuplicateSearchHoverPreview = DuplicateSearchPreviewImage & {
   pointerY: number
 }
 
+type DuplicateSearchBulkDeletePlan = {
+  selectedImageIds: string[]
+  deleteImageIds: string[]
+  keptImageIds: string[]
+}
+
 const CACHE_DB_ACTION_ITEMS: Array<{
   action: CacheDbAction
   title: string
@@ -817,6 +823,26 @@ function App() {
       imagesById.has(match.leftImageId) && imagesById.has(match.rightImageId)
     )
   })
+  const duplicateSearchVisibleImageIdSet = buildDuplicateSearchImageIdSet(
+    visibleDuplicateSearchMatches,
+  )
+  const activeDuplicateSearchSelectedImageIds =
+    duplicateSearchSelectedImageIds.filter(
+      (imageId) =>
+        imagesById.has(imageId) && duplicateSearchVisibleImageIdSet.has(imageId),
+    )
+  const duplicateSearchBulkDeletePlan = buildDuplicateSearchBulkDeletePlan(
+    activeDuplicateSearchSelectedImageIds,
+    visibleDuplicateSearchMatches,
+    imagesById,
+    currentEntry?.id ?? null,
+  )
+  const duplicateSearchSuggestedDeleteImageIds =
+    buildSuggestedDuplicateSearchDeleteImageIds(
+      visibleDuplicateSearchMatches,
+      imagesById,
+      currentEntry?.id ?? null,
+    )
   const duplicateSearchPageCount = Math.max(
     1,
     Math.ceil(visibleDuplicateSearchMatches.length / DUPLICATE_SEARCH_PAGE_SIZE),
@@ -2286,11 +2312,25 @@ function App() {
   }, [duplicateSearchCurrentPage, duplicateSearchPage])
 
   useEffect(() => {
+    const activeImageIds = imageIdSetRef.current
+    const visibleImageIds = new Set<string>()
+    for (const match of duplicateSearchMatches) {
+      if (
+        activeImageIds.has(match.leftImageId) &&
+        activeImageIds.has(match.rightImageId)
+      ) {
+        visibleImageIds.add(match.leftImageId)
+        visibleImageIds.add(match.rightImageId)
+      }
+    }
+
     setDuplicateSearchSelectedImageIds((current) => {
-      const next = current.filter((imageId) => imageIdSetRef.current.has(imageId))
+      const next = current.filter(
+        (imageId) => activeImageIds.has(imageId) && visibleImageIds.has(imageId),
+      )
       return next.length === current.length ? current : next
     })
-  }, [images])
+  }, [duplicateSearchMatches, images])
 
   useEffect(() => {
     const jobId = duplicateSearchRuntime.jobId
@@ -3810,6 +3850,11 @@ function App() {
 
     try {
       await deleteSessionImageById(imageId, preferredImageRelativePath)
+      const deletedImageIds = new Set([imageId])
+      setDuplicateSearchHoverPreview(null)
+      setDuplicateSearchMatches((current) =>
+        filterDuplicateSearchMatchesAfterDeleting(current, deletedImageIds),
+      )
       setDuplicateSearchSelectedImageIds((current) =>
         current.filter((selectedImageId) => selectedImageId !== imageId),
       )
@@ -3850,10 +3895,13 @@ function App() {
       return
     }
 
-    const candidateImageIds = [...new Set(imageIds)].filter((imageId) =>
-      imagesById.has(imageId),
+    const deletePlan = buildDuplicateSearchBulkDeletePlan(
+      imageIds,
+      visibleDuplicateSearchMatches,
+      imagesById,
+      currentEntry?.id ?? null,
     )
-    if (candidateImageIds.length === 0) {
+    if (deletePlan.deleteImageIds.length === 0) {
       setDuplicateSearchSelectedImageIds([])
       return
     }
@@ -3862,17 +3910,31 @@ function App() {
     setDuplicateSearchError(null)
 
     try {
-      const deletedImages = await deleteSessionImagesById(candidateImageIds)
+      const deletedImages = await deleteSessionImagesById(deletePlan.deleteImageIds)
       const deletedImageIdSet = new Set(deletedImages.map((image) => image.id))
+      const handledImageIdSet = new Set([
+        ...deletePlan.keptImageIds,
+        ...deletedImageIdSet,
+      ])
+      setDuplicateSearchHoverPreview(null)
+      setDuplicateSearchMatches((current) =>
+        filterDuplicateSearchMatchesAfterDeleting(current, deletedImageIdSet),
+      )
       setDuplicateSearchSelectedImageIds((current) =>
-        current.filter((imageId) => !deletedImageIdSet.has(imageId)),
+        current.filter((imageId) => !handledImageIdSet.has(imageId)),
       )
 
       if (deletedImages.length === 1) {
-        pushToast(`Deleted ${deletedImages[0].relativePath}.`, 'success')
+        const keptCopy =
+          deletePlan.keptImageIds.length > 0 ? ' Kept one group original.' : ''
+        pushToast(`Deleted ${deletedImages[0].relativePath}.${keptCopy}`, 'success')
       } else {
+        const keptCopy =
+          deletePlan.keptImageIds.length > 0
+            ? ` Kept ${deletePlan.keptImageIds.length.toLocaleString()} group originals.`
+            : ''
         pushToast(
-          `Deleted ${deletedImages.length.toLocaleString()} images.`,
+          `Deleted ${deletedImages.length.toLocaleString()} images.${keptCopy}`,
           'success',
         )
       }
@@ -4755,16 +4817,6 @@ function App() {
           <div className="menu-root">
             <AppButton
               variant="menu-trigger"
-              isActive={isSidebarVisible && sidebarView === 'info'}
-              onClick={openProjectInfo}
-            >
-              Info
-            </AppButton>
-          </div>
-
-          <div className="menu-root">
-            <AppButton
-              variant="menu-trigger"
               isActive={openMenu === 'plugins'}
               onClick={() =>
                 setOpenMenu((current) => (current === 'plugins' ? null : 'plugins'))
@@ -4817,6 +4869,16 @@ function App() {
                 />
               </div>
             ) : null}
+          </div>
+
+          <div className="menu-root">
+            <AppButton
+              variant="menu-trigger"
+              isActive={isSidebarVisible && sidebarView === 'info'}
+              onClick={openProjectInfo}
+            >
+              Info
+            </AppButton>
           </div>
 
         </nav>
@@ -4884,14 +4946,6 @@ function App() {
                 onClick={() => selectSidebarView('main')}
               >
                 Main Menu
-              </AppButton>
-              <AppButton
-                variant="chip"
-                isActive={sidebarView === 'info'}
-                className="panel-sidebar-tab"
-                onClick={() => selectSidebarView('info')}
-              >
-                Info
               </AppButton>
               <AppButton
                 variant="chip"
@@ -5834,17 +5888,35 @@ function App() {
               {isDatasetSession ? (
                 <div className="duplicate-search-selection-bar">
                   <span className="duplicate-search-selection-copy">
-                    {duplicateSearchSelectedImageIds.length > 0
-                      ? `${duplicateSearchSelectedImageIds.length.toLocaleString()} images selected for bulk delete`
+                    {activeDuplicateSearchSelectedImageIds.length > 0
+                      ? duplicateSearchBulkDeletePlan.keptImageIds.length > 0
+                        ? `${activeDuplicateSearchSelectedImageIds.length.toLocaleString()} selected; ${duplicateSearchBulkDeletePlan.deleteImageIds.length.toLocaleString()} will be deleted and ${duplicateSearchBulkDeletePlan.keptImageIds.length.toLocaleString()} kept as originals.`
+                        : `${activeDuplicateSearchSelectedImageIds.length.toLocaleString()} images selected for bulk delete`
                       : 'Mark duplicate images with the checkbox to delete them in one batch.'}
                   </span>
                   <div className="duplicate-search-selection-actions">
                     <AppButton
                       variant="ghost"
                       className="duplicate-search-selection-button"
+                      onClick={() => {
+                        setDuplicateSearchError(null)
+                        setDuplicateSearchSelectedImageIds(
+                          duplicateSearchSuggestedDeleteImageIds,
+                        )
+                      }}
+                      disabled={
+                        duplicateSearchSuggestedDeleteImageIds.length === 0 ||
+                        isDuplicateSearchDeleteBusy
+                      }
+                    >
+                      Select copies
+                    </AppButton>
+                    <AppButton
+                      variant="ghost"
+                      className="duplicate-search-selection-button"
                       onClick={() => setDuplicateSearchSelectedImageIds([])}
                       disabled={
-                        duplicateSearchSelectedImageIds.length === 0 ||
+                        activeDuplicateSearchSelectedImageIds.length === 0 ||
                         isDuplicateSearchDeleteBusy
                       }
                     >
@@ -5854,39 +5926,49 @@ function App() {
                       variant="ghost"
                       className="duplicate-search-selection-button is-danger"
                       onClick={() => {
-                        const selectedImageIds = duplicateSearchSelectedImageIds.filter(
-                          (imageId) => imagesById.has(imageId),
-                        )
-                        if (selectedImageIds.length === 0) {
+                        const deletePlan = duplicateSearchBulkDeletePlan
+                        if (deletePlan.selectedImageIds.length === 0) {
                           setDuplicateSearchSelectedImageIds([])
                           return
                         }
 
-                        const selectedCount = selectedImageIds.length
+                        if (deletePlan.deleteImageIds.length === 0) {
+                          setDuplicateSearchError(
+                            'Keep at least one image from each duplicate group.',
+                          )
+                          return
+                        }
+
+                        const deleteCount = deletePlan.deleteImageIds.length
+                        const keptCount = deletePlan.keptImageIds.length
+                        const keptCopy =
+                          keptCount > 0
+                            ? ` ${keptCount.toLocaleString()} selected image${keptCount === 1 ? '' : 's'} will be kept so every duplicate group keeps an original.`
+                            : ''
                         setConfirmDialogState({
                           title:
-                            selectedCount === 1
+                            deleteCount === 1
                               ? 'Delete selected image?'
-                              : `Delete ${selectedCount.toLocaleString()} selected images?`,
+                              : `Delete ${deleteCount.toLocaleString()} selected images?`,
                           message:
-                            selectedCount === 1
-                              ? 'The selected image and its annotation sidecar will be removed from the dataset.'
-                              : `${selectedCount.toLocaleString()} selected images and their annotation sidecars will be removed from the dataset.`,
+                            deleteCount === 1
+                              ? `The selected image and its annotation sidecar will be removed from the dataset.${keptCopy}`
+                              : `${deleteCount.toLocaleString()} selected images and their annotation sidecars will be removed from the dataset.${keptCopy}`,
                           confirmLabel:
-                            selectedCount === 1
+                            deleteCount === 1
                               ? 'Delete image'
-                              : `Delete ${selectedCount.toLocaleString()} images`,
+                              : `Delete ${deleteCount.toLocaleString()} images`,
                           confirmTone: 'danger',
                           onConfirm: () => {
                             setConfirmDialogState(null)
                             void handleDeleteSelectedDuplicateSearchImages(
-                              selectedImageIds,
+                              deletePlan.deleteImageIds,
                             )
                           },
                         })
                       }}
                       disabled={
-                        duplicateSearchSelectedImageIds.length === 0 ||
+                        duplicateSearchBulkDeletePlan.deleteImageIds.length === 0 ||
                         isDuplicateSearchDeleteBusy
                       }
                     >
@@ -6162,10 +6244,10 @@ function App() {
                       <span>
                         of {visibleDuplicateSearchMatches.length.toLocaleString()} pairs
                       </span>
-                      {duplicateSearchSelectedImageIds.length > 0 ? (
+                      {activeDuplicateSearchSelectedImageIds.length > 0 ? (
                         <span>
                           · Selected{' '}
-                          {duplicateSearchSelectedImageIds.length.toLocaleString()}{' '}
+                          {activeDuplicateSearchSelectedImageIds.length.toLocaleString()}{' '}
                           images
                         </span>
                       ) : null}
@@ -7904,6 +7986,213 @@ function sortDuplicateSearchMatches(matches: LocalDuplicateSearchMatch[]) {
 
     return left.rightRelativePath.localeCompare(right.rightRelativePath)
   })
+}
+
+function buildDuplicateSearchImageIdSet(matches: LocalDuplicateSearchMatch[]) {
+  const imageIds = new Set<string>()
+  for (const match of matches) {
+    imageIds.add(match.leftImageId)
+    imageIds.add(match.rightImageId)
+  }
+  return imageIds
+}
+
+function buildDuplicateSearchBulkDeletePlan(
+  imageIds: string[],
+  matches: LocalDuplicateSearchMatch[],
+  imagesById: ReadonlyMap<string, ImageEntry>,
+  preferredImageId: string | null,
+): DuplicateSearchBulkDeletePlan {
+  const selectedImageIds = [...new Set(imageIds)].filter((imageId) =>
+    imagesById.has(imageId),
+  )
+  const deleteImageIdSet = new Set(selectedImageIds)
+  const keptImageIdSet = new Set<string>()
+
+  for (const groupImageIds of buildDuplicateSearchImageGroups(matches, imagesById)) {
+    const selectedGroupImageIds = groupImageIds.filter((imageId) =>
+      deleteImageIdSet.has(imageId),
+    )
+    if (selectedGroupImageIds.length !== groupImageIds.length) {
+      continue
+    }
+
+    const keeperImageId = chooseDuplicateSearchKeeper(
+      groupImageIds,
+      imagesById,
+      preferredImageId,
+    )
+    if (keeperImageId) {
+      deleteImageIdSet.delete(keeperImageId)
+      keptImageIdSet.add(keeperImageId)
+    }
+  }
+
+  return {
+    selectedImageIds,
+    deleteImageIds: selectedImageIds.filter((imageId) =>
+      deleteImageIdSet.has(imageId),
+    ),
+    keptImageIds: selectedImageIds.filter((imageId) =>
+      keptImageIdSet.has(imageId),
+    ),
+  }
+}
+
+function buildSuggestedDuplicateSearchDeleteImageIds(
+  matches: LocalDuplicateSearchMatch[],
+  imagesById: ReadonlyMap<string, ImageEntry>,
+  preferredImageId: string | null,
+) {
+  const imageIdsToDelete: string[] = []
+
+  for (const groupImageIds of buildDuplicateSearchImageGroups(matches, imagesById)) {
+    const keeperImageId = chooseDuplicateSearchKeeper(
+      groupImageIds,
+      imagesById,
+      preferredImageId,
+    )
+    for (const imageId of groupImageIds) {
+      if (imageId !== keeperImageId) {
+        imageIdsToDelete.push(imageId)
+      }
+    }
+  }
+
+  return imageIdsToDelete
+}
+
+function buildDuplicateSearchImageGroups(
+  matches: LocalDuplicateSearchMatch[],
+  imagesById: ReadonlyMap<string, ImageEntry>,
+) {
+  const adjacency = new Map<string, Set<string>>()
+
+  for (const match of matches) {
+    if (!imagesById.has(match.leftImageId) || !imagesById.has(match.rightImageId)) {
+      continue
+    }
+
+    addDuplicateSearchGraphEdge(adjacency, match.leftImageId, match.rightImageId)
+    addDuplicateSearchGraphEdge(adjacency, match.rightImageId, match.leftImageId)
+  }
+
+  const visitedImageIds = new Set<string>()
+  const groups: string[][] = []
+
+  for (const imageId of adjacency.keys()) {
+    if (visitedImageIds.has(imageId)) {
+      continue
+    }
+
+    const groupImageIds: string[] = []
+    const pendingImageIds = [imageId]
+    visitedImageIds.add(imageId)
+
+    while (pendingImageIds.length > 0) {
+      const currentImageId = pendingImageIds.pop()
+      if (!currentImageId) {
+        continue
+      }
+
+      groupImageIds.push(currentImageId)
+      const neighborImageIds = adjacency.get(currentImageId)
+      if (!neighborImageIds) {
+        continue
+      }
+
+      for (const neighborImageId of neighborImageIds) {
+        if (visitedImageIds.has(neighborImageId)) {
+          continue
+        }
+
+        visitedImageIds.add(neighborImageId)
+        pendingImageIds.push(neighborImageId)
+      }
+    }
+
+    if (groupImageIds.length > 1) {
+      groups.push(groupImageIds)
+    }
+  }
+
+  return groups
+}
+
+function addDuplicateSearchGraphEdge(
+  adjacency: Map<string, Set<string>>,
+  sourceImageId: string,
+  targetImageId: string,
+) {
+  const neighbors = adjacency.get(sourceImageId)
+  if (neighbors) {
+    neighbors.add(targetImageId)
+    return
+  }
+
+  adjacency.set(sourceImageId, new Set([targetImageId]))
+}
+
+function chooseDuplicateSearchKeeper(
+  imageIds: string[],
+  imagesById: ReadonlyMap<string, ImageEntry>,
+  preferredImageId: string | null,
+) {
+  return [...imageIds].sort((leftImageId, rightImageId) =>
+    compareDuplicateSearchKeeperCandidates(
+      leftImageId,
+      rightImageId,
+      imagesById,
+      preferredImageId,
+    ),
+  )[0]
+}
+
+function compareDuplicateSearchKeeperCandidates(
+  leftImageId: string,
+  rightImageId: string,
+  imagesById: ReadonlyMap<string, ImageEntry>,
+  preferredImageId: string | null,
+) {
+  const leftEntry = imagesById.get(leftImageId) ?? null
+  const rightEntry = imagesById.get(rightImageId) ?? null
+  const annotationCountDelta =
+    (rightEntry?.annotationCount ?? 0) - (leftEntry?.annotationCount ?? 0)
+  if (annotationCountDelta !== 0) {
+    return annotationCountDelta
+  }
+
+  if (preferredImageId) {
+    const leftIsPreferred = leftImageId === preferredImageId
+    const rightIsPreferred = rightImageId === preferredImageId
+    if (leftIsPreferred !== rightIsPreferred) {
+      return leftIsPreferred ? -1 : 1
+    }
+  }
+
+  return (leftEntry?.relativePath ?? leftImageId).localeCompare(
+    rightEntry?.relativePath ?? rightImageId,
+    undefined,
+    {
+      numeric: true,
+      sensitivity: 'base',
+    },
+  )
+}
+
+function filterDuplicateSearchMatchesAfterDeleting(
+  matches: LocalDuplicateSearchMatch[],
+  deletedImageIds: ReadonlySet<string>,
+) {
+  if (deletedImageIds.size === 0) {
+    return matches
+  }
+
+  return matches.filter(
+    (match) =>
+      !deletedImageIds.has(match.leftImageId) &&
+      !deletedImageIds.has(match.rightImageId),
+  )
 }
 
 function formatDuplicateSimilarity(value: number) {
