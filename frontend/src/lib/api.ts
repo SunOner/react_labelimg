@@ -1,5 +1,17 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
 
+export class ApiError extends Error {
+  readonly status: number
+  readonly detail: string
+
+  constructor(status: number, detail: string) {
+    super(detail || `API request failed: ${status}`)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
 export type ApiHealth = {
   status: string
   service: string
@@ -667,9 +679,11 @@ export async function fetchLocalSessionInfo(sessionId: string) {
 export async function fetchLocalSessionNotifications(
   sessionId: string,
   afterSequence = 0,
+  signal?: AbortSignal,
 ) {
   return requestJson<LocalSessionNotificationsResponse>(
     `/api/local/sessions/${sessionId}/notifications?after_sequence=${afterSequence}`,
+    { signal },
   )
 }
 
@@ -798,7 +812,7 @@ async function requestJson<T>(path: string, init?: RequestJsonOptions) {
 
   if (!response.ok) {
     const detail = await readErrorDetail(response)
-    throw new Error(detail || `API request failed: ${response.status}`)
+    throw new ApiError(response.status, detail)
   }
 
   return (await response.json()) as T

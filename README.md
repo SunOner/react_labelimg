@@ -27,6 +27,16 @@ docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up
 ```
 
+On Windows Command Prompt:
+
+```bat
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
+copy .env.example .env
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up
+```
+
 The default image tag is `main`:
 
 ```bash
@@ -58,6 +68,14 @@ On Windows PowerShell:
 git clone https://github.com/SunOner/react_labelimg.git
 cd react_labelimg
 Copy-Item .env.example .env
+```
+
+On Windows Command Prompt:
+
+```bat
+git clone https://github.com/SunOner/react_labelimg.git
+cd react_labelimg
+copy .env.example .env
 ```
 
 Edit `.env` if your datasets are not in `./datasets`:

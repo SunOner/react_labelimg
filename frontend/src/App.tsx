@@ -14,6 +14,7 @@ import { AppButton } from './components/ui/AppButton'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { MenuItemButton } from './components/ui/MenuItemButton'
 import {
+  ApiError,
   buildLocalImageUrl,
   fetchCacheDbSummary,
   deleteLocalSessionImage,
@@ -575,6 +576,9 @@ function App() {
   const imageResourcesRef = useRef<Record<string, ImageResource>>({})
   const annotationsByImageRef = useRef<Record<string, Annotation[]>>({})
   const currentSessionIdRef = useRef<string | null>(null)
+  const pendingCurrentSessionStateRef = useRef<{
+    sessionId: string | null
+  } | null>(null)
   const imageIdSetRef = useRef<Set<string>>(new Set())
   const pendingLoadsRef = useRef<Record<string, PendingImageLoad>>({})
   const pendingAnnotationLoadsRef = useRef<Record<string, Promise<void>>>({})
@@ -1148,7 +1152,16 @@ function App() {
   })
 
   useEffect(() => {
+    const pendingSessionState = pendingCurrentSessionStateRef.current
+    if (
+      pendingSessionState &&
+      pendingSessionState.sessionId !== currentSessionId
+    ) {
+      return
+    }
+
     currentSessionIdRef.current = currentSessionId
+    pendingCurrentSessionStateRef.current = null
   }, [currentSessionId])
 
   useEffect(() => {
@@ -1721,6 +1734,7 @@ function App() {
   const resetSessionState = (nextImages: ImageEntry[], nextSessionLabel: string) => {
     sessionVersionRef.current += 1
     currentSessionIdRef.current = null
+    pendingCurrentSessionStateRef.current = { sessionId: null }
     imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
     cancelPendingImageLoads()
     pendingAnnotationLoadsRef.current = {}
@@ -3521,6 +3535,11 @@ function App() {
     openResetHotkeysConfirmDialog()
   }
 
+  const selectActiveLabel = useEffectEvent((nextLabel: string) => {
+    setSelectedId(null)
+    setActiveLabel(nextLabel)
+  })
+
   const addClass = () => {
     const nextLabel = newClassName.trim()
     if (!nextLabel) {
@@ -3531,7 +3550,7 @@ function App() {
       updateCurrentProjectClasses((current) => [...current, nextLabel])
     }
 
-    setActiveLabel(nextLabel)
+    selectActiveLabel(nextLabel)
     setNewClassName('')
   }
 
@@ -4234,7 +4253,7 @@ function App() {
       }
 
       event.preventDefault()
-      setActiveLabel(shortcutLabel)
+      selectActiveLabel(shortcutLabel)
       return
     }
 
@@ -4447,6 +4466,7 @@ function App() {
 
     sessionVersionRef.current += 1
     currentSessionIdRef.current = sessionId
+    pendingCurrentSessionStateRef.current = { sessionId }
     imageIdSetRef.current = nextImageIdSet
     cancelPendingImageLoads()
     pendingAnnotationLoadsRef.current = {}
@@ -4486,22 +4506,53 @@ function App() {
     })
   })
 
+  const handleMissingLocalSession = useEffectEvent((
+    sessionId: string,
+    sessionVersion: number,
+  ) => {
+    if (
+      currentSessionIdRef.current !== sessionId ||
+      sessionVersionRef.current !== sessionVersion
+    ) {
+      return
+    }
+
+    delete sessionNotificationSequencesRef.current[sessionId]
+    restoreAttemptedRef.current = false
+    pushToast(
+      persistedSessionState
+        ? 'Backend session expired. Reopening previous session.'
+        : 'Backend session expired. Open an image or dataset again.',
+      persistedSessionState ? 'info' : 'error',
+    )
+    resetSessionState([], 'No session')
+  })
+
   useEffect(() => {
     if (backendStatus !== 'online' || !currentSessionId) {
       return
     }
 
     let cancelled = false
+    const controller = new AbortController()
     const sessionId = currentSessionId
+    const sessionVersion = sessionVersionRef.current
+
+    const isCurrentPollSession = () =>
+      !cancelled &&
+      !controller.signal.aborted &&
+      currentSessionIdRef.current === sessionId &&
+      sessionVersionRef.current === sessionVersion
 
     const pollSessionNotifications = async () => {
-      while (!cancelled && currentSessionIdRef.current === sessionId) {
+      while (isCurrentPollSession()) {
         try {
           const result = await fetchLocalSessionNotifications(
             sessionId,
             sessionNotificationSequencesRef.current[sessionId] ?? 0,
+            controller.signal,
           )
-          if (cancelled || currentSessionIdRef.current !== sessionId) {
+          if (!isCurrentPollSession()) {
             return
           }
 
@@ -4514,13 +4565,26 @@ function App() {
           for (const notification of result.notifications) {
             pushToast(notification.message, notification.tone)
           }
-        } catch {
-          if (cancelled || currentSessionIdRef.current !== sessionId) {
+        } catch (error) {
+          if (!isCurrentPollSession() || isAbortError(error)) {
+            return
+          }
+
+          if (error instanceof ApiError && error.status === 404) {
+            handleMissingLocalSession(sessionId, sessionVersion)
             return
           }
         }
 
-        await delay(2000)
+        try {
+          await delay(2000, controller.signal)
+        } catch (error) {
+          if (isAbortError(error)) {
+            return
+          }
+
+          throw error
+        }
       }
     }
 
@@ -4528,6 +4592,7 @@ function App() {
 
     return () => {
       cancelled = true
+      controller.abort()
     }
   }, [backendStatus, currentSessionId])
 
@@ -5617,7 +5682,7 @@ function App() {
                           key={label}
                           variant="chip"
                           isActive={label === effectiveActiveLabel}
-                          onClick={() => setActiveLabel(label)}
+                          onClick={() => selectActiveLabel(label)}
                         >
                           {label}
                         </AppButton>
@@ -6948,7 +7013,7 @@ function App() {
                               ? 'class-manager-main is-active'
                               : 'class-manager-main'
                           }
-                          onClick={() => setActiveLabel(label)}
+                          onClick={() => selectActiveLabel(label)}
                         >
                           <span className="class-manager-name">{label}</span>
                           <span className="class-manager-meta">
@@ -9579,6 +9644,34 @@ function isEditableTarget(target: EventTarget | null) {
   )
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
+function delay(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+
+    let abortListener: (() => void) | null = null
+    const timeoutId = window.setTimeout(() => {
+      if (signal && abortListener) {
+        signal.removeEventListener('abort', abortListener)
+      }
+      resolve()
+    }, ms)
+
+    if (signal) {
+      abortListener = () => {
+        window.clearTimeout(timeoutId)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }
+      signal.addEventListener('abort', abortListener, { once: true })
+    }
+  })
+}
+
+function isAbortError(error: unknown) {
+  return (
+    error instanceof DOMException ||
+    error instanceof Error
+  ) && error.name === 'AbortError'
 }
