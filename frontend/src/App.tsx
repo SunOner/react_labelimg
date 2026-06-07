@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
 } from 'react'
 import './App.css'
 import { AnnotationViewport } from './components/AnnotationViewport'
@@ -25,6 +26,7 @@ import {
   fetchLocalDuplicateSearchJob,
   fetchLocalSessionJob,
   fetchLocalSessionInfo,
+  fetchLocalSessionNotifications,
   fetchPlugins,
   fetchPredefinedClasses,
   installPluginRuntime,
@@ -40,6 +42,7 @@ import {
   startHuggingFaceAuth,
   updateHuggingFaceAuthConfig,
   updateAppState,
+  uploadLocalSessionImages,
   type CacheDbAction,
   type CacheDbSummary,
   type HuggingFaceAuthStatus,
@@ -117,6 +120,18 @@ const DEFAULT_SAM_SCORE_THRESHOLD = '0.25'
 const DEFAULT_SAM_MAX_RESULTS = '8'
 const DEFAULT_DUPLICATE_SEARCH_THRESHOLD = '92'
 const MAX_RECENT_DATASETS = 6
+const DROP_UPLOAD_BATCH_SIZE = 32
+const DROPPED_IMAGE_EXTENSIONS = new Set([
+  '.avif',
+  '.bmp',
+  '.gif',
+  '.jpeg',
+  '.jpg',
+  '.png',
+  '.tif',
+  '.tiff',
+  '.webp',
+])
 const HUGGING_FACE_OAUTH_APP_URL =
   'https://huggingface.co/settings/applications/new'
 const HOTKEY_SECTION_ORDER = [
@@ -311,6 +326,11 @@ type ToastItem = {
   message: string
   tone: ToastTone
   isClosing: boolean
+}
+
+type DropUploadProgress = {
+  processed: number
+  total: number
 }
 
 type DuplicateSearchRuntimeStatus = 'idle' | LocalDuplicateSearchJobResponse['status']
@@ -546,6 +566,9 @@ function App() {
     null,
   )
   const [dragInsertIndex, setDragInsertIndex] = useState<number | null>(null)
+  const [isImageDropActive, setIsImageDropActive] = useState(false)
+  const [dropUploadProgress, setDropUploadProgress] =
+    useState<DropUploadProgress | null>(null)
   const [toasts, setToasts] = useState<ToastItem[]>([])
 
   const menuBarRef = useRef<HTMLElement | null>(null)
@@ -574,8 +597,10 @@ function App() {
   const annotationSaveRevisionRef = useRef<Record<string, number>>({})
   const queuedAnnotationSavesRef = useRef<Record<string, QueuedAnnotationSave>>({})
   const annotationSavePromisesRef = useRef<Record<string, Promise<void>>>({})
+  const imageDropDragDepthRef = useRef(0)
   const toastTimeoutsRef = useRef<Record<string, number>>({})
   const toastRemoveTimeoutsRef = useRef<Record<string, number>>({})
+  const sessionNotificationSequencesRef = useRef<Record<string, number>>({})
   const pluginToastKeysRef = useRef<Record<string, string>>({})
 
   const resetDuplicateSearchState = (closeDialog = false) => {
@@ -678,6 +703,26 @@ function App() {
     max: 1,
   })
   const isDatasetSession = persistedSessionState?.sourceKind === 'dataset'
+  const isDropUploadBusy = dropUploadProgress !== null
+  const canDropUploadImages =
+    backendStatus === 'online' &&
+    currentSessionId !== null &&
+    isDatasetSession &&
+    !isOpeningSession &&
+    !isDropUploadBusy
+  const dropUploadProgressText = dropUploadProgress
+    ? `${dropUploadProgress.processed.toLocaleString()}/${dropUploadProgress.total.toLocaleString()}`
+    : null
+  const imageDropOverlayTitle = isDropUploadBusy
+    ? `Adding images ${dropUploadProgressText ?? ''}`.trim()
+    : canDropUploadImages
+      ? 'Drop images to add'
+      : 'Open a dataset first'
+  const imageDropOverlayDescription = isDropUploadBusy
+    ? 'Saving dropped images into the dataset.'
+    : canDropUploadImages
+      ? 'Images will be copied into the dataset image folder.'
+      : 'Drag and drop works when a dataset session is active.'
   const isDeleteImageArmed =
     currentEntry !== null && armedDeleteImageId === currentEntry.id
   const classUsageCounts = usableSessionAnnotations.reduce<Record<string, number>>(
@@ -815,34 +860,49 @@ function App() {
   const hasSession = images.length > 0
   const canSearchDuplicates =
     backendStatus === 'online' && currentSessionId !== null && images.length > 1
-  const imagesById = new Map<string, ImageEntry>(
-    images.map((entry) => [entry.id, entry] as const),
+  const imagesById = useMemo(
+    () =>
+      new Map<string, ImageEntry>(
+        images.map((entry) => [entry.id, entry] as const),
+      ),
+    [images],
   )
-  const visibleDuplicateSearchMatches = duplicateSearchMatches.filter((match) => {
-    return (
-      imagesById.has(match.leftImageId) && imagesById.has(match.rightImageId)
-    )
-  })
-  const duplicateSearchVisibleImageIdSet = buildDuplicateSearchImageIdSet(
-    visibleDuplicateSearchMatches,
+  const visibleDuplicateSearchMatches = useMemo(
+    () =>
+      duplicateSearchMatches.filter((match) => {
+        return (
+          imagesById.has(match.leftImageId) && imagesById.has(match.rightImageId)
+        )
+      }),
+    [duplicateSearchMatches, imagesById],
   )
-  const activeDuplicateSearchSelectedImageIds =
-    duplicateSearchSelectedImageIds.filter(
-      (imageId) =>
-        imagesById.has(imageId) && duplicateSearchVisibleImageIdSet.has(imageId),
-    )
-  const duplicateSearchBulkDeletePlan = buildDuplicateSearchBulkDeletePlan(
-    activeDuplicateSearchSelectedImageIds,
-    visibleDuplicateSearchMatches,
-    imagesById,
-    currentEntry?.id ?? null,
+  const duplicateSearchVisibleImageIdSet = useMemo(
+    () => buildDuplicateSearchImageIdSet(visibleDuplicateSearchMatches),
+    [visibleDuplicateSearchMatches],
   )
-  const duplicateSearchSuggestedDeleteImageIds =
-    buildSuggestedDuplicateSearchDeleteImageIds(
-      visibleDuplicateSearchMatches,
+  const activeDuplicateSearchSelectedImageIds = useMemo(
+    () =>
+      duplicateSearchSelectedImageIds.filter(
+        (imageId) =>
+          imagesById.has(imageId) && duplicateSearchVisibleImageIdSet.has(imageId),
+      ),
+    [duplicateSearchSelectedImageIds, duplicateSearchVisibleImageIdSet, imagesById],
+  )
+  const duplicateSearchBulkDeletePlan = useMemo(
+    () =>
+      buildDuplicateSearchBulkDeletePlan(
+        activeDuplicateSearchSelectedImageIds,
+        visibleDuplicateSearchMatches,
+        imagesById,
+        currentEntry?.id ?? null,
+      ),
+    [
+      activeDuplicateSearchSelectedImageIds,
+      currentEntry?.id,
       imagesById,
-      currentEntry?.id ?? null,
-    )
+      visibleDuplicateSearchMatches,
+    ],
+  )
   const duplicateSearchPageCount = Math.max(
     1,
     Math.ceil(visibleDuplicateSearchMatches.length / DUPLICATE_SEARCH_PAGE_SIZE),
@@ -857,12 +917,21 @@ function App() {
     visibleDuplicateSearchMatches.length,
     duplicateSearchPageStartIndex + DUPLICATE_SEARCH_PAGE_SIZE,
   )
-  const duplicateSearchPageMatches = visibleDuplicateSearchMatches.slice(
-    duplicateSearchPageStartIndex,
-    duplicateSearchPageEndIndex,
+  const duplicateSearchPageMatches = useMemo(
+    () =>
+      visibleDuplicateSearchMatches.slice(
+        duplicateSearchPageStartIndex,
+        duplicateSearchPageEndIndex,
+      ),
+    [
+      duplicateSearchPageEndIndex,
+      duplicateSearchPageStartIndex,
+      visibleDuplicateSearchMatches,
+    ],
   )
-  const duplicateSearchSelectedImageIdSet = new Set(
-    duplicateSearchSelectedImageIds,
+  const duplicateSearchSelectedImageIdSet = useMemo(
+    () => new Set(duplicateSearchSelectedImageIds),
+    [duplicateSearchSelectedImageIds],
   )
   const isDuplicateSearchDeleteBusy =
     duplicateSearchDeletingImageId !== null || isDuplicateSearchBulkDeleting
@@ -3761,6 +3830,112 @@ function App() {
     )
   }
 
+  const removeDeletedSessionImages = useEffectEvent((
+    deletedImageIds: Set<string>,
+    preferredImageRelativePath?: string | null,
+  ) => {
+    if (!currentSessionId || deletedImageIds.size === 0) {
+      return
+    }
+
+    const deletedImageEntries = images.filter((entry) => deletedImageIds.has(entry.id))
+    const deletedImageRelativePaths = new Set(
+      deletedImageEntries.map((entry) => entry.relativePath),
+    )
+    const deletedImageUrls = new Set(deletedImageEntries.map((entry) => entry.url))
+    const nextImages = images.filter((entry) => !deletedImageIds.has(entry.id))
+    const nextImageIdSet = new Set(nextImages.map((entry) => entry.id))
+    const currentImageId = currentImageEntry?.id ?? null
+    const preferredEntry = preferredImageRelativePath
+      ? (nextImages.find((entry) =>
+          entry.relativePath === preferredImageRelativePath,
+        ) ?? null)
+      : null
+    const retainedCurrentEntry = currentImageId
+      ? (nextImages.find((entry) => entry.id === currentImageId) ?? null)
+      : null
+    const nextCurrentEntry =
+      preferredEntry ?? retainedCurrentEntry ?? nextImages[0] ?? null
+    const didCurrentImageChange = currentImageId !== (nextCurrentEntry?.id ?? null)
+
+    for (const imageId of deletedImageIds) {
+      clearScheduledAnnotationSave(imageId)
+      delete pendingAnnotationLoadsRef.current[imageId]
+      delete annotationLoadStateRef.current[imageId]
+    }
+    cancelPendingImageLoads([...deletedImageIds])
+
+    imageIdSetRef.current = nextImageIdSet
+    currentSessionIdRef.current = currentSessionId
+    pendingPreferredImageRelativePathRef.current = null
+    annotationLoadStateRef.current = Object.fromEntries(
+      Object.entries(annotationLoadStateRef.current).filter(([imageId]) =>
+        nextImageIdSet.has(imageId),
+      ),
+    )
+    imageResourcesRef.current = Object.fromEntries(
+      Object.entries(imageResourcesRef.current).filter(([imageId]) =>
+        nextImageIdSet.has(imageId),
+      ),
+    )
+
+    startTransition(() => {
+      setImages((current) =>
+        current.filter((entry) => !deletedImageIds.has(entry.id)),
+      )
+      setCurrentImageEntry(nextCurrentEntry)
+      setImageResources((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([imageId]) =>
+            nextImageIdSet.has(imageId),
+          ),
+        ),
+      )
+      commitAnnotationsByImage((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([imageId]) =>
+            nextImageIdSet.has(imageId),
+          ),
+        ),
+      )
+      setSessionError(null)
+      if (didCurrentImageChange) {
+        setSelectedId(null)
+        updateDrawStart(null)
+        setDraftRect(null)
+      }
+      if (armedDeleteImageId && deletedImageIds.has(armedDeleteImageId)) {
+        clearDeleteImageArm()
+      }
+      setDuplicateSearchPreviewImage((current) =>
+        current &&
+        isDuplicateSearchPreviewDeleted(
+          current,
+          deletedImageRelativePaths,
+          deletedImageUrls,
+        )
+          ? null
+          : current,
+      )
+      setDuplicateSearchHoverPreview((current) =>
+        current &&
+        isDuplicateSearchPreviewDeleted(
+          current,
+          deletedImageRelativePaths,
+          deletedImageUrls,
+        )
+          ? null
+          : current,
+      )
+      setDuplicateSearchMatches((current) =>
+        filterDuplicateSearchMatchesAfterDeleting(current, deletedImageIds),
+      )
+      setDuplicateSearchSelectedImageIds((current) =>
+        current.filter((imageId) => nextImageIdSet.has(imageId)),
+      )
+    })
+  })
+
   const deleteSessionImagesById = useEffectEvent(async (
     imageIds: string[],
     preferredImageRelativePath?: string | null,
@@ -3769,6 +3944,7 @@ function App() {
       throw new Error('Open a dataset to delete images.')
     }
 
+    const sessionId = currentSessionId
     const uniqueImageIds = [...new Set(imageIds)]
     const imagesToDelete = uniqueImageIds.flatMap((imageId) => {
       const imageToDelete = imagesById.get(imageId) ?? null
@@ -3792,26 +3968,37 @@ function App() {
         currentDeleteCandidateImages,
       )
 
-    const session =
+    const deleteResult =
       imagesToDelete.length === 1
-        ? await deleteLocalSessionImage(currentSessionId, imagesToDelete[0].id)
+        ? await deleteLocalSessionImage(sessionId, imagesToDelete[0].id)
         : await deleteLocalSessionImages(
-            currentSessionId,
+            sessionId,
             imagesToDelete.map((image) => image.id),
           )
+    const deletedImageIdSet = new Set(deleteResult.deletedImageIds)
+    const deletedImages = imagesToDelete.filter((image) =>
+      deletedImageIdSet.has(image.id),
+    )
 
-    applyLocalSession(session, {
-      preferredImageRelativePath: nextPreferredImageRelativePath,
-    })
+    if (currentSessionIdRef.current === sessionId) {
+      removeDeletedSessionImages(
+        deletedImageIdSet,
+        nextPreferredImageRelativePath,
+      )
+    }
 
-    if (!nextPreferredImageRelativePath && persistedSessionState) {
+    if (
+      currentSessionIdRef.current === sessionId &&
+      !nextPreferredImageRelativePath &&
+      persistedSessionState
+    ) {
       commitPersistedSessionState({
         ...persistedSessionState,
         currentImageRelativePath: null,
       })
     }
 
-    return imagesToDelete
+    return deletedImages
   })
 
   const deleteSessionImageById = useEffectEvent(async (
@@ -4145,6 +4332,15 @@ function App() {
         (imageId) => !nextImageIdSet.has(imageId),
       )
       const removedImageIdSet = new Set(removedImageIds)
+      const removedImageEntries = images.filter((entry) =>
+        removedImageIdSet.has(entry.id),
+      )
+      const removedImageRelativePaths = new Set(
+        removedImageEntries.map((entry) => entry.relativePath),
+      )
+      const removedImageUrls = new Set(
+        removedImageEntries.map((entry) => entry.url),
+      )
       const currentImageId = currentImageEntry?.id ?? null
       const preferredEntry =
         preferredImageIndex >= 0 ? (nextImages[preferredImageIndex] ?? null) : null
@@ -4218,6 +4414,29 @@ function App() {
           clearDeleteImageArm()
         }
         if (removedImageIdSet.size > 0) {
+          setDuplicateSearchPreviewImage((current) =>
+            current &&
+            isDuplicateSearchPreviewDeleted(
+              current,
+              removedImageRelativePaths,
+              removedImageUrls,
+            )
+              ? null
+              : current,
+          )
+          setDuplicateSearchHoverPreview((current) =>
+            current &&
+            isDuplicateSearchPreviewDeleted(
+              current,
+              removedImageRelativePaths,
+              removedImageUrls,
+            )
+              ? null
+              : current,
+          )
+          setDuplicateSearchMatches((current) =>
+            filterDuplicateSearchMatchesAfterDeleting(current, removedImageIdSet),
+          )
           setDuplicateSearchSelectedImageIds((current) =>
             current.filter((imageId) => nextImageIdSet.has(imageId)),
           )
@@ -4267,6 +4486,51 @@ function App() {
     })
   })
 
+  useEffect(() => {
+    if (backendStatus !== 'online' || !currentSessionId) {
+      return
+    }
+
+    let cancelled = false
+    const sessionId = currentSessionId
+
+    const pollSessionNotifications = async () => {
+      while (!cancelled && currentSessionIdRef.current === sessionId) {
+        try {
+          const result = await fetchLocalSessionNotifications(
+            sessionId,
+            sessionNotificationSequencesRef.current[sessionId] ?? 0,
+          )
+          if (cancelled || currentSessionIdRef.current !== sessionId) {
+            return
+          }
+
+          sessionNotificationSequencesRef.current[sessionId] = result.sequence
+
+          if (result.session && !result.session.cancelled) {
+            applyLocalSession(result.session)
+          }
+
+          for (const notification of result.notifications) {
+            pushToast(notification.message, notification.tone)
+          }
+        } catch {
+          if (cancelled || currentSessionIdRef.current !== sessionId) {
+            return
+          }
+        }
+
+        await delay(2000)
+      }
+    }
+
+    void pollSessionNotifications()
+
+    return () => {
+      cancelled = true
+    }
+  }, [backendStatus, currentSessionId])
+
   const rememberRecentDataset = (session: LocalSessionResponse) => {
     if (!session.rootPath) {
       return
@@ -4288,6 +4552,176 @@ function App() {
       current.filter((entry) => entry.path !== path),
     )
   })
+
+  const handleDroppedImageFiles = useEffectEvent(async (droppedFiles: File[]) => {
+    if (droppedFiles.length === 0) {
+      return
+    }
+
+    const imageFiles = droppedFiles.filter(isSupportedDroppedImageFile)
+    const skippedCount = droppedFiles.length - imageFiles.length
+
+    if (imageFiles.length === 0) {
+      pushToast('Drop PNG, JPG, WebP, AVIF, TIFF, BMP or GIF images.', 'error')
+      return
+    }
+
+    if (isDropUploadBusy) {
+      pushToast('Image import is already running.', 'info')
+      return
+    }
+
+    if (backendStatus !== 'online') {
+      pushToast('Backend is offline. Images were not added.', 'error')
+      return
+    }
+
+    if (!currentSessionId || !isDatasetSession) {
+      pushToast('Open a dataset before dropping images.', 'error')
+      return
+    }
+
+    if (isOpeningSession) {
+      pushToast('Wait for the current dataset load to finish.', 'info')
+      return
+    }
+
+    const sessionId = currentSessionId
+    let firstUploadedRelativePath: string | null = null
+    let lastSession: LocalSessionResponse | null = null
+    let completedCount = 0
+
+    const applyUploadedSession = () => {
+      if (!lastSession || !firstUploadedRelativePath) {
+        return
+      }
+
+      setFileSearchQuery('')
+      applyLocalSession(lastSession, {
+        persistedState: buildPersistedSessionState(lastSession, 'dataset'),
+        preferredImageRelativePath: firstUploadedRelativePath,
+      })
+      rememberRecentDataset(lastSession)
+      setProjectInfo(null)
+      setProjectInfoStatus('idle')
+      setProjectInfoError(null)
+      if (sidebarView === 'info') {
+        void refreshProjectInfo()
+      }
+    }
+
+    setSessionError(null)
+    setDropUploadProgress({
+      processed: 0,
+      total: imageFiles.length,
+    })
+
+    try {
+      await flushPendingAnnotationSaves()
+
+      for (
+        let startIndex = 0;
+        startIndex < imageFiles.length;
+        startIndex += DROP_UPLOAD_BATCH_SIZE
+      ) {
+        if (currentSessionIdRef.current !== sessionId) {
+          return
+        }
+
+        const batchFiles = imageFiles.slice(
+          startIndex,
+          startIndex + DROP_UPLOAD_BATCH_SIZE,
+        )
+        const result = await uploadLocalSessionImages(sessionId, batchFiles)
+        completedCount += result.images.length
+        firstUploadedRelativePath ??= result.images[0]?.relativePath ?? null
+        lastSession = result.session
+        setDropUploadProgress({
+          processed: completedCount,
+          total: imageFiles.length,
+        })
+      }
+
+      if (currentSessionIdRef.current !== sessionId) {
+        return
+      }
+
+      applyUploadedSession()
+      const addedText =
+        completedCount === 1
+          ? `Added ${firstUploadedRelativePath}.`
+          : `Added ${completedCount.toLocaleString()} images.`
+      const skippedText =
+        skippedCount > 0
+          ? ` Skipped ${skippedCount.toLocaleString()} unsupported file${skippedCount === 1 ? '' : 's'}.`
+          : ''
+      pushToast(`${addedText}${skippedText}`, 'success')
+    } catch (error) {
+      if (currentSessionIdRef.current === sessionId) {
+        applyUploadedSession()
+      }
+
+      const baseMessage =
+        error instanceof Error ? error.message : 'Failed to add dropped images'
+      const partialMessage =
+        completedCount > 0
+          ? ` Added ${completedCount.toLocaleString()} of ${imageFiles.length.toLocaleString()} images before the error.`
+          : ''
+      setSessionError(`${baseMessage}${partialMessage}`)
+    } finally {
+      setDropUploadProgress(null)
+    }
+  })
+
+  const handleAppDragEnter = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isFileDataTransfer(event.dataTransfer)) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    imageDropDragDepthRef.current += 1
+    setIsImageDropActive(true)
+  }
+
+  const handleAppDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isFileDataTransfer(event.dataTransfer)) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.dataTransfer.dropEffect = canDropUploadImages ? 'copy' : 'none'
+    setIsImageDropActive(true)
+  }
+
+  const handleAppDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isFileDataTransfer(event.dataTransfer)) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    imageDropDragDepthRef.current = Math.max(
+      0,
+      imageDropDragDepthRef.current - 1,
+    )
+    if (imageDropDragDepthRef.current === 0) {
+      setIsImageDropActive(false)
+    }
+  }
+
+  const handleAppDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    if (!isFileDataTransfer(event.dataTransfer)) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    imageDropDragDepthRef.current = 0
+    setIsImageDropActive(false)
+    void handleDroppedImageFiles(Array.from(event.dataTransfer.files))
+  }
 
   const handleOpenLocalImage = async () => {
     if (!(await flushPendingAnnotationSavesForSessionChange())) {
@@ -4607,7 +5041,13 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div
+      className="app-shell"
+      onDragEnter={handleAppDragEnter}
+      onDragOver={handleAppDragOver}
+      onDragLeave={handleAppDragLeave}
+      onDrop={handleAppDrop}
+    >
       {toasts.length > 0 ? (
         <div className="toast-stack" aria-live="polite" aria-label="Notifications">
           {toasts.map((toast) => (
@@ -4634,6 +5074,40 @@ function App() {
               </button>
             </div>
           ))}
+        </div>
+      ) : null}
+
+      {isImageDropActive || isDropUploadBusy ? (
+        <div
+          className={[
+            'image-drop-overlay',
+            canDropUploadImages || isDropUploadBusy ? 'is-ready' : 'is-blocked',
+            isDropUploadBusy ? 'is-uploading' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          aria-live="polite"
+        >
+          <div className="image-drop-target">
+            <span className="image-drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path
+                  d="M12 5v14M5 12h14"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M4.5 4.5h15v15h-15z"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </span>
+            <strong>{imageDropOverlayTitle}</strong>
+            <span>{imageDropOverlayDescription}</span>
+          </div>
         </div>
       ) : null}
 
@@ -4991,6 +5465,26 @@ function App() {
                       <span>Size</span>
                       <strong className="meta-value">{currentImageSize}</strong>
                     </div>
+                    {dropUploadProgress ? (
+                      <div className="meta-line">
+                        <span>Adding</span>
+                        <div className="dataset-progress-meta" aria-live="polite">
+                          <strong className="meta-value">
+                            {dropUploadProgressText}
+                          </strong>
+                          <span
+                            className="dataset-progress-spinner"
+                            role="status"
+                            aria-label="Adding dropped images"
+                            title="Adding dropped images"
+                          >
+                            <span className="visually-hidden">
+                              Adding dropped images
+                            </span>
+                          </span>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                   {images.length > 0 ? (
                     <>
@@ -5901,11 +6395,15 @@ function App() {
                       onClick={() => {
                         setDuplicateSearchError(null)
                         setDuplicateSearchSelectedImageIds(
-                          duplicateSearchSuggestedDeleteImageIds,
+                          buildSuggestedDuplicateSearchDeleteImageIds(
+                            visibleDuplicateSearchMatches,
+                            imagesById,
+                            currentEntry?.id ?? null,
+                          ),
                         )
                       }}
                       disabled={
-                        duplicateSearchSuggestedDeleteImageIds.length === 0 ||
+                        visibleDuplicateSearchMatches.length === 0 ||
                         isDuplicateSearchDeleteBusy
                       }
                     >
@@ -7661,6 +8159,23 @@ function isImagePreloadAbort(error: unknown) {
   )
 }
 
+function isFileDataTransfer(dataTransfer: DataTransfer) {
+  return Array.from(dataTransfer.types).includes('Files')
+}
+
+function isSupportedDroppedImageFile(file: File) {
+  if (file.type.toLowerCase().startsWith('image/')) {
+    return true
+  }
+
+  return DROPPED_IMAGE_EXTENSIONS.has(getFileExtension(file.name))
+}
+
+function getFileExtension(filename: string) {
+  const dotIndex = filename.lastIndexOf('.')
+  return dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : ''
+}
+
 function getBufferedEntries(
   images: ImageEntry[],
   currentIndex: number,
@@ -8006,6 +8521,14 @@ function buildDuplicateSearchBulkDeletePlan(
   const selectedImageIds = [...new Set(imageIds)].filter((imageId) =>
     imagesById.has(imageId),
   )
+  if (selectedImageIds.length === 0) {
+    return {
+      selectedImageIds: [],
+      deleteImageIds: [],
+      keptImageIds: [],
+    }
+  }
+
   const deleteImageIdSet = new Set(selectedImageIds)
   const keptImageIdSet = new Set<string>()
 
@@ -8188,10 +8711,22 @@ function filterDuplicateSearchMatchesAfterDeleting(
     return matches
   }
 
-  return matches.filter(
+  const nextMatches = matches.filter(
     (match) =>
       !deletedImageIds.has(match.leftImageId) &&
       !deletedImageIds.has(match.rightImageId),
+  )
+  return nextMatches.length === matches.length ? matches : nextMatches
+}
+
+function isDuplicateSearchPreviewDeleted(
+  preview: DuplicateSearchPreviewImage,
+  deletedImageRelativePaths: ReadonlySet<string>,
+  deletedImageUrls: ReadonlySet<string>,
+) {
+  return (
+    deletedImageRelativePaths.has(preview.relativePath) ||
+    deletedImageUrls.has(preview.url)
   )
 }
 

@@ -92,6 +92,97 @@
   color: var(--ink-strong);
 }
 
+.image-drop-overlay {
+  position: fixed;
+  inset: 6px 8px 8px;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 11, 15, 0.62);
+  pointer-events: none;
+}
+
+.image-drop-target {
+  width: min(420px, calc(100vw - 48px));
+  min-height: 168px;
+  padding: 24px;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 10px;
+  border: 1px dashed rgba(255, 255, 255, 0.26);
+  background: var(--surface-overlay);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.42);
+  color: var(--ink-strong);
+  text-align: center;
+}
+
+.image-drop-target strong {
+  font-family: var(--font-heading);
+  font-size: 1rem;
+  line-height: 1.1;
+}
+
+.image-drop-target span:last-child {
+  max-width: 32ch;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.image-drop-icon {
+  width: 42px;
+  height: 42px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--ink-strong);
+}
+
+.image-drop-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.image-drop-overlay.is-ready .image-drop-target {
+  border-color: rgba(132, 196, 255, 0.64);
+  box-shadow:
+    0 22px 48px rgba(0, 0, 0, 0.42),
+    inset 0 0 0 1px rgba(132, 196, 255, 0.12);
+}
+
+.image-drop-overlay.is-ready .image-drop-icon {
+  border-color: rgba(132, 196, 255, 0.58);
+  color: #cfe8ff;
+}
+
+.image-drop-overlay.is-blocked .image-drop-target {
+  border-color: rgba(240, 106, 95, 0.56);
+}
+
+.image-drop-overlay.is-blocked .image-drop-icon {
+  border-color: rgba(240, 106, 95, 0.42);
+  color: #ffc9c1;
+}
+
+.image-drop-overlay.is-uploading .image-drop-icon svg {
+  animation: image-drop-upload-pulse 900ms ease-in-out infinite;
+}
+
+@keyframes image-drop-upload-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.72;
+  }
+
+  50% {
+    transform: scale(1.1);
+    opacity: 1;
+  }
+}
+
 @keyframes toast-enter {
   from {
     opacity: 0;
@@ -149,6 +240,7 @@
 .class-manager-main,
 .viewport,
 .empty-state-visual,
+.image-drop-target,
 .duplicate-search-card,
 .duplicate-search-preview-frame,
 .duplicate-search-progress-track,

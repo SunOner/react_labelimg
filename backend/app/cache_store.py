@@ -511,6 +511,53 @@ class CacheStore:
                     (dataset_key, dataset_key),
                 )
 
+    def delete_dataset_manifest_images(
+        self,
+        root_path: Path,
+        image_ids: Sequence[str],
+        relative_paths: Sequence[str],
+        image_count: int,
+    ):
+        dataset_key = self.dataset_key_for_path(root_path)
+        unique_image_ids = list(dict.fromkeys(image_ids))
+        unique_relative_paths = list(dict.fromkeys(relative_paths))
+        now = time.time()
+
+        if not unique_image_ids and not unique_relative_paths:
+            return
+
+        with self._lock:
+            with self._connect() as connection:
+                if unique_relative_paths:
+                    connection.executemany(
+                        """
+                        DELETE FROM dataset_images
+                        WHERE dataset_key = ? AND relative_path = ?
+                        """,
+                        [
+                            (dataset_key, relative_path)
+                            for relative_path in unique_relative_paths
+                        ],
+                    )
+
+                if unique_image_ids:
+                    connection.executemany(
+                        """
+                        DELETE FROM image_fingerprints
+                        WHERE dataset_key = ? AND image_id = ?
+                        """,
+                        [(dataset_key, image_id) for image_id in unique_image_ids],
+                    )
+
+                connection.execute(
+                    """
+                    UPDATE dataset_manifests
+                    SET image_count = ?, updated_at = ?
+                    WHERE dataset_key = ?
+                    """,
+                    (image_count, now, dataset_key),
+                )
+
     def update_dataset_annotation_metadata(
         self,
         root_path: Path,

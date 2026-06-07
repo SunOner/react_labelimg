@@ -30,7 +30,7 @@ from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
@@ -102,8 +102,10 @@ IMAGE_EXTENSIONS = {
     ".tif",
     ".tiff",
 }
+IMAGE_UPLOAD_CHUNK_SIZE = 1024 * 1024
 IMAGE_DIRECTORY_NAMES = {"images", "image", "imgs"}
 LABEL_DIRECTORY_NAMES = ("labels", "label", "annotations", "annotation")
+INVALID_IMAGE_DIRECTORY_NAME = "not_valid"
 NO_CACHE_HTML_HEADERS = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
@@ -170,6 +172,17 @@ class DuplicateSearchJob:
 
 
 @dataclass(slots=True)
+class LocalSessionNotification:
+    sequence: int
+    type: str
+    tone: Literal["info", "success", "error"]
+    message: str
+    image_id: str | None = None
+    relative_path: str | None = None
+    quarantine_path: str | None = None
+
+
+@dataclass(slots=True)
 class YoloClassSource:
     names: list[str]
     source_path: Path | None = None
@@ -208,6 +221,16 @@ class MissingSamRuntimeDependencyError(RuntimeError):
         super().__init__(
             "SAM 3 runtime is installed but missing dependency "
             f"'{dependency}'. Re-run the runtime installer in Manage Plugins.",
+        )
+
+
+class InvalidSessionImageError(RuntimeError):
+    def __init__(self, image: SessionImage, quarantine_path: Path):
+        self.image = image
+        self.quarantine_path = quarantine_path
+        super().__init__(
+            f"Moved unreadable image to {INVALID_IMAGE_DIRECTORY_NAME}: "
+            f"{image.relative_path}"
         )
 
 
@@ -338,6 +361,9 @@ class BulkImageDeleteRequest(BaseModel):
 LOCAL_SESSIONS: dict[str, LocalSession] = {}
 LOCAL_SESSION_JOBS: dict[str, SessionOpenJob] = {}
 LOCAL_IMAGE_PATHS: dict[str, Path] = {}
+LOCAL_SESSION_NOTIFICATIONS: dict[str, list[LocalSessionNotification]] = {}
+LOCAL_SESSION_NOTIFICATION_SEQUENCE = 0
+LOCAL_SESSION_NOTIFICATION_LOCK = Lock()
 SESSION_JOB_LOCK = Lock()
 DUPLICATE_SEARCH_JOBS: dict[str, DuplicateSearchJob] = {}
 DUPLICATE_SEARCH_LOCK = Lock()
@@ -345,6 +371,7 @@ FINGERPRINT_WARMUP_PENDING: OrderedDict[str, tuple[Path, SessionImage]] = Ordere
 FINGERPRINT_WARMUP_IN_PROGRESS: set[str] = set()
 FINGERPRINT_WARMUP_CONDITION = Condition()
 FINGERPRINT_WARMUP_WORKER_STARTED = False
+INVALID_IMAGE_QUARANTINE_LOCK = Lock()
 HF_OAUTH_PENDING_STATES: dict[str, dict[str, Any]] = {}
 HF_OAUTH_PENDING_LOCK = Lock()
 PLUGIN_DOWNLOAD_JOBS: dict[str, PluginDownloadJob] = {}
@@ -909,6 +936,32 @@ def read_local_session_info(session_id: str):
     return build_local_session_info(session)
 
 
+@app.get("/api/local/sessions/{session_id}/notifications")
+def read_local_session_notifications(session_id: str, after_sequence: int = 0):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    with LOCAL_SESSION_NOTIFICATION_LOCK:
+        notifications = [
+            notification
+            for notification in LOCAL_SESSION_NOTIFICATIONS.get(session_id, [])
+            if notification.sequence > after_sequence
+        ]
+        sequence = max(
+            [after_sequence, *[notification.sequence for notification in notifications]]
+        )
+
+    return {
+        "sequence": sequence,
+        "notifications": [
+            serialize_local_session_notification(notification)
+            for notification in notifications
+        ],
+        "session": serialize_session(session) if notifications else None,
+    }
+
+
 @app.get("/api/local/sessions/{session_id}/annotations/{image_id}")
 def read_local_session_annotations(session_id: str, image_id: str):
     session = LOCAL_SESSIONS.get(session_id)
@@ -975,6 +1028,7 @@ def save_local_session_annotations(
 def bulk_delete_local_session_images(
     session_id: str,
     payload: BulkImageDeleteRequest,
+    response_mode: Literal["full", "summary"] = "full",
 ):
     session = LOCAL_SESSIONS.get(session_id)
     if session is None:
@@ -984,16 +1038,108 @@ def bulk_delete_local_session_images(
     if not image_ids:
         raise HTTPException(status_code=400, detail="Select at least one image")
 
-    return delete_local_session_images(session, image_ids)
+    return delete_local_session_images(session, image_ids, response_mode=response_mode)
 
 
-@app.delete("/api/local/sessions/{session_id}/images/{image_id}")
-def delete_local_session_image(session_id: str, image_id: str):
+@app.post("/api/local/sessions/{session_id}/images/upload")
+async def upload_local_session_image(
+    session_id: str,
+    request: Request,
+    filename: str,
+):
     session = LOCAL_SESSIONS.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    return delete_local_session_images(session, [image_id])
+    upload_dir = ensure_local_session_upload_dir(session)
+    target_path = await save_local_session_upload(
+        upload_dir,
+        filename,
+        request.stream(),
+    )
+
+    uploaded_image = build_session_image(target_path, session.root_path)
+    upsert_image_in_matching_sessions(session.root_path, uploaded_image)
+    CACHE_STORE.save_dataset_manifest(
+        session.root_path,
+        session.label,
+        serialize_manifest_images(session.images),
+    )
+    schedule_session_fingerprint_warmup(session)
+
+    return {
+        "image": serialize_session_image(uploaded_image),
+        "session": serialize_session(session),
+    }
+
+
+@app.post("/api/local/sessions/{session_id}/images/bulk-upload")
+async def upload_local_session_images(
+    session_id: str,
+    files: list[UploadFile] = File(...),
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="Select at least one image")
+
+    upload_dir = ensure_local_session_upload_dir(session)
+    uploaded_paths: list[Path] = []
+
+    try:
+        for upload_file in files:
+            uploaded_paths.append(
+                await save_local_session_upload(
+                    upload_dir,
+                    upload_file.filename or "",
+                    iter_upload_file_chunks(upload_file),
+                )
+            )
+    except Exception:
+        for uploaded_path in uploaded_paths:
+            try:
+                uploaded_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Failed to roll back uploaded image %s", uploaded_path)
+        raise
+    finally:
+        for upload_file in files:
+            await upload_file.close()
+
+    uploaded_images = [
+        build_session_image(uploaded_path, session.root_path)
+        for uploaded_path in uploaded_paths
+    ]
+    upsert_images_in_matching_sessions(session.root_path, uploaded_images)
+    CACHE_STORE.save_dataset_manifest(
+        session.root_path,
+        session.label,
+        serialize_manifest_images(session.images),
+    )
+    schedule_session_fingerprint_warmup(session)
+
+    return {
+        "images": [
+            serialize_session_image(uploaded_image)
+            for uploaded_image in uploaded_images
+        ],
+        "session": serialize_session(session),
+    }
+
+
+@app.delete("/api/local/sessions/{session_id}/images/{image_id}")
+def delete_local_session_image(
+    session_id: str,
+    image_id: str,
+    response_mode: Literal["full", "summary"] = "full",
+):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return delete_local_session_images(session, [image_id], response_mode=response_mode)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2613,7 +2759,12 @@ def create_local_session(root_path: Path, label: str):
     return session
 
 
-def delete_local_session_images(session: LocalSession, image_ids: list[str]):
+def delete_local_session_images(
+    session: LocalSession,
+    image_ids: list[str],
+    *,
+    response_mode: Literal["full", "summary"] = "full",
+):
     images_to_delete = [
         session.images_by_id[image_id]
         for image_id in dict.fromkeys(image_ids)
@@ -2629,11 +2780,16 @@ def delete_local_session_images(session: LocalSession, image_ids: list[str]):
     deleted_image_ids = {image.id for image in images_to_delete}
     prune_duplicate_search_jobs_for_deleted_images(session.root_path, deleted_image_ids)
     remove_pending_fingerprint_warmup_images(deleted_image_ids)
-    CACHE_STORE.save_dataset_manifest(
+    CACHE_STORE.delete_dataset_manifest_images(
         session.root_path,
-        session.label,
-        serialize_manifest_images(session.images),
+        [image.id for image in images_to_delete],
+        [image.relative_path for image in images_to_delete],
+        len(session.images),
     )
+
+    if response_mode == "summary":
+        return serialize_image_delete_response(session, images_to_delete)
+
     return serialize_session(session)
 
 
@@ -2710,6 +2866,37 @@ def remove_images_from_matching_sessions(
         LOCAL_IMAGE_PATHS.pop(image_id, None)
 
 
+def upsert_image_in_matching_sessions(root_path: Path, image: SessionImage):
+    upsert_images_in_matching_sessions(root_path, [image])
+
+
+def upsert_images_in_matching_sessions(root_path: Path, images: list[SessionImage]):
+    if not images:
+        return
+
+    normalized_root_path = root_path.expanduser().resolve()
+    register_session_images(images)
+    image_ids = {image.id for image in images}
+    image_paths = {image.full_path for image in images}
+
+    for session in LOCAL_SESSIONS.values():
+        if session.root_path != normalized_root_path:
+            continue
+
+        next_images = [
+            current_image
+            for current_image in session.images
+            if current_image.id not in image_ids
+            and current_image.full_path not in image_paths
+        ]
+        next_images.extend(images)
+        next_images.sort(key=lambda item: natural_sort_key(item.relative_path))
+        session.images = next_images
+        session.images_by_id = {
+            current_image.id: current_image for current_image in next_images
+        }
+
+
 def remove_pending_fingerprint_warmup_images(image_ids: set[str]):
     if not image_ids:
         return
@@ -2717,6 +2904,177 @@ def remove_pending_fingerprint_warmup_images(image_ids: set[str]):
     with FINGERPRINT_WARMUP_CONDITION:
         for image_id in image_ids:
             FINGERPRINT_WARMUP_PENDING.pop(image_id, None)
+
+
+def enqueue_local_session_notification(
+    session_ids: list[str],
+    *,
+    notification_type: str,
+    tone: Literal["info", "success", "error"],
+    message: str,
+    image_id: str | None = None,
+    relative_path: str | None = None,
+    quarantine_path: Path | None = None,
+):
+    global LOCAL_SESSION_NOTIFICATION_SEQUENCE
+
+    if not session_ids:
+        return
+
+    with LOCAL_SESSION_NOTIFICATION_LOCK:
+        for session_id in session_ids:
+            LOCAL_SESSION_NOTIFICATION_SEQUENCE += 1
+            notification = LocalSessionNotification(
+                sequence=LOCAL_SESSION_NOTIFICATION_SEQUENCE,
+                type=notification_type,
+                tone=tone,
+                message=message,
+                image_id=image_id,
+                relative_path=relative_path,
+                quarantine_path=str(quarantine_path) if quarantine_path else None,
+            )
+            notifications = LOCAL_SESSION_NOTIFICATIONS.setdefault(session_id, [])
+            notifications.append(notification)
+            del notifications[:-100]
+
+
+def find_matching_session_ids_for_image(root_path: Path, image: SessionImage):
+    normalized_root_path = root_path.expanduser().resolve()
+    matching_session_ids: list[str] = []
+
+    for session in LOCAL_SESSIONS.values():
+        if session.root_path != normalized_root_path:
+            continue
+
+        if image.id in session.images_by_id:
+            matching_session_ids.append(session.id)
+            continue
+
+        if any(current_image.full_path == image.full_path for current_image in session.images):
+            matching_session_ids.append(session.id)
+
+    return matching_session_ids
+
+
+def quarantine_invalid_session_image(root_path: Path, image: SessionImage):
+    with INVALID_IMAGE_QUARANTINE_LOCK:
+        matching_session_ids = find_matching_session_ids_for_image(root_path, image)
+        quarantine_path = move_session_file_to_not_valid(root_path, image.full_path)
+        annotation_quarantine_path = None
+        if image.annotation_path is not None and image.annotation_path.exists():
+            try:
+                annotation_quarantine_path = move_session_file_to_not_valid(
+                    root_path,
+                    image.annotation_path,
+                )
+            except OSError:
+                LOGGER.warning(
+                    "Failed to move annotation sidecar for invalid image %s at %s",
+                    image.full_path,
+                    image.annotation_path,
+                    exc_info=True,
+                )
+
+        remove_images_from_matching_sessions(root_path, [image])
+        deleted_image_ids = {image.id}
+        prune_duplicate_search_jobs_for_deleted_images(root_path, deleted_image_ids)
+        remove_pending_fingerprint_warmup_images(deleted_image_ids)
+        remaining_count = next(
+            (
+                len(session.images)
+                for session in LOCAL_SESSIONS.values()
+                if session.root_path == root_path.expanduser().resolve()
+            ),
+            0,
+        )
+        CACHE_STORE.delete_dataset_manifest_images(
+            root_path,
+            [image.id],
+            [image.relative_path],
+            remaining_count,
+        )
+
+        LOGGER.info(
+            "Moved unreadable image %s to %s",
+            image.full_path,
+            quarantine_path,
+        )
+        if annotation_quarantine_path is not None:
+            LOGGER.info(
+                "Moved annotation sidecar for unreadable image %s to %s",
+                image.full_path,
+                annotation_quarantine_path,
+            )
+
+        enqueue_local_session_notification(
+            matching_session_ids,
+            notification_type="invalid-image-quarantined",
+            tone="info",
+            message=(
+                f"Moved unreadable image to {INVALID_IMAGE_DIRECTORY_NAME}: "
+                f"{image.relative_path}."
+            ),
+            image_id=image.id,
+            relative_path=image.relative_path,
+            quarantine_path=quarantine_path,
+        )
+
+    return quarantine_path
+
+
+def move_session_file_to_not_valid(root_path: Path, source_path: Path):
+    if not source_path.exists():
+        raise FileNotFoundError(source_path)
+
+    target_path = build_not_valid_target_path(root_path, source_path)
+    if source_path.resolve() == target_path.resolve():
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path = build_unique_not_valid_path(target_path)
+    shutil.move(str(source_path), str(target_path))
+    return target_path
+
+
+def build_not_valid_target_path(root_path: Path, source_path: Path):
+    base_path = resolve_not_valid_base_path(root_path)
+    quarantine_root = base_path / INVALID_IMAGE_DIRECTORY_NAME
+    resolved_source_path = source_path.resolve()
+    resolved_quarantine_root = quarantine_root.resolve()
+    try:
+        resolved_source_path.relative_to(resolved_quarantine_root)
+        return resolved_source_path
+    except ValueError:
+        pass
+
+    try:
+        relative_path = resolved_source_path.relative_to(base_path)
+    except ValueError:
+        relative_path = Path(source_path.name)
+
+    return quarantine_root / relative_path
+
+
+def resolve_not_valid_base_path(root_path: Path):
+    resolved_root_path = root_path.expanduser().resolve()
+    if resolved_root_path.name.lower() in IMAGE_DIRECTORY_NAMES:
+        return resolved_root_path.parent
+    return resolved_root_path
+
+
+def build_unique_not_valid_path(target_path: Path):
+    if not target_path.exists():
+        return target_path
+
+    parent = target_path.parent
+    stem = target_path.stem
+    suffix = target_path.suffix
+    for index in range(1, 1000):
+        candidate = parent / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+
+    return parent / f"{stem}-{uuid4().hex}{suffix}"
 
 
 def remove_image_from_matching_sessions(root_path: Path, image_id: str):
@@ -2989,16 +3347,44 @@ def serialize_session(session: LocalSession):
         "sessionId": session.id,
         "sessionLabel": session.label,
         "rootPath": str(session.root_path),
-        "images": [
-            {
-                "id": image.id,
-                "name": image.name,
-                "relativePath": image.relative_path,
-                "annotationCount": image.annotation_count,
-                "annotationFormat": image.annotation_format,
-            }
-            for image in session.images
-        ],
+        "images": [serialize_session_image(image) for image in session.images],
+    }
+
+
+def serialize_session_image(image: SessionImage):
+    return {
+        "id": image.id,
+        "name": image.name,
+        "relativePath": image.relative_path,
+        "annotationCount": image.annotation_count,
+        "annotationFormat": image.annotation_format,
+    }
+
+
+def serialize_image_delete_response(
+    session: LocalSession,
+    deleted_images: list[SessionImage],
+):
+    return {
+        "cancelled": False,
+        "sessionId": session.id,
+        "sessionLabel": session.label,
+        "rootPath": str(session.root_path),
+        "deletedImageIds": [image.id for image in deleted_images],
+        "deletedImages": [serialize_session_image(image) for image in deleted_images],
+        "remainingImageCount": len(session.images),
+    }
+
+
+def serialize_local_session_notification(notification: LocalSessionNotification):
+    return {
+        "sequence": notification.sequence,
+        "type": notification.type,
+        "tone": notification.tone,
+        "message": notification.message,
+        "imageId": notification.image_id,
+        "relativePath": notification.relative_path,
+        "quarantinePath": notification.quarantine_path,
     }
 
 
@@ -3136,6 +3522,8 @@ def run_fingerprint_warmup_worker():
             _, cache_hit = load_or_build_duplicate_image_signature(root_path, image)
             if not cache_hit:
                 time.sleep(FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS)
+        except InvalidSessionImageError as exc:
+            LOGGER.info("%s", exc)
         except FileNotFoundError:
             LOGGER.info(
                 "Background fingerprint warmup skipped missing image %s",
@@ -3180,6 +3568,9 @@ def run_duplicate_search_job(
                 signature, _ = load_or_build_duplicate_image_signature(root_path, image)
             except HTTPException:
                 raise
+            except InvalidSessionImageError as exc:
+                LOGGER.info("%s", exc)
+                signature = None
             except FileNotFoundError:
                 LOGGER.info(
                     "Skipping missing duplicate-search image %s",
@@ -3304,7 +3695,13 @@ def load_or_build_duplicate_image_signature(root_path: Path, image: SessionImage
     if cached_signature is not None:
         return cached_signature, True
 
-    signature = build_duplicate_image_signature(image.full_path)
+    try:
+        signature = build_duplicate_image_signature(image.full_path)
+    except Exception as exc:
+        if is_unidentified_image_error(exc):
+            quarantine_path = quarantine_invalid_session_image(root_path, image)
+            raise InvalidSessionImageError(image, quarantine_path) from exc
+        raise
     try:
         CACHE_STORE.save_image_fingerprint(
             root_path=root_path,
@@ -3379,6 +3776,15 @@ def is_duplicate_search_match_active(
         left_image_id in session.images_by_id
         and right_image_id in session.images_by_id
     )
+
+
+def is_unidentified_image_error(exc: Exception):
+    try:
+        from PIL import UnidentifiedImageError
+    except Exception:
+        return exc.__class__.__name__ == "UnidentifiedImageError"
+
+    return isinstance(exc, UnidentifiedImageError)
 
 
 def build_duplicate_image_signature(image_path: Path):
@@ -4418,6 +4824,11 @@ def collect_directory_images(root_path: Path):
 
 def iter_directory_images(root_path: Path):
     for current_root, dir_names, file_names in os.walk(root_path):
+        dir_names[:] = [
+            dir_name
+            for dir_name in dir_names
+            if dir_name.lower() != INVALID_IMAGE_DIRECTORY_NAME
+        ]
         dir_names.sort(key=natural_sort_key)
         file_names.sort(key=natural_sort_key)
 
@@ -4426,6 +4837,114 @@ def iter_directory_images(root_path: Path):
             path = current_root_path / file_name
             if path.suffix.lower() in IMAGE_EXTENSIONS:
                 yield path
+
+
+def resolve_default_image_upload_dir(root_path: Path):
+    if root_path.name.lower() in IMAGE_DIRECTORY_NAMES:
+        return root_path
+
+    preferred_names = ("images", "image", "imgs")
+    for preferred_name in preferred_names:
+        candidate = root_path / preferred_name
+        if candidate.is_dir():
+            return candidate
+
+    return root_path
+
+
+def ensure_local_session_upload_dir(session: LocalSession):
+    upload_dir = resolve_default_image_upload_dir(session.root_path)
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create image upload directory",
+        ) from exc
+
+    return upload_dir
+
+
+async def save_local_session_upload(upload_dir: Path, filename: str, chunks):
+    safe_filename = sanitize_upload_filename(filename)
+    if Path(safe_filename).suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported image file")
+
+    target_path = build_unique_upload_path(upload_dir, safe_filename)
+    temp_file = tempfile.NamedTemporaryFile(
+        "wb",
+        prefix=f".{target_path.stem}-",
+        suffix=".upload",
+        dir=upload_dir,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    bytes_written = 0
+
+    try:
+        with temp_file as output:
+            async for chunk in chunks:
+                if not chunk:
+                    continue
+                bytes_written += len(chunk)
+                output.write(chunk)
+
+        if bytes_written <= 0:
+            raise HTTPException(status_code=400, detail="Uploaded image is empty")
+
+        try:
+            read_image_size(temp_path)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file is not a readable image",
+            ) from exc
+
+        shutil.move(str(temp_path), target_path)
+        return target_path
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                LOGGER.warning("Failed to remove temporary upload %s", temp_path)
+
+
+async def iter_upload_file_chunks(upload_file: UploadFile):
+    while True:
+        chunk = await upload_file.read(IMAGE_UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        yield chunk
+
+
+def sanitize_upload_filename(filename: str):
+    normalized = filename.replace("\\", "/")
+    basename = Path(normalized).name.strip()
+    basename = re.sub(r"[\x00-\x1f\x7f]+", "", basename)
+    basename = re.sub(r'[<>:"/\\|?*]+', "_", basename).strip(" .")
+    if not basename:
+        raise HTTPException(status_code=400, detail="Uploaded image needs a filename")
+
+    stem = Path(basename).stem.strip(" .") or "image"
+    suffix = Path(basename).suffix.lower()
+    return f"{stem}{suffix}"
+
+
+def build_unique_upload_path(directory: Path, filename: str):
+    parsed_filename = Path(filename)
+    stem = parsed_filename.stem or "image"
+    suffix = parsed_filename.suffix.lower()
+    candidate = directory / f"{stem}{suffix}"
+    counter = 1
+
+    while candidate.exists():
+        candidate = directory / f"{stem}-{counter}{suffix}"
+        counter += 1
+
+    return candidate
 
 
 def natural_sort_key(value: str):

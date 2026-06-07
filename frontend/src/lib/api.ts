@@ -50,9 +50,45 @@ export type LocalSessionInfoResponse = {
   classes: LocalSessionClassInfo[]
 }
 
+export type LocalSessionNotification = {
+  sequence: number
+  type: string
+  tone: 'info' | 'success' | 'error'
+  message: string
+  imageId?: string | null
+  relativePath?: string | null
+  quarantinePath?: string | null
+}
+
+export type LocalSessionNotificationsResponse = {
+  sequence: number
+  notifications: LocalSessionNotification[]
+  session?: LocalSessionResponse | null
+}
+
 export type LocalSessionJobStartResponse = {
   cancelled: boolean
   jobId?: string
+}
+
+export type LocalSessionImageUploadResponse = {
+  image: LocalSessionImage
+  session: LocalSessionResponse
+}
+
+export type LocalSessionImagesUploadResponse = {
+  images: LocalSessionImage[]
+  session: LocalSessionResponse
+}
+
+export type LocalSessionImageDeleteResponse = {
+  cancelled: boolean
+  sessionId?: string
+  sessionLabel?: string
+  rootPath?: string
+  deletedImageIds: string[]
+  deletedImages?: LocalSessionImage[]
+  remainingImageCount: number
 }
 
 export type LocalAnnotation = {
@@ -557,6 +593,38 @@ export async function fetchLocalSessionJob(jobId: string, afterRevision = 0) {
   )
 }
 
+export async function uploadLocalSessionImage(sessionId: string, file: File) {
+  const params = new URLSearchParams({
+    filename: file.name,
+  })
+
+  return requestJson<LocalSessionImageUploadResponse>(
+    `/api/local/sessions/${sessionId}/images/upload?${params.toString()}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': file.type || 'application/octet-stream',
+      },
+      body: file,
+    },
+  )
+}
+
+export async function uploadLocalSessionImages(sessionId: string, files: File[]) {
+  const formData = new FormData()
+  for (const file of files) {
+    formData.append('files', file, file.name)
+  }
+
+  return requestJson<LocalSessionImagesUploadResponse>(
+    `/api/local/sessions/${sessionId}/images/bulk-upload`,
+    {
+      method: 'POST',
+      body: formData,
+    },
+  )
+}
+
 export async function startLocalDuplicateSearch(
   sessionId: string,
   minimumSimilarityPercent: number,
@@ -596,6 +664,15 @@ export async function fetchLocalSessionInfo(sessionId: string) {
   )
 }
 
+export async function fetchLocalSessionNotifications(
+  sessionId: string,
+  afterSequence = 0,
+) {
+  return requestJson<LocalSessionNotificationsResponse>(
+    `/api/local/sessions/${sessionId}/notifications?after_sequence=${afterSequence}`,
+  )
+}
+
 export async function saveLocalAnnotations(
   sessionId: string,
   imageId: string,
@@ -621,8 +698,8 @@ export async function deleteLocalSessionImage(
   sessionId: string,
   imageId: string,
 ) {
-  return requestJson<LocalSessionResponse>(
-    `/api/local/sessions/${sessionId}/images/${imageId}`,
+  return requestJson<LocalSessionImageDeleteResponse>(
+    `/api/local/sessions/${sessionId}/images/${imageId}?response_mode=summary`,
     {
       method: 'DELETE',
     },
@@ -633,8 +710,8 @@ export async function deleteLocalSessionImages(
   sessionId: string,
   imageIds: string[],
 ) {
-  return requestJson<LocalSessionResponse>(
-    `/api/local/sessions/${sessionId}/images/bulk-delete`,
+  return requestJson<LocalSessionImageDeleteResponse>(
+    `/api/local/sessions/${sessionId}/images/bulk-delete?response_mode=summary`,
     {
       method: 'POST',
       headers: {
