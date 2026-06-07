@@ -91,6 +91,7 @@ export type LocalSessionImageUploadResponse = {
 export type LocalSessionImagesUploadResponse = {
   images: LocalSessionImage[]
   session: LocalSessionResponse
+  skippedExistingFilenames?: string[]
 }
 
 export type LocalSessionImageDeleteResponse = {

@@ -1052,10 +1052,18 @@ async def upload_local_session_image(
         raise HTTPException(status_code=404, detail="Session not found")
 
     upload_dir = ensure_local_session_upload_dir(session)
+    target_path = resolve_upload_target_path(upload_dir, filename)
+    if any(image.name == target_path.name for image in session.images):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Image file already exists: {target_path.name}",
+        )
+
     target_path = await save_local_session_upload(
         upload_dir,
         filename,
         request.stream(),
+        target_path=target_path,
     )
 
     uploaded_image = build_session_image(target_path, session.root_path)
@@ -1087,16 +1095,40 @@ async def upload_local_session_images(
 
     upload_dir = ensure_local_session_upload_dir(session)
     uploaded_paths: list[Path] = []
+    skipped_existing_filenames: list[str] = []
+    existing_image_names = {image.name for image in session.images}
+    accepted_image_names: set[str] = set()
 
     try:
         for upload_file in files:
-            uploaded_paths.append(
-                await save_local_session_upload(
-                    upload_dir,
-                    upload_file.filename or "",
-                    iter_upload_file_chunks(upload_file),
-                )
+            target_path = resolve_upload_target_path(
+                upload_dir,
+                upload_file.filename or "",
             )
+            target_name = target_path.name
+            if (
+                target_name in existing_image_names
+                or target_name in accepted_image_names
+                or target_path.exists()
+            ):
+                skipped_existing_filenames.append(target_path.name)
+                continue
+
+            try:
+                uploaded_paths.append(
+                    await save_local_session_upload(
+                        upload_dir,
+                        upload_file.filename or "",
+                        iter_upload_file_chunks(upload_file),
+                        target_path=target_path,
+                    )
+                )
+                accepted_image_names.add(target_name)
+            except HTTPException as exc:
+                if exc.status_code == 409:
+                    skipped_existing_filenames.append(target_path.name)
+                    continue
+                raise
     except Exception:
         for uploaded_path in uploaded_paths:
             try:
@@ -1112,13 +1144,14 @@ async def upload_local_session_images(
         build_session_image(uploaded_path, session.root_path)
         for uploaded_path in uploaded_paths
     ]
-    upsert_images_in_matching_sessions(session.root_path, uploaded_images)
-    CACHE_STORE.save_dataset_manifest(
-        session.root_path,
-        session.label,
-        serialize_manifest_images(session.images),
-    )
-    schedule_session_fingerprint_warmup(session)
+    if uploaded_images:
+        upsert_images_in_matching_sessions(session.root_path, uploaded_images)
+        CACHE_STORE.save_dataset_manifest(
+            session.root_path,
+            session.label,
+            serialize_manifest_images(session.images),
+        )
+        schedule_session_fingerprint_warmup(session)
 
     return {
         "images": [
@@ -1126,6 +1159,7 @@ async def upload_local_session_images(
             for uploaded_image in uploaded_images
         ],
         "session": serialize_session(session),
+        "skippedExistingFilenames": skipped_existing_filenames,
     }
 
 
@@ -4865,12 +4899,22 @@ def ensure_local_session_upload_dir(session: LocalSession):
     return upload_dir
 
 
-async def save_local_session_upload(upload_dir: Path, filename: str, chunks):
-    safe_filename = sanitize_upload_filename(filename)
-    if Path(safe_filename).suffix.lower() not in IMAGE_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported image file")
+async def save_local_session_upload(
+    upload_dir: Path,
+    filename: str,
+    chunks,
+    *,
+    target_path: Path | None = None,
+):
+    if target_path is None:
+        target_path = resolve_upload_target_path(upload_dir, filename)
 
-    target_path = build_unique_upload_path(upload_dir, safe_filename)
+    if target_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Image file already exists: {target_path.name}",
+        )
+
     temp_file = tempfile.NamedTemporaryFile(
         "wb",
         prefix=f".{target_path.stem}-",
@@ -4902,6 +4946,11 @@ async def save_local_session_upload(upload_dir: Path, filename: str, chunks):
                 detail="Uploaded file is not a readable image",
             ) from exc
 
+        if target_path.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Image file already exists: {target_path.name}",
+            )
         shutil.move(str(temp_path), target_path)
         return target_path
     finally:
@@ -4933,18 +4982,12 @@ def sanitize_upload_filename(filename: str):
     return f"{stem}{suffix}"
 
 
-def build_unique_upload_path(directory: Path, filename: str):
-    parsed_filename = Path(filename)
-    stem = parsed_filename.stem or "image"
-    suffix = parsed_filename.suffix.lower()
-    candidate = directory / f"{stem}{suffix}"
-    counter = 1
+def resolve_upload_target_path(directory: Path, filename: str):
+    safe_filename = sanitize_upload_filename(filename)
+    if Path(safe_filename).suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported image file")
 
-    while candidate.exists():
-        candidate = directory / f"{stem}-{counter}{suffix}"
-        counter += 1
-
-    return candidate
+    return directory / safe_filename
 
 
 def natural_sort_key(value: str):

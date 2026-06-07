@@ -4654,7 +4654,9 @@ function App() {
     const sessionId = currentSessionId
     let firstUploadedRelativePath: string | null = null
     let lastSession: LocalSessionResponse | null = null
-    let completedCount = 0
+    let addedCount = 0
+    let processedCount = 0
+    const skippedExistingFilenames: string[] = []
 
     const applyUploadedSession = () => {
       if (!lastSession || !firstUploadedRelativePath) {
@@ -4698,11 +4700,13 @@ function App() {
           startIndex + DROP_UPLOAD_BATCH_SIZE,
         )
         const result = await uploadLocalSessionImages(sessionId, batchFiles)
-        completedCount += result.images.length
+        addedCount += result.images.length
+        processedCount += batchFiles.length
+        skippedExistingFilenames.push(...(result.skippedExistingFilenames ?? []))
         firstUploadedRelativePath ??= result.images[0]?.relativePath ?? null
         lastSession = result.session
         setDropUploadProgress({
-          processed: completedCount,
+          processed: processedCount,
           total: imageFiles.length,
         })
       }
@@ -4713,14 +4717,31 @@ function App() {
 
       applyUploadedSession()
       const addedText =
-        completedCount === 1
+        addedCount === 1
           ? `Added ${firstUploadedRelativePath}.`
-          : `Added ${completedCount.toLocaleString()} images.`
-      const skippedText =
+          : `Added ${addedCount.toLocaleString()} images.`
+      const unsupportedSkippedText =
         skippedCount > 0
           ? ` Skipped ${skippedCount.toLocaleString()} unsupported file${skippedCount === 1 ? '' : 's'}.`
           : ''
-      pushToast(`${addedText}${skippedText}`, 'success')
+      const existingSkippedText =
+        skippedExistingFilenames.length > 0
+          ? ` ${formatExistingImageSkipMessage(skippedExistingFilenames)}`
+          : ''
+
+      if (addedCount > 0) {
+        pushToast(
+          `${addedText}${existingSkippedText}${unsupportedSkippedText}`,
+          'success',
+        )
+      } else if (skippedExistingFilenames.length > 0) {
+        pushToast(
+          `${formatExistingImageSkipMessage(skippedExistingFilenames)}${unsupportedSkippedText}`,
+          'info',
+        )
+      } else {
+        pushToast(`No images were added.${unsupportedSkippedText}`, 'info')
+      }
     } catch (error) {
       if (currentSessionIdRef.current === sessionId) {
         applyUploadedSession()
@@ -4729,8 +4750,8 @@ function App() {
       const baseMessage =
         error instanceof Error ? error.message : 'Failed to add dropped images'
       const partialMessage =
-        completedCount > 0
-          ? ` Added ${completedCount.toLocaleString()} of ${imageFiles.length.toLocaleString()} images before the error.`
+        addedCount > 0
+          ? ` Added ${addedCount.toLocaleString()} of ${imageFiles.length.toLocaleString()} images before the error.`
           : ''
       setSessionError(`${baseMessage}${partialMessage}`)
     } finally {
@@ -8239,6 +8260,25 @@ function isSupportedDroppedImageFile(file: File) {
 function getFileExtension(filename: string) {
   const dotIndex = filename.lastIndexOf('.')
   return dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : ''
+}
+
+function formatExistingImageSkipMessage(filenames: string[]) {
+  const uniqueFilenames = [...new Set(filenames)]
+  const filenameList = formatFilenameListPreview(uniqueFilenames)
+
+  return uniqueFilenames.length === 1
+    ? `Image already exists and was not added: ${filenameList}.`
+    : `${uniqueFilenames.length.toLocaleString()} images already exist and were not added: ${filenameList}.`
+}
+
+function formatFilenameListPreview(filenames: string[]) {
+  const visibleFilenames = filenames.slice(0, 3)
+  const remainingCount = filenames.length - visibleFilenames.length
+  const visibleText = visibleFilenames.join(', ')
+
+  return remainingCount > 0
+    ? `${visibleText}, and ${remainingCount.toLocaleString()} more`
+    : visibleText
 }
 
 function getBufferedEntries(
