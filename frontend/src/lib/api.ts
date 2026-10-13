@@ -134,7 +134,7 @@ export type SaveLocalAnnotationsResponse = {
 export type LocalSessionJobResponse = {
   jobId: string
   status: 'running' | 'completed' | 'failed'
-  phase: 'indexing' | 'loading' | 'completed' | 'failed'
+  phase: 'indexing' | 'validating' | 'loading' | 'completed' | 'failed'
   processedImages: number
   totalImages: number
   sessionRevision: number
@@ -169,6 +169,8 @@ export type LocalDuplicateSearchJobResponse = {
   minimumSimilarityPercent: number
   revision: number
   matchCount: number
+  resultLimit: number
+  resultLimitReached: boolean
   matches?: LocalDuplicateSearchMatch[] | null
   error?: string | null
 }
@@ -558,13 +560,15 @@ export async function openLocalImage() {
   })
 }
 
-export async function openLocalImagePath(path: string) {
+export async function openLocalImagePath(path: string, signal?: AbortSignal) {
   return requestJson<LocalSessionResponse>('/api/local/sessions/open-image-path', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ path }),
+    signal,
+    timeoutMs: 30_000,
   })
 }
 
@@ -587,7 +591,7 @@ export async function openLocalDirectoryPath(path: string) {
   )
 }
 
-export async function openLocalDirectoryPathJob(path: string) {
+export async function openLocalDirectoryPathJob(path: string, signal?: AbortSignal) {
   return requestJson<LocalSessionJobStartResponse>(
     '/api/local/sessions/open-directory-path-job',
     {
@@ -596,13 +600,16 @@ export async function openLocalDirectoryPathJob(path: string) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ path }),
+      signal,
+      timeoutMs: 30_000,
     },
   )
 }
 
-export async function fetchLocalSessionJob(jobId: string, afterRevision = 0) {
+export async function fetchLocalSessionJob(jobId: string, afterRevision = 0, signal?: AbortSignal) {
   return requestJson<LocalSessionJobResponse>(
     `/api/local/session-jobs/${jobId}?after_revision=${afterRevision}`,
+    { signal, timeoutMs: 30_000 },
   )
 }
 
@@ -665,9 +672,15 @@ export async function fetchLocalDuplicateSearchJob(
   )
 }
 
-export async function fetchLocalAnnotations(sessionId: string, imageId: string) {
+export async function fetchLocalAnnotations(sessionId: string, imageId: string, signal?: AbortSignal) {
   return requestJson<LocalImageAnnotationsResponse>(
-    `/api/local/sessions/${sessionId}/annotations/${imageId}`,
+    `/api/local/sessions/${sessionId}/annotations/${imageId}`, { signal },
+  )
+}
+
+export async function fetchLocalImageMetadata(sessionId: string, imageId: string, signal?: AbortSignal) {
+  return requestJson<{ width: number; height: number }>(
+    `/api/local/sessions/${sessionId}/images/${imageId}/metadata`, { signal },
   )
 }
 
@@ -705,6 +718,18 @@ export async function saveLocalAnnotations(
         annotations,
         projectClasses,
       }),
+    },
+  )
+}
+
+
+export async function renameLocalClass(sessionId: string, sourceLabel: string, targetLabel: string) {
+  return requestJson<{ session: LocalSessionResponse }>(
+    `/api/local/sessions/${sessionId}/classes/rename`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceLabel, targetLabel }),
     },
   )
 }
@@ -789,12 +814,18 @@ async function requestJson<T>(path: string, init?: RequestJsonOptions) {
     }, timeoutMs)
   }
 
-  let response: Response
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
       ...requestInit,
       signal: controller?.signal ?? signal,
     })
+    if (!response.ok) {
+      const detail = await readErrorDetail(response)
+      throw new ApiError(response.status, detail)
+    }
+    // Keep cancellation connected until the body is consumed, not just until
+    // headers arrive. Large annotation responses can still be downloading.
+    return (await response.json()) as T
   } catch (error) {
     if (didTimeout && timeoutMs) {
       throw new Error(
@@ -810,13 +841,6 @@ async function requestJson<T>(path: string, init?: RequestJsonOptions) {
       signal.removeEventListener('abort', abortListener)
     }
   }
-
-  if (!response.ok) {
-    const detail = await readErrorDetail(response)
-    throw new ApiError(response.status, detail)
-  }
-
-  return (await response.json()) as T
 }
 
 async function readErrorDetail(response: Response) {

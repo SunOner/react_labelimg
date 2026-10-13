@@ -2,6 +2,7 @@ import base64
 import hashlib
 import html
 import importlib.util
+import io
 import json
 import logging
 import math
@@ -21,8 +22,9 @@ import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib.metadata import version as package_version
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import BoundedSemaphore, Condition, Lock, Thread
 from typing import Any, Callable, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -32,7 +34,7 @@ from xml.etree import ElementTree
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from .cache_store import CacheStore
@@ -62,7 +64,17 @@ SAM3_SOURCE_ARCHIVE_URL = (
 )
 SAM3_RUNTIME_EXTRA_DEPENDENCIES = (
     "einops",
+    # SAM's model builder imports pkg_resources, removed in setuptools 81.
+    "setuptools>=61,<81",
 )
+SAM3_RUNTIME_DEPENDENCY_REQUIREMENTS = {
+    "cv2": "opencv-python<4.12",  # SAM requires NumPy < 2.
+    "pkg_resources": "setuptools>=61,<81",
+    "PIL": "Pillow>=10,<12",
+    "skimage": "scikit-image",
+    "hydra": "hydra-core",
+    "yaml": "PyYAML",
+}
 PIP_IPV4_WRAPPER_CODE = """
 import runpy
 import socket
@@ -118,6 +130,12 @@ FINGERPRINT_WARMUP_COMPUTE_PAUSE_SECONDS = 0.01
 FINGERPRINT_WARMUP_BUSY_WAIT_SECONDS = 0.35
 ANNOTATION_DEDUPLICATION_PRECISION_DIGITS = 4
 CACHE_OPERATION_WARNING_INTERVAL_SECONDS = 15.0
+MAX_DUPLICATE_SEARCH_MATCHES = 5_000
+MAX_RETAINED_DUPLICATE_SEARCH_JOBS = 3
+IMAGE_PREVIEW_MAX_SIZE = 512
+IMAGE_PREVIEW_SLOTS = BoundedSemaphore(2)
+SESSION_PROGRESS_PUBLISH_INTERVAL_SECONDS = 0.75
+MAX_RETAINED_SESSION_JOBS = 3
 
 
 @dataclass(slots=True)
@@ -147,6 +165,7 @@ class SessionOpenJob:
     id: str
     status: str
     phase: str
+    root_path: str | None = None
     processed_images: int = 0
     total_images: int = 0
     session_revision: int = 0
@@ -168,6 +187,7 @@ class DuplicateSearchJob:
     total_pairs: int = 0
     revision: int = 0
     matches: list[dict[str, Any]] = field(default_factory=list)
+    result_limit_reached: bool = False
     error: str | None = None
 
 
@@ -320,6 +340,11 @@ class SaveLocalAnnotationsPayload(BaseModel):
     projectClasses: list[str] | None = None
 
 
+class RenameLocalClassPayload(BaseModel):
+    sourceLabel: str
+    targetLabel: str
+
+
 class PluginDownloadRequest(BaseModel):
     force: bool = False
 
@@ -364,6 +389,7 @@ LOCAL_IMAGE_PATHS: dict[str, Path] = {}
 LOCAL_SESSION_NOTIFICATIONS: dict[str, list[LocalSessionNotification]] = {}
 LOCAL_SESSION_NOTIFICATION_SEQUENCE = 0
 LOCAL_SESSION_NOTIFICATION_LOCK = Lock()
+ANNOTATION_WRITE_LOCK = Lock()
 SESSION_JOB_LOCK = Lock()
 DUPLICATE_SEARCH_JOBS: dict[str, DuplicateSearchJob] = {}
 DUPLICATE_SEARCH_LOCK = Lock()
@@ -743,7 +769,7 @@ def auto_annotate_with_plugin(plugin_id: str, payload: PluginAutoAnnotateRequest
 
 
 @app.post("/api/local/sessions/open-image")
-async def open_local_image():
+def open_local_image():
     selected_path = choose_local_image()
     if selected_path is None:
         return {"cancelled": True}
@@ -752,7 +778,7 @@ async def open_local_image():
 
 
 @app.post("/api/local/sessions/open-directory")
-async def open_local_directory():
+def open_local_directory():
     selected_path = choose_local_directory()
     if selected_path is None:
         return {"cancelled": True}
@@ -799,26 +825,20 @@ def open_local_directory_path_job(payload: PathRequest):
 
 @app.get("/api/local/session-jobs/{job_id}")
 def read_local_session_job(job_id: str, after_revision: int = 0):
-    job = LOCAL_SESSION_JOBS.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Session job not found")
-
-    session_payload = (
-        job.session_payload
-        if job.session_payload is not None and job.session_revision > after_revision
-        else None
-    )
-
-    return {
-        "jobId": job.id,
-        "status": job.status,
-        "phase": job.phase,
-        "processedImages": job.processed_images,
-        "totalImages": job.total_images,
-        "sessionRevision": job.session_revision,
-        "session": session_payload,
-        "error": job.error,
-    }
+    with SESSION_JOB_LOCK:
+        job = LOCAL_SESSION_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Session job not found")
+        return {
+            "jobId": job.id,
+            "status": job.status,
+            "phase": job.phase,
+            "processedImages": job.processed_images,
+            "totalImages": job.total_images,
+            "sessionRevision": job.session_revision,
+            "session": job.session_payload if job.session_revision > after_revision else None,
+            "error": job.error,
+        }
 
 
 @app.post("/api/local/sessions/{session_id}/duplicate-search")
@@ -874,7 +894,6 @@ def read_local_duplicate_search_job(job_id: str, after_revision: int = 0):
 
         revision = job.revision
         all_matches = list(job.matches)
-        matches_payload = list(all_matches) if revision > after_revision else None
         response = {
             "jobId": job.id,
             "status": job.status,
@@ -885,6 +904,8 @@ def read_local_duplicate_search_job(job_id: str, after_revision: int = 0):
             "totalPairs": job.total_pairs,
             "minimumSimilarityPercent": job.minimum_similarity_percent,
             "revision": revision,
+            "resultLimit": MAX_DUPLICATE_SEARCH_MATCHES,
+            "resultLimitReached": job.result_limit_reached,
             "error": job.error,
         }
         session_id = job.session_id
@@ -894,14 +915,7 @@ def read_local_duplicate_search_job(job_id: str, after_revision: int = 0):
         all_matches,
     )
     response["matchCount"] = len(filtered_matches)
-    response["matches"] = (
-        filter_duplicate_search_matches_for_active_session(
-            session_id,
-            matches_payload or [],
-        )
-        if matches_payload is not None
-        else None
-    )
+    response["matches"] = filtered_matches if revision > after_revision else None
     return response
 
 
@@ -934,6 +948,42 @@ def read_local_session_info(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     return build_local_session_info(session)
+
+
+@app.get("/api/local/sessions/{session_id}/images/{image_id}/metadata")
+def read_local_image_metadata(session_id: str, image_id: str):
+    from PIL import Image
+
+    path = resolve_local_image_path(image_id, session_id)
+    with Image.open(path) as image:
+        width, height = image.size
+        # Match the browser's natural dimensions for camera JPEGs without
+        # decoding pixels. Annotation file size readers keep their own rules.
+        if image.format == "JPEG" and image.getexif().get(274) in (5, 6, 7, 8):
+            width, height = height, width
+    return {"width": width, "height": height}
+
+
+@app.get("/api/local/sessions/{session_id}/images/{image_id}/preview")
+@app.get("/api/local/images/{image_id}/preview")
+def read_local_image_preview(image_id: str, session_id: str | None = None):
+    from PIL import Image, ImageOps
+
+    path = resolve_local_image_path(image_id, session_id)
+    # Limit concurrent full source decodes as well as browser preview dimensions.
+    with IMAGE_PREVIEW_SLOTS:
+        with Image.open(path) as image:
+            image.draft("RGB", (IMAGE_PREVIEW_MAX_SIZE, IMAGE_PREVIEW_MAX_SIZE))
+            image.thumbnail((IMAGE_PREVIEW_MAX_SIZE, IMAGE_PREVIEW_MAX_SIZE))
+            with ImageOps.exif_transpose(image) as oriented:
+                preview = oriented.convert("RGBA" if "A" in oriented.getbands() or "transparency" in oriented.info else "RGB")
+            try:
+                with io.BytesIO() as output:
+                    preview.save(output, format="PNG")
+                    content = output.getvalue()
+            finally:
+                preview.close()
+    return Response(content, media_type="image/png", headers=IMMUTABLE_IMAGE_HEADERS)
 
 
 @app.get("/api/local/sessions/{session_id}/notifications")
@@ -1039,6 +1089,88 @@ def bulk_delete_local_session_images(
         raise HTTPException(status_code=400, detail="Select at least one image")
 
     return delete_local_session_images(session, image_ids, response_mode=response_mode)
+
+
+@app.post("/api/local/sessions/{session_id}/classes/rename")
+def rename_local_session_class(session_id: str, payload: RenameLocalClassPayload):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    source = payload.sourceLabel.strip()
+    target = payload.targetLabel.strip()
+    if not source or not target or any(c in source + target for c in "\r\n"):
+        raise HTTPException(status_code=400, detail="Class names must be nonempty single lines")
+    if source == target:
+        return {"session": serialize_session(session)}
+
+    with ANNOTATION_WRITE_LOCK:
+        # Include images added externally since the session was opened.
+        images = [build_session_image(path, session.root_path)
+                  for path in iter_directory_images(session.root_path)]
+        planned: dict[Path, str] = {}
+
+        def plan_yolo_class_rename(annotation_path: Path):
+            class_source = load_yolo_classes(annotation_path.parent, session.root_path)
+            if source not in class_source.names:
+                return
+            if target in class_source.names:
+                raise HTTPException(status_code=409, detail=f"Class already exists: {target}")
+            path = resolve_yolo_classes_output_path(session, annotation_path, class_source)
+            names = [target if name == source else name for name in class_source.names]
+            planned[path] = "\n".join(names) + "\n"
+
+        # Class lists also matter for classes that have not yet been used.
+        plan_yolo_class_rename(session.root_path / "image.txt")
+        for image in images:
+            if image.annotation_format != "voc":
+                plan_yolo_class_rename(image.annotation_path or resolve_annotation_output_path(session, image, "yolo"))
+            elif image.annotation_path is not None:
+                try:
+                    tree = ElementTree.parse(image.annotation_path)
+                except (OSError, ElementTree.ParseError) as exc:
+                    raise HTTPException(status_code=400, detail=f"Cannot read {image.annotation_path.name}") from exc
+                changed = False
+                for node in tree.getroot().findall("object/name"):
+                    if (node.text or "").strip() == target:
+                        raise HTTPException(status_code=409, detail=f"Class already exists: {target}")
+                    if (node.text or "").strip() == source:
+                        node.text = target
+                        changed = True
+                if changed:
+                    planned[image.annotation_path] = ElementTree.tostring(tree.getroot(), encoding="unicode")
+
+        originals = {path: path.read_bytes().decode("utf-8") if path.exists() else None
+                     for path in planned}
+        written: list[Path] = []
+        try:
+            for path, contents in planned.items():
+                write_text_atomically(path, contents)
+                written.append(path)
+        except OSError as exc:
+            for path in reversed(written):
+                try:
+                    original = originals[path]
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        write_text_atomically(path, original)
+                except OSError:
+                    LOGGER.exception("Failed to restore class rename at %s", path)
+            raise HTTPException(status_code=500, detail="Class rename failed; original files restored where possible") from exc
+        # Invalidate caches even when a rename keeps the same file size/mtime.
+        try:
+            CACHE_STORE.clear_annotation_cache()
+        except sqlite3.Error as exc:
+            log_cache_operation_warning("Class rename committed; annotation cache clear failed", exc)
+        for active in list(LOCAL_SESSIONS.values()):
+            if active.root_path == session.root_path:
+                for image in active.images:
+                    image.annotation_path, image.annotation_format, image.annotation_count = find_annotation_sidecar(image.full_path, active.root_path)
+        try:
+            CACHE_STORE.save_dataset_manifest(session.root_path, session.label, serialize_manifest_images(session.images))
+        except sqlite3.Error as exc:
+            log_cache_operation_warning("Class rename committed; manifest cache update failed", exc)
+    return {"session": serialize_session(session)}
 
 
 @app.post("/api/local/sessions/{session_id}/images/upload")
@@ -1252,6 +1384,12 @@ def build_hf_oauth_redirect_uri(request: Request):
 
 def resolve_local_request_path(raw_path: str):
     normalized_path = (raw_path or "").strip()
+    if (
+        len(normalized_path) >= 2
+        and normalized_path[0] == normalized_path[-1]
+        and normalized_path[0] in {"'", '"'}
+    ):
+        normalized_path = normalized_path[1:-1]
     if not normalized_path:
         return Path(".").resolve()
 
@@ -1891,6 +2029,7 @@ def append_plugin_runtime_install_log(plugin_id: str, text: str):
         return
 
     normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+    LOGGER.info("%s", normalized_text.rstrip())
     with PLUGIN_RUNTIME_INSTALL_LOCK:
         current = PLUGIN_RUNTIME_INSTALL_JOBS.get(plugin_id)
         if current is None:
@@ -1960,10 +2099,10 @@ def ensure_supported_sam_runtime_host():
 
 def ensure_supported_sam_runtime_platform():
     current_platform = platform.system()
-    if current_platform != "Linux":
+    if current_platform not in {"Linux", "Windows"}:
         raise RuntimeError(
-            "Official SAM 3 runtime is not supported on native "
-            f"{current_platform}. Use Linux or WSL2 with an NVIDIA GPU and CUDA 12.6+.",
+            f"SAM 3 runtime is not supported on {current_platform}. "
+            "Use Windows or Ubuntu with an NVIDIA GPU and CUDA 12.6+.",
         )
 
 
@@ -2025,10 +2164,14 @@ def run_pip_command(
     command_display = " ".join(
         shlex.quote(part) for part in [sys.executable, "-u", "-m", "pip", *arguments]
     )
+    if os.name == "nt":
+        command_display = subprocess.list2cmdline(
+            [sys.executable, "-u", "-m", "pip", *arguments]
+        )
     if runtime_plugin_id:
         log_plugin_runtime_install_event(
             runtime_plugin_id,
-            "Using IPv4-only pip networking to avoid WSL IPv6 stalls.",
+            "Using IPv4-only pip networking.",
         )
         append_plugin_runtime_install_log(
             runtime_plugin_id,
@@ -2042,6 +2185,9 @@ def run_pip_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUTF8": "1"},
             bufsize=1,
         )
     except OSError as exc:
@@ -2154,14 +2300,25 @@ def install_sam_runtime_dependencies(
         [
             "install",
             "--upgrade",
-            "torch",
-            "torchvision",
-            "torchaudio",
+            "torch>=2.7,<2.11" if os.name == "nt" else "torch>=2.7",
+            "torchvision>=0.22,<0.26" if os.name == "nt" else "torchvision",
+            "torchaudio>=2.7,<2.11" if os.name == "nt" else "torchaudio",
+            "numpy>=1.26,<2",
             "--index-url",
             index_url,
         ],
         runtime_plugin_id=plugin_id,
     )
+    if os.name == "nt":
+        # Windows PyTorch wheels do not depend on Triton. Match the minor
+        # version supported by each PyTorch release before importing SAM.
+        run_pip_command(
+            [
+                "install", "--upgrade",
+                windows_triton_requirement(package_version("torch")),
+            ],
+            runtime_plugin_id=plugin_id,
+        )
     run_pip_command(
         [
             "install",
@@ -2170,6 +2327,16 @@ def install_sam_runtime_dependencies(
         ],
         runtime_plugin_id=plugin_id,
     )
+
+
+def windows_triton_requirement(torch_version: str):
+    torch_minor = ".".join(torch_version.split(".")[:2])
+    triton_minor = {"2.7": 3, "2.8": 4, "2.9": 5, "2.10": 6}.get(torch_minor)
+    if triton_minor is None:
+        raise RuntimeError(
+            f"No supported Windows Triton version for PyTorch {torch_version}."
+        )
+    return f"triton-windows>=3.{triton_minor},<3.{triton_minor + 1}"
 
 
 def verify_sam_runtime_install(plugin: PluginDefinition):
@@ -2198,7 +2365,10 @@ def verify_sam_runtime_install(plugin: PluginDefinition):
                 f"Installing missing SAM dependency: {dependency}.",
             )
             run_pip_command(
-                ["install", "--upgrade", dependency],
+                [
+                    "install", "--upgrade",
+                    SAM3_RUNTIME_DEPENDENCY_REQUIREMENTS.get(dependency, dependency),
+                ],
                 runtime_plugin_id=plugin.id,
             )
 
@@ -2213,6 +2383,7 @@ def run_plugin_runtime_install_job(
         ensure_supported_sam_runtime_platform()
         ensure_supported_sam_runtime_profile(requested_profile)
         resolved_profile = resolve_runtime_install_profile(requested_profile)
+        ensure_supported_sam_runtime_profile(resolved_profile)
         log_plugin_runtime_install_event(
             plugin.id,
             f"Resolved installation profile: {resolved_profile.upper()}.",
@@ -3143,7 +3314,7 @@ def log_cache_operation_warning(message: str, exc: Exception):
     LOGGER.warning("%s: %s", message, exc)
 
 
-def build_cached_directory_session(root_path: Path):
+def build_cached_directory_session(root_path: Path, progress_callback: Callable[..., None] | None = None):
     try:
         manifest = CACHE_STORE.load_dataset_manifest(root_path)
     except sqlite3.Error as exc:
@@ -3155,26 +3326,44 @@ def build_cached_directory_session(root_path: Path):
     if manifest is None:
         return None
 
+    if progress_callback is not None:
+        progress_callback(phase="validating", processed=0, total=len(manifest["images"]))
+
     images = [
         build_cached_session_image(root_path, manifest_image)
         for manifest_image in manifest["images"]
     ]
-    stale_image = next(
-        (image for image in images if not is_session_image_file_current(image)),
-        None,
-    )
-    if stale_image is not None:
-        LOGGER.info(
-            "Ignoring stale cached dataset manifest for %s because %s is missing or changed",
-            root_path,
-            stale_image.full_path,
-        )
+    current_paths = set(iter_directory_images(root_path))
+    if current_paths != {image.full_path for image in images}:
         return None
+    for index, image in enumerate(images, start=1):
+        if not is_session_image_file_current(image):
+            LOGGER.info("Ignoring stale cached dataset manifest for %s because %s is missing or changed", root_path, image.full_path)
+            return None
+        if progress_callback is not None and (index % 128 == 0 or index == len(images)):
+            progress_callback(phase="validating", processed=index, total=len(images))
 
+    changed_annotations = False
     session = create_local_session(root_path, manifest["label"])
-    session.images = images
-    session.images_by_id = {image.id: image for image in session.images}
-    register_session_images(session.images)
+    last_publish_at = time.monotonic()
+    for index, image in enumerate(images, start=1):
+        previous = (image.annotation_path, image.annotation_format, image.annotation_count)
+        image.annotation_path, image.annotation_format, image.annotation_count = find_annotation_sidecar(image.full_path, root_path)
+        changed_annotations |= previous != (image.annotation_path, image.annotation_format, image.annotation_count)
+        session.images.append(image)
+        session.images_by_id[image.id] = image
+        register_session_image(image)
+        should_publish = index in (1, 4, 12) or time.monotonic() - last_publish_at >= SESSION_PROGRESS_PUBLISH_INTERVAL_SECONDS
+        if progress_callback is not None and (should_publish or index % 128 == 0 or index == len(images)):
+            progress_callback(
+                phase="loading", processed=index, total=len(images),
+                session=serialize_session(session) if should_publish else None,
+            )
+        if should_publish:
+            last_publish_at = time.monotonic()
+    if changed_annotations:
+        CACHE_STORE.save_dataset_manifest(root_path, manifest["label"], serialize_manifest_images(images))
+
     schedule_session_fingerprint_warmup(session)
     return session
 
@@ -3242,7 +3431,7 @@ def build_directory_session(
     progress_callback: Callable[..., None] | None = None,
 ):
     resolved_root = root_path.expanduser().resolve()
-    cached_session = build_cached_directory_session(resolved_root)
+    cached_session = build_cached_directory_session(resolved_root, progress_callback)
     if cached_session is not None:
         return serialize_session(cached_session)
 
@@ -3262,37 +3451,18 @@ def build_directory_session(
 
 def start_directory_open_job(root_path: Path):
     resolved_root = root_path.expanduser().resolve()
-    job = SessionOpenJob(
-        id=uuid4().hex,
-        status="running",
-        phase="indexing",
-    )
-    LOCAL_SESSION_JOBS[job.id] = job
-    cached_session = build_cached_directory_session(resolved_root)
+    root_key = os.path.normcase(str(resolved_root))
+    with SESSION_JOB_LOCK:
+        for existing_job in LOCAL_SESSION_JOBS.values():
+            if existing_job.status == "running" and existing_job.root_path == root_key:
+                return existing_job
+        completed_job_ids = [job_id for job_id, job in LOCAL_SESSION_JOBS.items() if job.status != "running"]
+        for job_id in completed_job_ids[:max(0, len(completed_job_ids) - MAX_RETAINED_SESSION_JOBS + 1)]:
+            del LOCAL_SESSION_JOBS[job_id]
+        job = SessionOpenJob(id=uuid4().hex, status="running", phase="indexing", root_path=root_key)
+        LOCAL_SESSION_JOBS[job.id] = job
 
-    if cached_session is not None:
-        session_payload = serialize_session(cached_session)
-        with SESSION_JOB_LOCK:
-            job.status = "completed"
-            job.phase = "completed"
-            job.processed_images = len(cached_session.images)
-            job.total_images = len(cached_session.images)
-            job.session_payload = session_payload
-            job.session_revision += 1
-        return job
-
-    session = create_local_session(
-        resolved_root,
-        resolved_root.name or "Folder session",
-    )
-
-    def update_progress(
-        *,
-        phase: str,
-        processed: int,
-        total: int,
-        session: dict[str, Any] | None = None,
-    ):
+    def update_progress(*, phase: str, processed: int, total: int, session: dict[str, Any] | None = None):
         with SESSION_JOB_LOCK:
             job.phase = phase
             job.processed_images = processed
@@ -3303,16 +3473,14 @@ def start_directory_open_job(root_path: Path):
 
     def worker():
         try:
-            session_payload = scan_directory_session(
-                session,
-                progress_callback=update_progress,
-                publish_intermediate=cached_session is None,
-            )
+            # Manifest checks and annotation reads are part of the background
+            # job. Returning its ID must never wait for an entire dataset.
+            session_payload = build_directory_session(resolved_root, progress_callback=update_progress)
             with SESSION_JOB_LOCK:
                 job.status = "completed"
                 job.phase = "completed"
-                job.processed_images = len(session.images)
-                job.total_images = len(session.images)
+                job.processed_images = len(session_payload["images"])
+                job.total_images = len(session_payload["images"])
                 job.session_payload = session_payload
                 job.session_revision += 1
         except Exception as exc:
@@ -3333,7 +3501,6 @@ def scan_directory_session(
     publish_intermediate: bool,
 ):
     next_images: list[SessionImage] = []
-    published_count = 0
     last_publish_at = time.monotonic()
 
     for path in iter_directory_images(session.root_path):
@@ -3343,15 +3510,13 @@ def scan_directory_session(
 
         processed_images = len(next_images)
         should_publish_session = publish_intermediate and (
-            processed_images <= 12
-            or processed_images - published_count >= 24
-            or time.monotonic() - last_publish_at >= 0.2
+            processed_images in (1, 4, 12)
+            or time.monotonic() - last_publish_at >= SESSION_PROGRESS_PUBLISH_INTERVAL_SECONDS
         )
 
         if should_publish_session:
             session.images = list(next_images)
             session.images_by_id = {image.id: image for image in next_images}
-            published_count = processed_images
             last_publish_at = time.monotonic()
 
         if progress_callback is not None:
@@ -3485,6 +3650,12 @@ def start_duplicate_search_job(
     )
 
     with DUPLICATE_SEARCH_LOCK:
+        completed_job_ids = [
+            existing_id for existing_id, existing_job in DUPLICATE_SEARCH_JOBS.items()
+            if existing_job.status != "running"
+        ]
+        for existing_id in completed_job_ids[:max(0, len(completed_job_ids) - MAX_RETAINED_DUPLICATE_SEARCH_JOBS + 1)]:
+            del DUPLICATE_SEARCH_JOBS[existing_id]
         DUPLICATE_SEARCH_JOBS[job.id] = job
 
     def worker():
@@ -3665,6 +3836,11 @@ def run_duplicate_search_job(
                                 }
                             )
                             active_job.revision += 1
+                            if len(active_job.matches) >= MAX_DUPLICATE_SEARCH_MATCHES:
+                                active_job.result_limit_reached = processed_pairs < total_pairs
+                                active_job.status = "completed"
+                                active_job.phase = "completed"
+                                return
                         last_progress_publish_at = time.monotonic()
                         continue
 
@@ -4270,6 +4446,17 @@ def save_image_annotations(
     *,
     preferred_classes: list[str],
 ):
+    with ANNOTATION_WRITE_LOCK:
+        return save_image_annotations_locked(session, image, annotations, preferred_classes=preferred_classes)
+
+
+def save_image_annotations_locked(
+    session: LocalSession,
+    image: SessionImage,
+    annotations: list[dict[str, Any]],
+    *,
+    preferred_classes: list[str],
+):
     annotation_format = image.annotation_format or infer_session_annotation_format(session)
     annotation_path = resolve_annotation_output_path(session, image, annotation_format)
     cache_payload = annotations
@@ -4279,11 +4466,7 @@ def save_image_annotations(
         class_source_path = None
         class_source_mtime_ns = None
     else:
-        existing_class_source = (
-            load_yolo_classes(image.annotation_path.parent, session.root_path)
-            if image.annotation_path is not None
-            else YoloClassSource(names=[])
-        )
+        existing_class_source = load_yolo_classes(annotation_path.parent, session.root_path)
         class_names = build_yolo_class_list(
             annotations,
             preferred_classes=preferred_classes,
@@ -4979,6 +5162,11 @@ def sanitize_upload_filename(filename: str):
 
     stem = Path(basename).stem.strip(" .") or "image"
     suffix = Path(basename).suffix.lower()
+    # Device names are reserved on Windows, including names such as CON.photo.
+    if re.match(
+        r"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", stem, re.IGNORECASE
+    ):
+        stem = f"_{stem}"
     return f"{stem}{suffix}"
 
 

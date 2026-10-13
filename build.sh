@@ -30,7 +30,8 @@ Options:
   --lint         Run npm run lint before npm run build.
   -h, --help     Show this help.
 
-Run this from a Linux/WSL shell. In WSL, do not use Windows node/npm from /mnt/c.
+Run this from an Ubuntu/WSL shell. On native Windows, use build.ps1 instead.
+In WSL, do not use Windows node/npm from /mnt/c.
 EOF
 }
 
@@ -60,6 +61,10 @@ while (($#)); do
   esac
   shift
 done
+
+if ((SKIP_INSTALL && (CLEAN || FORCE_INSTALL))); then
+  fail "--no-install cannot be combined with --clean or --install."
+fi
 
 is_wsl() {
   grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null
@@ -98,7 +103,7 @@ ensure_linux_node() {
   fi
 
   if ! command -v node >/dev/null 2>&1; then
-    fail "Node.js was not found. Install Linux Node in WSL, for example: nvm install && nvm use"
+    fail "Node.js was not found. Install Node 22 in Ubuntu/WSL, for example: nvm install && nvm use"
   fi
 
   if ! command -v npm >/dev/null 2>&1; then

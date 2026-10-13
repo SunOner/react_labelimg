@@ -509,6 +509,30 @@
 
 .annotator {
   grid-area: main;
+  position: relative;
+}
+
+.annotation-status-stack {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.annotation-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  color: var(--ink-strong);
 }
 
 .workspace-sidebar-toggle {

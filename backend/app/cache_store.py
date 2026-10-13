@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing, contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any, Sequence
@@ -32,7 +33,15 @@ class CacheStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    @contextmanager
     def _connect(self):
+        # sqlite3's transaction context commits/rolls back but does not close
+        # the connection. Windows keeps the database locked until it is closed.
+        with closing(self._open_connection()) as connection:
+            with connection:
+                yield connection
+
+    def _open_connection(self):
         last_error: sqlite3.OperationalError | None = None
 
         for attempt_index, retry_delay in enumerate(
@@ -42,6 +51,7 @@ class CacheStore:
             if retry_delay > 0:
                 time.sleep(retry_delay)
 
+            connection = None
             try:
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
                 connection = sqlite3.connect(str(self.db_path), timeout=30.0)
@@ -51,6 +61,8 @@ class CacheStore:
                 connection.execute("PRAGMA foreign_keys=ON")
                 return connection
             except (sqlite3.OperationalError, OSError) as exc:
+                if connection is not None:
+                    connection.close()
                 operational_error = (
                     exc
                     if isinstance(exc, sqlite3.OperationalError)
@@ -319,7 +331,7 @@ class CacheStore:
 
     def compact_database(self):
         with self._lock:
-            with sqlite3.connect(self.db_path, isolation_level=None) as connection:
+            with closing(sqlite3.connect(self.db_path, isolation_level=None)) as connection:
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("VACUUM")
 

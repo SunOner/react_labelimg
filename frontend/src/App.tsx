@@ -24,6 +24,7 @@ import {
   fetchApiHealth,
   fetchHuggingFaceAuthStatus,
   fetchLocalAnnotations,
+  fetchLocalImageMetadata,
   fetchLocalDuplicateSearchJob,
   fetchLocalSessionJob,
   fetchLocalSessionInfo,
@@ -39,6 +40,7 @@ import {
   runPluginAutoAnnotate,
   runCacheDbAction,
   saveLocalAnnotations,
+  renameLocalClass,
   startLocalDuplicateSearch,
   startHuggingFaceAuth,
   updateHuggingFaceAuthConfig,
@@ -63,7 +65,6 @@ import {
   INVALID_ANNOTATION_COLOR,
   MIN_ANNOTATION_SIZE,
   MIN_SAM_CLICK_REGION_SIZE,
-  buildClassList,
   downloadTextFile,
   labelToColor,
   rectFromPoints,
@@ -71,6 +72,21 @@ import {
   serializeSession,
   serializeYolo,
 } from './lib/annotations'
+import {
+  canEditAnnotations,
+  flushQueuedAnnotationSave,
+  renameProjectClass,
+  resolveProjectClassLabel,
+  type AnnotationLoadState,
+} from './lib/annotationSafety'
+import { useImageResource } from './lib/useImageResource'
+import {
+  aggregateAnnotationSummaries,
+  renameAnnotationSummaries,
+  summarizeAnnotations,
+  trimAnnotationCache,
+  type AnnotationSummary,
+} from './lib/sessionMemory'
 import type {
   Annotation,
   ImageEntry,
@@ -355,6 +371,8 @@ type DuplicateSearchRuntime = {
   processedPairs: number
   totalPairs: number
   minimumSimilarityPercent: number
+  resultLimit: number
+  resultLimitReached: boolean
 }
 
 type DuplicateSearchPreviewImage = {
@@ -501,6 +519,10 @@ function App() {
   const [newClassName, setNewClassName] = useState('')
   const [editingClassLabel, setEditingClassLabel] = useState<string | null>(null)
   const [editingClassDraft, setEditingClassDraft] = useState('')
+  const [isRenamingClass, setIsRenamingClass] = useState(false)
+  const [annotationLoadStates, setAnnotationLoadStates] = useState<Record<string, AnnotationLoadState>>({})
+  const [annotationLoadErrors, setAnnotationLoadErrors] = useState<Record<string, string>>({})
+  const [annotationSaveErrors, setAnnotationSaveErrors] = useState<Record<string, string>>({})
   const [cacheDbSummary, setCacheDbSummary] = useState<CacheDbSummary | null>(null)
   const [cacheDbError, setCacheDbError] = useState<string | null>(null)
   const [cacheDbBusyAction, setCacheDbBusyAction] =
@@ -584,6 +606,12 @@ function App() {
   const menuBarRef = useRef<HTMLElement | null>(null)
   const imageResourcesRef = useRef<Record<string, ImageResource>>({})
   const annotationsByImageRef = useRef<Record<string, Annotation[]>>({})
+  const annotationSummariesRef = useRef(new Map<string, AnnotationSummary[]>())
+  const [annotationSummaries, setAnnotationSummaries] = useState(new Map<string, AnnotationSummary[]>())
+  const retainedAnnotationIdsRef = useRef(new Set<string>())
+  const retainedImageIdsRef = useRef(new Set<string>())
+  const samImageIdsRef = useRef(new Set<string>())
+  const annotationLoadControllersRef = useRef<Record<string, AbortController>>({})
   const currentSessionIdRef = useRef<string | null>(null)
   const pendingCurrentSessionStateRef = useRef<{
     sessionId: string | null
@@ -600,6 +628,7 @@ function App() {
   const pendingPreferredImageRelativePathRef = useRef<string | null>(null)
   const sessionVersionRef = useRef(0)
   const restoreAttemptedRef = useRef(false)
+  const restoreControllerRef = useRef<AbortController | null>(null)
   const isMountedRef = useRef(true)
   const hfAuthPopupRef = useRef<Window | null>(null)
   const pendingHfAuthRefreshRef = useRef(false)
@@ -665,10 +694,13 @@ function App() {
   const currentResource = currentEntry
     ? imageResources[currentEntry.id] ?? null
     : null
+  const displayImage = useImageResource(currentEntry?.url)
+  const duplicatePreviewResource = useImageResource(duplicateSearchPreviewImage?.url)
   const image: LoadedImage | null =
-    currentEntry && currentResource?.status === 'ready'
+    currentEntry && currentResource?.status === 'ready' && displayImage?.source === currentEntry.url && displayImage.url
       ? {
           ...currentEntry,
+          url: displayImage.url,
           width: currentResource.width,
           height: currentResource.height,
         }
@@ -676,7 +708,10 @@ function App() {
   const annotations = currentEntry
     ? annotationsByImage[currentEntry.id] ?? []
     : []
-  const sessionAnnotations = Object.values(annotationsByImage).flat()
+  const currentAnnotationLoadState = currentEntry ? annotationLoadStates[currentEntry.id] : undefined
+  const currentAnnotationLoadError = currentEntry ? annotationLoadErrors[currentEntry.id] : undefined
+  const annotationEditingReady = canEditAnnotations(currentAnnotationLoadState) && !isRenamingClass
+  const annotationSaveError = Object.values(annotationSaveErrors)[0]
   const selectedAnnotation =
     selectedId !== null
       ? annotations.find((annotation) => annotation.id === selectedId) ?? null
@@ -692,13 +727,15 @@ function App() {
     currentSessionRootPath !== null && hasStoredProjectClasses
       ? (projectClassesByRootPath[currentSessionRootPath] ?? [])
       : backendClasses
-  const usableSessionAnnotations = sessionAnnotations.filter((annotation) =>
-    isAnnotationUsableInLabeling(annotation, projectClasses),
-  )
+  const observedAnnotationStats = useMemo(() => aggregateAnnotationSummaries(
+    annotationSummaries.values(),
+    (group) => resolveProjectClassLabel(group, projectClasses),
+    (group) => isAnnotationUsableInLabeling(group, projectClasses),
+  ), [annotationSummaries, projectClasses])
   const exportableAnnotations = annotations.filter((annotation) =>
     isAnnotationUsableInLabeling(annotation, projectClasses),
   )
-  const annotationClassList = buildClassList(usableSessionAnnotations)
+  const annotationClassList = Object.keys(observedAnnotationStats.classCounts)
   const classList = [...new Set([...projectClasses, ...annotationClassList])]
   const effectiveActiveLabel = classList.includes(activeLabel)
     ? activeLabel
@@ -738,30 +775,8 @@ function App() {
       : 'Drag and drop works when a dataset session is active.'
   const isDeleteImageArmed =
     currentEntry !== null && armedDeleteImageId === currentEntry.id
-  const classUsageCounts = usableSessionAnnotations.reduce<Record<string, number>>(
-    (current, annotation) => {
-      current[annotation.label] = (current[annotation.label] ?? 0) + 1
-      return current
-    },
-    {},
-  )
-  const localClassImageUsageCounts = useMemo(() => {
-    const counts: Record<string, number> = {}
-
-    for (const imageAnnotations of Object.values(annotationsByImage)) {
-      const imageLabels = new Set<string>()
-      for (const annotation of imageAnnotations) {
-        if (isAnnotationUsableInLabeling(annotation, projectClasses)) {
-          imageLabels.add(annotation.label)
-        }
-      }
-      for (const label of imageLabels) {
-        counts[label] = (counts[label] ?? 0) + 1
-      }
-    }
-
-    return counts
-  }, [annotationsByImage, projectClasses])
+  const classUsageCounts = observedAnnotationStats.classCounts
+  const localClassImageUsageCounts = observedAnnotationStats.imageCounts
   const projectInfoClassRows = useMemo(() => {
     const rowsByLabel = new Map<
       string,
@@ -864,12 +879,10 @@ function App() {
     images.reduce((total, entry) => total + entry.annotationCount, 0)
   const projectDifficultAnnotationCount =
     projectInfo?.difficultAnnotationCount ??
-    usableSessionAnnotations.filter((annotation) => annotation.difficult).length
+    observedAnnotationStats.difficultCount
   const projectUnknownClassCount =
     projectInfo?.unknownClassCount ??
-    sessionAnnotations.filter(
-      (annotation) => !isAnnotationUsableInLabeling(annotation, projectClasses),
-    ).length
+    observedAnnotationStats.unknownCount
   const hasSession = images.length > 0
   const canSearchDuplicates =
     backendStatus === 'online' && currentSessionId !== null && images.length > 1
@@ -961,8 +974,10 @@ function App() {
       : null
   const isCurrentImageLoading =
     Boolean(currentEntry) &&
-    (!currentResource || currentResource.status === 'loading')
-  const isCurrentImageError = currentResource?.status === 'error'
+    (!currentResource || currentResource.status === 'loading' ||
+      displayImage?.source !== currentEntry?.url || (!displayImage?.url && !displayImage?.error))
+  const isCurrentImageError = currentResource?.status === 'error' ||
+    (displayImage?.source === currentEntry?.url && displayImage?.error === true)
   const currentImageSize =
     currentResource?.status === 'ready'
       ? `${currentResource.width} × ${currentResource.height}`
@@ -975,9 +990,11 @@ function App() {
             : '—'
   const openingLabel =
     openingTarget === 'dataset'
-      ? sessionLoadProgress?.total
-        ? `Scanning dataset, ${sessionLoadProgress.total.toLocaleString()} images indexed`
-        : 'Scanning dataset'
+      ? sessionLoadProgress?.phase === 'validating'
+        ? 'Checking cached dataset'
+        : sessionLoadProgress?.phase === 'loading'
+          ? 'Loading cached dataset'
+          : 'Scanning dataset'
       : 'Loading image'
   const hotkeySections = HOTKEY_SECTION_ORDER.map((sectionTitle) => ({
     title: sectionTitle,
@@ -1351,10 +1368,43 @@ function App() {
   const commitAnnotationsByImage = (
     updater: (current: Record<string, Annotation[]>) => Record<string, Annotation[]>,
   ) => {
-    const next = updater(annotationsByImageRef.current)
+    const previous = annotationsByImageRef.current
+    const updated = updater(previous)
+    for (const [imageId, values] of Object.entries(updated)) {
+      if (previous[imageId] !== values) {
+        annotationSummariesRef.current.set(imageId, summarizeAnnotations(values))
+      }
+    }
+    for (const imageId of annotationSummariesRef.current.keys()) {
+      if (!imageIdSetRef.current.has(imageId)) annotationSummariesRef.current.delete(imageId)
+    }
+    setAnnotationSummaries(new Map(annotationSummariesRef.current))
+    const protectedIds = new Set([
+      ...retainedAnnotationIdsRef.current,
+      ...samImageIdsRef.current,
+      ...Object.keys(queuedAnnotationSavesRef.current),
+      ...Object.keys(annotationSavePromisesRef.current),
+      ...(currentEntry ? [currentEntry.id] : []),
+    ])
+    const next = trimAnnotationCache(updated, retainedAnnotationIdsRef.current, protectedIds)
+    const evictedIds = Object.keys(previous).filter((id) => next[id] === undefined)
+    if (evictedIds.length > 0) {
+      for (const id of evictedIds) {
+        delete annotationLoadStateRef.current[id]
+        delete annotationSaveRevisionRef.current[id]
+      }
+      const evicted = new Set(evictedIds)
+      setAnnotationLoadStates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !evicted.has(id))))
+      setAnnotationLoadErrors((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !evicted.has(id))))
+    }
     annotationsByImageRef.current = next
     setAnnotationsByImage(next)
     return next
+  }
+
+  const setAnnotationLoadState = (imageId: string, state: AnnotationLoadState) => {
+    annotationLoadStateRef.current[imageId] = state
+    setAnnotationLoadStates((current) => ({ ...current, [imageId]: state }))
   }
 
   const clearScheduledAnnotationSave = (imageId?: string) => {
@@ -1366,6 +1416,11 @@ function App() {
       }
       delete queuedAnnotationSavesRef.current[imageId]
       delete annotationSaveRevisionRef.current[imageId]
+      setAnnotationSaveErrors((current) => {
+        const next = { ...current }
+        delete next[imageId]
+        return next
+      })
       return
     }
 
@@ -1375,6 +1430,7 @@ function App() {
     annotationSaveTimeoutsRef.current = {}
     annotationSaveRevisionRef.current = {}
     queuedAnnotationSavesRef.current = {}
+    setAnnotationSaveErrors({})
   }
 
   const cancelPendingImageLoad = (imageId: string) => {
@@ -1394,7 +1450,24 @@ function App() {
     }
   }
 
+  const cancelPendingAnnotationLoads = (imageIds?: Iterable<string>) => {
+    for (const imageId of imageIds ?? Object.keys(annotationLoadControllersRef.current)) {
+      annotationLoadControllersRef.current[imageId]?.abort()
+      delete annotationLoadControllersRef.current[imageId]
+      delete pendingAnnotationLoadsRef.current[imageId]
+      if (annotationLoadStateRef.current[imageId] === 'loading') {
+        delete annotationLoadStateRef.current[imageId]
+        setAnnotationLoadStates((current) => {
+          const next = { ...current }
+          delete next[imageId]
+          return next
+        })
+      }
+    }
+  }
+
   const retainImageResourceBuffer = useEffectEvent((retainedImageIds: Set<string>) => {
+    retainedImageIdsRef.current = retainedImageIds
     for (const imageId of Object.keys(pendingLoadsRef.current)) {
       if (!retainedImageIds.has(imageId)) {
         cancelPendingImageLoad(imageId)
@@ -1528,6 +1601,11 @@ function App() {
           payload.count,
           payload.format ?? undefined,
         )
+        setAnnotationSaveErrors((current) => {
+          const next = { ...current }
+          delete next[queuedSave.imageId]
+          return next
+        })
         applyAutomaticAnnotationDeduplication(
           queuedSave.imageId,
           payload.annotations,
@@ -1540,6 +1618,10 @@ function App() {
           isQueuedAnnotationSaveActive(queuedSave) &&
           (!newerQueuedSave || newerQueuedSave.revision <= queuedSave.revision)
         ) {
+          setAnnotationSaveErrors((current) => ({
+            ...current,
+            [queuedSave.imageId]: error instanceof Error ? error.message : 'Failed to save annotations',
+          }))
           pushToast(
             error instanceof Error
               ? error.message
@@ -1553,43 +1635,14 @@ function App() {
   )
 
   const flushAnnotationSave = async (imageId: string): Promise<void> => {
-    const timeoutId = annotationSaveTimeoutsRef.current[imageId]
-    if (timeoutId !== undefined) {
-      window.clearTimeout(timeoutId)
-      delete annotationSaveTimeoutsRef.current[imageId]
-    }
-
-    const runningSave = annotationSavePromisesRef.current[imageId]
-    if (runningSave) {
-      try {
-        await runningSave
-      } catch (error) {
-        if (!queuedAnnotationSavesRef.current[imageId]) {
-          throw error
-        }
-      }
-    }
-
-    const queuedSave = queuedAnnotationSavesRef.current[imageId]
-    if (!queuedSave) {
-      return
-    }
-
-    delete queuedAnnotationSavesRef.current[imageId]
-    const savePromise = runQueuedAnnotationSave(queuedSave)
-    annotationSavePromisesRef.current[imageId] = savePromise
-
-    try {
-      await savePromise
-    } finally {
-      if (annotationSavePromisesRef.current[imageId] === savePromise) {
-        delete annotationSavePromisesRef.current[imageId]
-      }
-    }
-
-    if (queuedAnnotationSavesRef.current[imageId]) {
-      await flushAnnotationSave(imageId)
-    }
+    await flushQueuedAnnotationSave(imageId, {
+      timeouts: annotationSaveTimeoutsRef,
+      queued: queuedAnnotationSavesRef,
+      running: annotationSavePromisesRef,
+      clearTimeout: (id) => window.clearTimeout(id),
+      runSave: runQueuedAnnotationSave,
+      isActive: isQueuedAnnotationSaveActive,
+    })
   }
 
   const flushPendingAnnotationSaves = async (imageIds?: Iterable<string>) => {
@@ -1651,6 +1704,10 @@ function App() {
   })
 
   const flushPendingAnnotationSavesForSessionChange = async () => {
+    if (isRenamingClass) {
+      setSessionError('Wait until the class rename finishes.')
+      return false
+    }
     try {
       await flushPendingAnnotationSaves()
       return true
@@ -1718,7 +1775,10 @@ function App() {
       selectedAnnotationId?: string | null
     } = {},
   ) => {
-    annotationLoadStateRef.current[imageId] = 'ready'
+    if (!canEditAnnotations(annotationLoadStateRef.current[imageId]) || isRenamingClass) {
+      pushToast('Wait for annotations to load before editing.', 'info')
+      return
+    }
     const effectiveProjectClasses = options.projectClassesOverride ?? projectClasses
     commitAnnotationsByImage((current) => ({
       ...current,
@@ -1746,9 +1806,14 @@ function App() {
     pendingCurrentSessionStateRef.current = { sessionId: null }
     imageIdSetRef.current = new Set(nextImages.map((entry) => entry.id))
     cancelPendingImageLoads()
+    cancelPendingAnnotationLoads()
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
+    setAnnotationLoadStates({})
+    setAnnotationLoadErrors({})
     imageResourcesRef.current = {}
+    annotationSummariesRef.current.clear()
+    retainedAnnotationIdsRef.current.clear()
     clearScheduledAnnotationSave()
     pendingPreferredImageRelativePathRef.current = null
 
@@ -1792,11 +1857,15 @@ function App() {
     }))
 
     const sessionVersion = sessionVersionRef.current
-    const preload = preloadImage(entry.url)
+    const controller = new AbortController()
+    const preload: ImagePreload = currentSessionId
+      ? { promise: fetchLocalImageMetadata(currentSessionId, entry.id, controller.signal), cancel: () => controller.abort() }
+      : preloadImage(entry.url)
     const promise = preload.promise
       .then((size) => {
         if (
           sessionVersion !== sessionVersionRef.current ||
+          !retainedImageIdsRef.current.has(entry.id) ||
           !imageIdSetRef.current.has(entry.id)
         ) {
           return
@@ -1820,6 +1889,7 @@ function App() {
 
         if (
           sessionVersion !== sessionVersionRef.current ||
+          !retainedImageIdsRef.current.has(entry.id) ||
           !imageIdSetRef.current.has(entry.id)
         ) {
           return
@@ -1848,12 +1918,15 @@ function App() {
   })
 
   useEffect(() => {
+    isMountedRef.current = true
     return () => {
       isMountedRef.current = false
+      restoreControllerRef.current?.abort()
       sessionVersionRef.current += 1
       currentSessionIdRef.current = null
       imageIdSetRef.current = new Set()
       cancelPendingImageLoads()
+      cancelPendingAnnotationLoads()
       pendingAnnotationLoadsRef.current = {}
       annotationLoadStateRef.current = {}
       clearScheduledAnnotationSave()
@@ -1920,30 +1993,30 @@ function App() {
     }
   }, [armedDeleteImageId, currentEntry])
 
-  const ensureAnnotationsLoaded = useEffectEvent(async (entry: ImageEntry) => {
+  const ensureAnnotationsLoaded = useEffectEvent(async (entry: ImageEntry, retry = false) => {
     if (!currentSessionId) {
       return
     }
 
+    const pendingLoad = pendingAnnotationLoadsRef.current[entry.id]
+    if (pendingLoad) return pendingLoad
     const currentLoadState = annotationLoadStateRef.current[entry.id]
     if (
       currentLoadState === 'loading' ||
       currentLoadState === 'ready' ||
-      currentLoadState === 'error'
+      (currentLoadState === 'error' && !retry)
     ) {
       return
     }
 
-    const pendingLoad = pendingAnnotationLoadsRef.current[entry.id]
-    if (pendingLoad) {
-      return pendingLoad
-    }
-
-    annotationLoadStateRef.current[entry.id] = 'loading'
+    setAnnotationLoadState(entry.id, 'loading')
+    const controller = new AbortController()
+    annotationLoadControllersRef.current[entry.id] = controller
     const sessionVersion = sessionVersionRef.current
-    const promise = fetchLocalAnnotations(currentSessionId, entry.id)
+    const promise = fetchLocalAnnotations(currentSessionId, entry.id, controller.signal)
       .then((payload) => {
         if (
+          controller.signal.aborted ||
           sessionVersion !== sessionVersionRef.current ||
           !imageIdSetRef.current.has(entry.id)
         ) {
@@ -1991,19 +2064,32 @@ function App() {
           )
         }
 
-        annotationLoadStateRef.current[entry.id] = 'ready'
+        setAnnotationLoadState(entry.id, 'ready')
+        setAnnotationLoadErrors((current) => {
+          const next = { ...current }
+          delete next[entry.id]
+          return next
+        })
       })
-      .catch(() => {
+      .catch((error) => {
         if (
+          controller.signal.aborted ||
           sessionVersion !== sessionVersionRef.current ||
           !imageIdSetRef.current.has(entry.id)
         ) {
           return
         }
 
-        annotationLoadStateRef.current[entry.id] = 'error'
+        setAnnotationLoadState(entry.id, 'error')
+        setAnnotationLoadErrors((current) => ({
+          ...current,
+          [entry.id]: error instanceof Error ? error.message : 'Failed to load annotations',
+        }))
       })
       .finally(() => {
+        if (annotationLoadControllersRef.current[entry.id] === controller) {
+          delete annotationLoadControllersRef.current[entry.id]
+        }
         if (pendingAnnotationLoadsRef.current[entry.id] === promise) {
           delete pendingAnnotationLoadsRef.current[entry.id]
         }
@@ -2090,7 +2176,8 @@ function App() {
       return
     }
 
-    let isCancelled = false
+    const controller = new AbortController()
+    restoreControllerRef.current = controller
     restoreAttemptedRef.current = true
     setSessionError(null)
     setOpeningTarget(persistedSessionState.sourceKind)
@@ -2110,6 +2197,7 @@ function App() {
         if (persistedSessionState.sourceKind === 'dataset') {
           const job = await openLocalDirectoryPathJob(
             persistedSessionState.sourcePath,
+            controller.signal,
           )
           if (!job.cancelled && job.jobId) {
             await waitForSessionJob(
@@ -2123,14 +2211,15 @@ function App() {
                 })
               },
               rememberRecentDataset,
+              controller.signal,
             )
           }
           return
         }
 
-        const session = await openLocalImagePath(persistedSessionState.sourcePath)
+        const session = await openLocalImagePath(persistedSessionState.sourcePath, controller.signal)
 
-        if (isCancelled || session.cancelled) {
+        if (controller.signal.aborted || !isMountedRef.current || session.cancelled) {
           return
         }
 
@@ -2140,7 +2229,7 @@ function App() {
             persistedSessionState.currentImageRelativePath,
         })
       } catch (error) {
-        if (isCancelled) {
+        if (controller.signal.aborted || !isMountedRef.current) {
           return
         }
 
@@ -2151,19 +2240,19 @@ function App() {
             : 'Failed to restore previous session',
         )
       } finally {
-        if (isMountedRef.current) {
+        if (isMountedRef.current && !controller.signal.aborted) {
           setIsOpeningSession(false)
           setOpeningTarget(null)
           setSessionLoadProgress(null)
         }
+        if (restoreControllerRef.current === controller) restoreControllerRef.current = null
       }
     }
 
     void restoreSession()
 
-    return () => {
-      isCancelled = true
-    }
+    // Loading changes these dependencies itself. Only unmount cancels the
+    // request; an effect rerun must not hide failures or discard its result.
   }, [backendStatus, hasSession, isOpeningSession, persistedSessionState])
 
   useEffect(() => {
@@ -2426,7 +2515,7 @@ function App() {
 
   useEffect(() => {
     const jobId = duplicateSearchRuntime.jobId
-    if (!jobId) {
+    if (!jobId || !isDuplicateSearchOpen) {
       return
     }
 
@@ -2436,6 +2525,10 @@ function App() {
       let lastRevision = 0
 
       while (!cancelled) {
+        if (document.hidden) {
+          await delay(1000)
+          continue
+        }
         try {
           const job = await fetchLocalDuplicateSearchJob(jobId, lastRevision)
           if (cancelled) {
@@ -2457,6 +2550,8 @@ function App() {
               processedPairs: job.processedPairs,
               totalPairs: job.totalPairs,
               minimumSimilarityPercent: job.minimumSimilarityPercent,
+              resultLimit: job.resultLimit,
+              resultLimitReached: job.resultLimitReached,
             }
           })
 
@@ -2500,7 +2595,7 @@ function App() {
           return
         }
 
-        await delay(180)
+        await delay(750)
       }
     }
 
@@ -2509,7 +2604,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [duplicateSearchRuntime.jobId])
+  }, [duplicateSearchRuntime.jobId, isDuplicateSearchOpen])
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -2760,6 +2855,11 @@ function App() {
       backwardRadius: ANNOTATION_PRELOAD_RADIUS,
       forwardRadius: ANNOTATION_PRELOAD_RADIUS,
     })
+    retainedAnnotationIdsRef.current = new Set(annotationPreloadEntries.map((entry) => entry.id))
+    cancelPendingAnnotationLoads(Object.keys(annotationLoadControllersRef.current).filter(
+      id => !retainedAnnotationIdsRef.current.has(id) && !samImageIdsRef.current.has(id),
+    ))
+    commitAnnotationsByImage((current) => current)
     retainImageResourceBuffer(new Set(imagePreloadEntries.map((entry) => entry.id)))
 
     for (const entry of imagePreloadEntries) {
@@ -3011,6 +3111,8 @@ function App() {
       processedPairs: 0,
       totalPairs: (images.length * Math.max(images.length - 1, 0)) / 2,
       minimumSimilarityPercent,
+      resultLimit: 0,
+      resultLimitReached: false,
     })
 
     try {
@@ -3113,6 +3215,10 @@ function App() {
         setSamActionError('Open an image or dataset before using SAM auto-annotation.')
         return
       }
+      if (!canEditAnnotations(annotationLoadStateRef.current[currentEntry.id]) || isRenamingClass) {
+        setSamActionError('Load annotations successfully before using SAM.')
+        return
+      }
 
       if (mode === 'selected-box' && !region) {
         setSamActionError('Select a box or draw a region before running box-guided SAM.')
@@ -3161,6 +3267,8 @@ function App() {
       setSamActionError(null)
       setSamActionMessage(null)
       setIsRunningSamAction(true)
+      samImageIdsRef.current.add(currentEntry.id)
+      const samSessionVersion = sessionVersionRef.current
 
       const scoreThreshold = clampNumericInput(samScoreThresholdDraft, 0.25, {
         min: 0,
@@ -3191,6 +3299,8 @@ function App() {
             scoreThreshold,
             maxResults,
           })
+
+          if (samSessionVersion !== sessionVersionRef.current || !imageIdSetRef.current.has(currentEntry.id)) return
 
           if (result.annotations.length === 0) {
             setSamActionMessageTone('info')
@@ -3269,6 +3379,7 @@ function App() {
           height: annotation.height,
         }))
 
+        if (samSessionVersion !== sessionVersionRef.current || !imageIdSetRef.current.has(currentEntry.id)) return
         const currentAnnotations =
           annotationsByImageRef.current[currentEntry.id] ?? []
         replaceImageAnnotations(
@@ -3289,6 +3400,7 @@ function App() {
         )
         void refreshPlugins()
       } finally {
+        samImageIdsRef.current.delete(currentEntry.id)
         setIsRunningSamAction(false)
       }
     },
@@ -3557,6 +3669,7 @@ function App() {
   })
 
   const addClass = () => {
+    if (isRenamingClass) return
     const nextLabel = newClassName.trim()
     if (!nextLabel) {
       return
@@ -3571,6 +3684,7 @@ function App() {
   }
 
   const startEditingClass = (label: string) => {
+    if (isRenamingClass) return
     setEditingClassLabel(label)
     setEditingClassDraft(label)
   }
@@ -3580,9 +3694,9 @@ function App() {
     setEditingClassDraft('')
   }
 
-  const renameClass = (sourceLabel: string) => {
+  const renameClass = async (sourceLabel: string) => {
     const nextLabel = editingClassDraft.trim()
-    if (!nextLabel) {
+    if (!nextLabel || !currentSessionId || isRenamingClass) {
       return
     }
 
@@ -3598,61 +3712,43 @@ function App() {
       return
     }
 
-    const nextProjectClasses = updateCurrentProjectClasses((current) => {
-      const next = current.filter(
-        (label) => label !== sourceLabel && label !== nextLabel,
+    const sessionId = currentSessionId
+    setIsRenamingClass(true)
+    try {
+      await flushPendingAnnotationSaves()
+      const payload = await renameLocalClass(sessionId, sourceLabel, nextLabel)
+      if (currentSessionIdRef.current !== sessionId) return
+      sessionVersionRef.current += 1
+      cancelPendingAnnotationLoads()
+      pendingAnnotationLoadsRef.current = {}
+      annotationLoadStateRef.current = Object.fromEntries(
+        Object.entries(annotationLoadStateRef.current).filter(([, state]) => state !== 'loading'),
       )
-      next.push(nextLabel)
-      return next
-    })
-
-    const changedImageIds: string[] = []
-    const nextAnnotationsByImage = commitAnnotationsByImage((current) =>
-      Object.fromEntries(
-        Object.entries(current).map(([imageId, imageAnnotations]) => [
-          imageId,
-          imageAnnotations.map((annotation) => {
-            if (annotation.label !== sourceLabel) {
-              return annotation
-            }
-
-            if (!changedImageIds.includes(imageId)) {
-              changedImageIds.push(imageId)
-            }
-
-            return {
-              ...annotation,
-              label: nextLabel,
-              color: labelToColor(nextLabel),
-            }
-          }),
-        ]),
-      ),
-    )
-
-    for (const imageId of changedImageIds) {
-      annotationLoadStateRef.current[imageId] = 'ready'
-      updateImageAnnotationMetadata(
-        imageId,
-        countLabelingEligibleAnnotations(
-          nextAnnotationsByImage[imageId] ?? [],
-          nextProjectClasses ?? projectClasses,
+      setAnnotationLoadStates({ ...annotationLoadStateRef.current })
+      renameAnnotationSummaries(annotationSummariesRef.current, sourceLabel, nextLabel)
+      updateCurrentProjectClasses((current) => renameProjectClass(current, sourceLabel, nextLabel))
+      commitAnnotationsByImage((current) =>
+        Object.fromEntries(
+          Object.entries(current).map(([imageId, imageAnnotations]) => [
+            imageId,
+            imageAnnotations.map((annotation) => annotation.label === sourceLabel
+              ? { ...annotation, label: nextLabel, color: labelToColor(nextLabel) }
+              : annotation),
+          ]),
         ),
       )
-      scheduleAnnotationSave(
-        imageId,
-        nextAnnotationsByImage[imageId] ?? [],
-        nextProjectClasses ?? undefined,
-      )
+      applyLocalSession(payload.session)
+      setActiveLabel((current) => current === sourceLabel ? nextLabel : current)
+      cancelEditingClass()
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : 'Failed to rename class', 'error')
+    } finally {
+      setIsRenamingClass(false)
     }
-
-    setActiveLabel((current) =>
-      current === sourceLabel ? nextLabel : current,
-    )
-    cancelEditingClass()
   }
 
   const removeClass = (label: string) => {
+    if (isRenamingClass) return
     if ((classUsageCounts[label] ?? 0) > 0) {
       return
     }
@@ -3895,7 +3991,7 @@ function App() {
 
     for (const imageId of deletedImageIds) {
       clearScheduledAnnotationSave(imageId)
-      delete pendingAnnotationLoadsRef.current[imageId]
+      cancelPendingAnnotationLoads([imageId])
       delete annotationLoadStateRef.current[imageId]
     }
     cancelPendingImageLoads([...deletedImageIds])
@@ -4200,7 +4296,7 @@ function App() {
       return
     }
 
-    if (!image) {
+    if (!image || !canEditAnnotations(annotationLoadStateRef.current[currentEntry.id]) || isRenamingClass) {
       pushToast('Wait until the image finishes loading to start a new box.', 'info')
       return
     }
@@ -4398,7 +4494,7 @@ function App() {
 
       for (const imageId of removedImageIds) {
         clearScheduledAnnotationSave(imageId)
-        delete pendingAnnotationLoadsRef.current[imageId]
+        cancelPendingAnnotationLoads([imageId])
         delete annotationLoadStateRef.current[imageId]
       }
       cancelPendingImageLoads(removedImageIds)
@@ -4495,9 +4591,14 @@ function App() {
     pendingCurrentSessionStateRef.current = { sessionId }
     imageIdSetRef.current = nextImageIdSet
     cancelPendingImageLoads()
+    cancelPendingAnnotationLoads()
     pendingAnnotationLoadsRef.current = {}
     annotationLoadStateRef.current = {}
+    setAnnotationLoadStates({})
+    setAnnotationLoadErrors({})
     imageResourcesRef.current = {}
+    annotationSummariesRef.current.clear()
+    retainedAnnotationIdsRef.current.clear()
     clearScheduledAnnotationSave()
     resetDuplicateSearchState(true)
     pendingPreferredImageRelativePathRef.current =
@@ -5019,6 +5120,7 @@ function App() {
   })
 
   const handleCanvasPointerDown = useEffectEvent((point: Point) => {
+    if (!currentEntry || !canEditAnnotations(annotationLoadStateRef.current[currentEntry.id]) || isRenamingClass) return
     if (viewportTool === 'sam-click') {
       if (!image || !isSamInteractiveReady || isRunningSamAction) {
         return
@@ -5063,7 +5165,7 @@ function App() {
 
   const handleCanvasPointerUp = useEffectEvent((point: Point) => {
     const currentDrawStart = drawStartRef.current
-    if (!currentDrawStart || !image) {
+    if (!currentDrawStart || !image || !canEditAnnotations(annotationLoadStateRef.current[image.id]) || isRenamingClass) {
       return
     }
 
@@ -5477,6 +5579,33 @@ function App() {
         }
       >
         <main className="annotator">
+          {annotationSaveError || (currentEntry && !annotationEditingReady) ? (
+            <div className="annotation-status-stack">
+              {annotationSaveError ? (
+                <div className="annotation-status" role="alert">
+                  <span>Annotations have not been saved: {annotationSaveError}</span>
+                  <AppButton onClick={() => void flushPendingAnnotationSaves().catch(() => {})}>
+                    Retry saving
+                  </AppButton>
+                </div>
+              ) : null}
+              {currentEntry && !annotationEditingReady ? (
+                <div className="annotation-status" role={currentAnnotationLoadError ? 'alert' : 'status'}>
+                  <span>{isRenamingClass ? 'Renaming class...' : currentAnnotationLoadState === 'error'
+                    ? `Cannot edit until annotations load: ${currentAnnotationLoadError}`
+                    : 'Loading annotations...'}</span>
+                  {currentAnnotationLoadError ? (
+                    <AppButton
+                      disabled={currentAnnotationLoadState === 'loading'}
+                      onClick={() => void ensureAnnotationsLoaded(currentEntry, true)}
+                    >
+                      Retry loading
+                    </AppButton>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           <div className="canvas-panel">
             <AnnotationViewport
               key={currentEntry?.id ?? 'empty'}
@@ -5557,7 +5686,9 @@ function App() {
                       <span>Progress</span>
                       <div className="dataset-progress-meta" aria-live="polite">
                         <strong className="meta-value">
-                          {images.length > 0
+                          {isOpeningSession && sessionLoadProgress
+                            ? `${sessionLoadProgress.processed.toLocaleString()}/${sessionLoadProgress.total > 0 ? sessionLoadProgress.total.toLocaleString() : '…'}`
+                            : images.length > 0
                             ? `${currentImageIndex + 1}/${images.length}`
                             : '0/0'}
                         </strong>
@@ -5577,6 +5708,9 @@ function App() {
                       <span>Size</span>
                       <strong className="meta-value">{currentImageSize}</strong>
                     </div>
+                    {isOpeningSession ? (
+                      <p className="plugin-manager-note" role="status">{openingLabel}</p>
+                    ) : null}
                     {dropUploadProgress ? (
                       <div className="meta-line">
                         <span>Adding</span>
@@ -5713,7 +5847,7 @@ function App() {
                     isActive={viewportTool === 'new-box'}
                     className="labeling-new-box-button"
                     onClick={() => startNewBoxDrawing()}
-                    disabled={!image}
+                    disabled={!image || !annotationEditingReady}
                     title={
                       viewportTool === 'new-box'
                         ? 'Move the mouse and click to place the new box'
@@ -6411,7 +6545,7 @@ function App() {
                         : duplicateSearchRuntime.status === 'failed'
                           ? 'Error'
                           : duplicateSearchRuntime.status === 'completed'
-                            ? 'Completed'
+                            ? duplicateSearchRuntime.resultLimitReached ? 'Partial' : 'Completed'
                             : 'Idle'}
                     </span>
                   </div>
@@ -6478,6 +6612,12 @@ function App() {
 
               {duplicateSearchError ? (
                 <p className="plugin-manager-note is-error">{duplicateSearchError}</p>
+              ) : null}
+              {duplicateSearchRuntime.resultLimitReached ? (
+                <p className="plugin-manager-note">
+                  Scan stopped at {duplicateSearchRuntime.resultLimit.toLocaleString()} pairs to limit memory use.
+                  Results are partial. Remove reviewed duplicates and rescan, or increase the similarity threshold.
+                </p>
               ) : null}
             </section>
 
@@ -6649,7 +6789,7 @@ function App() {
                               >
                                 <span className="duplicate-search-preview-frame">
                                   <img
-                                    src={leftEntry.url}
+                                    src={`${leftEntry.url}/preview`}
                                     alt={match.leftRelativePath}
                                     loading="lazy"
                                   />
@@ -6756,7 +6896,7 @@ function App() {
                               >
                                 <span className="duplicate-search-preview-frame">
                                   <img
-                                    src={rightEntry.url}
+                                    src={`${rightEntry.url}/preview`}
                                     alt={match.rightRelativePath}
                                     loading="lazy"
                                   />
@@ -6914,7 +7054,7 @@ function App() {
         >
           <div className="duplicate-search-hover-stage">
             <img
-              src={duplicateSearchHoverPreview.url}
+              src={`${duplicateSearchHoverPreview.url}/preview`}
               alt=""
             />
           </div>
@@ -6961,7 +7101,7 @@ function App() {
 
             <div className="image-lightbox-stage">
               <img
-                src={duplicateSearchPreviewImage.url}
+                src={duplicatePreviewResource?.url}
                 alt={duplicateSearchPreviewImage.relativePath}
               />
             </div>
@@ -7037,13 +7177,14 @@ function App() {
                           className="class-manager-input"
                           type="text"
                           value={editingClassDraft}
+                          disabled={isRenamingClass}
                           onChange={(event) =>
                             setEditingClassDraft(event.target.value)
                           }
                           onKeyDown={(event) => {
                             if (event.key === 'Enter') {
                               event.preventDefault()
-                              renameClass(label)
+                              void renameClass(label)
                             }
                             if (event.key === 'Escape') {
                               event.preventDefault()
@@ -7078,14 +7219,16 @@ function App() {
                             <AppButton
                               variant="ghost"
                               className="class-manager-action"
-                              onClick={() => renameClass(label)}
+                              onClick={() => void renameClass(label)}
+                              disabled={isRenamingClass}
                             >
-                              Save
+                              {isRenamingClass ? 'Saving...' : 'Save'}
                             </AppButton>
                             <AppButton
                               variant="ghost"
                               className="class-manager-action"
                               onClick={cancelEditingClass}
+                              disabled={isRenamingClass}
                             >
                               Cancel
                             </AppButton>
@@ -8155,12 +8298,15 @@ async function waitForSessionJob(
   }) => void,
   onSessionUpdate: (session: LocalSessionResponse) => void,
   onCompleted?: (session: LocalSessionResponse) => void,
+  signal?: AbortSignal,
 ) {
   let lastSessionRevision = 0
   let lastSession: LocalSessionResponse | null = null
 
   while (true) {
-    const job = await fetchLocalSessionJob(jobId, lastSessionRevision)
+    signal?.throwIfAborted()
+    const job = await fetchLocalSessionJob(jobId, lastSessionRevision, signal)
+    signal?.throwIfAborted()
     onProgress({
       phase: job.phase,
       processed: job.processedImages,
@@ -8617,6 +8763,8 @@ function buildInitialDuplicateSearchRuntime(): DuplicateSearchRuntime {
     processedPairs: 0,
     totalPairs: 0,
     minimumSimilarityPercent: Number(DEFAULT_DUPLICATE_SEARCH_THRESHOLD),
+    resultLimit: 0,
+    resultLimitReached: false,
   }
 }
 
@@ -9579,44 +9727,6 @@ function projectClassIndexForLabel(label: string, projectClasses: string[]) {
     (projectClass) => projectClass === normalizedLabel,
   )
   return classIndex >= 0 ? classIndex : null
-}
-
-function resolveProjectClassAlias(label: string, projectClasses: string[]) {
-  const normalizedLabel = label.trim()
-  const match = normalizedLabel.match(/^class_(\d+)$/)
-  if (!match) {
-    return normalizedLabel || 'object'
-  }
-
-  const classIndex = Number(match[1])
-  if (!Number.isInteger(classIndex) || classIndex < 0) {
-    return normalizedLabel || 'object'
-  }
-
-  return projectClasses[classIndex] ?? (normalizedLabel || 'object')
-}
-
-function resolveProjectClassLabel(
-  annotation: {
-    label: string
-    sourceClassIndex?: number | null
-    hasUnknownClass?: boolean
-  },
-  projectClasses: string[],
-) {
-  const sourceClassIndex = annotation.sourceClassIndex
-  if (
-    typeof sourceClassIndex === 'number' &&
-    Number.isInteger(sourceClassIndex) &&
-    sourceClassIndex >= 0
-  ) {
-    const sourceLabel = projectClasses[sourceClassIndex]
-    if (sourceLabel) {
-      return sourceLabel
-    }
-  }
-
-  return resolveProjectClassAlias(annotation.label, projectClasses)
 }
 
 function isAnnotationUsableInLabeling(
