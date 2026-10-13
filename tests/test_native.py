@@ -27,7 +27,9 @@ class NativeBackendTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.TemporaryDirectory(prefix="labelimg native ")
-        cls.root = Path(cls.temp_dir.name) / "датасет с пробелами"
+        # Windows runner TEMP can contain an 8.3 alias (e.g. RUNNER~1).
+        # API paths are resolved, so fixtures must use the same canonical root.
+        cls.root = (Path(cls.temp_dir.name) / "датасет с пробелами").resolve()
         cls.root.mkdir()
         cls.store = CacheStore(cls.root / "cache.sqlite3")
         # Import without creating or modifying the user's project cache.
@@ -241,7 +243,17 @@ class NativeBackendTests(unittest.TestCase):
             self.assertEqual(self.client.post("/api/local/sessions/open-directory").json(), {"cancelled": True})
 
     def test_class_rename_rolls_back_if_a_write_fails(self):
-        dataset = self.root / "rename-rollback"
+        self.assert_class_rename_rollback(self.root / "rename-rollback")
+
+    def test_class_rename_rollback_with_noncanonical_path(self):
+        # This names the same directory but resolves differently, just like a
+        # Windows 8.3 TEMP alias. Exercise it on both CI operating systems.
+        alias = self.root.parent / ".." / self.root.parent.name / self.root.name
+        self.assertNotEqual(alias, alias.resolve())
+        self.assertEqual(alias.resolve(), self.root)
+        self.assert_class_rename_rollback(alias / "rename-rollback-alias")
+
+    def assert_class_rename_rollback(self, dataset):
         self.make_image(dataset / "a.png")
         self.make_image(dataset / "b.png")
         classes = dataset / "classes.txt"
@@ -250,11 +262,18 @@ class NativeBackendTests(unittest.TestCase):
         voc = dataset / "b.xml"
         original_voc = "<annotation><object><name>cat</name></object></annotation>"
         voc.write_text(original_voc, encoding="utf-8")
+        original_classes_bytes = classes.read_bytes()
+        original_voc_bytes = voc.read_bytes()
         session = self.client.post("/api/local/sessions/open-directory-path", json={"path": str(dataset)}).json()
         real_write = self.backend.write_text_atomically
+        attempted_paths = []
+        failed_paths = []
 
         def fail_voc_write(path, contents):
-            if path == voc:
+            canonical_path = path.resolve()
+            attempted_paths.append(canonical_path)
+            if canonical_path == voc.resolve():
+                failed_paths.append(canonical_path)
                 raise PermissionError("Annotation is read-only")
             real_write(path, contents)
 
@@ -263,9 +282,13 @@ class NativeBackendTests(unittest.TestCase):
                 f"/api/local/sessions/{session['sessionId']}/classes/rename",
                 json={"sourceLabel": "cat", "targetLabel": "kitten"},
             )
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(classes.read_text(), "cat\ndog\n")
-        self.assertEqual(voc.read_text(), original_voc)
+        self.assertEqual(failed_paths, [voc.resolve()], "The write failure must actually be injected")
+        self.assertEqual(response.status_code, 500, response.text)
+        # Verify that a successful first write was followed by the failing VOC
+        # write and restoration of the class list, including its line endings.
+        self.assertEqual(attempted_paths, [classes.resolve(), voc.resolve(), classes.resolve()])
+        self.assertEqual(classes.read_bytes(), original_classes_bytes)
+        self.assertEqual(voc.read_bytes(), original_voc_bytes)
 
     def test_unused_yolo_class_can_be_renamed(self):
         dataset = self.root / "rename-unused"
