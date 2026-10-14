@@ -3,6 +3,9 @@ import sys
 from pathlib import Path
 
 
+SHUTDOWN_TIMEOUT_SECONDS = 5
+
+
 def main() -> None:
     root_dir = Path(__file__).resolve().parent
     backend_dir = root_dir / "backend"
@@ -36,6 +39,9 @@ def main() -> None:
         reload=args.reload,
         reload_dirs=[str(backend_dir)] if args.reload else None,
         app_dir=str(backend_dir),
+        # A browser can leave an upload or response unfinished. Give active
+        # requests time to finish, then cancel them instead of waiting forever.
+        timeout_graceful_shutdown=SHUTDOWN_TIMEOUT_SECONDS,
     )
 
 

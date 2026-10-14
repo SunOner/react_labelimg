@@ -3,12 +3,13 @@ import fs from 'node:fs'
 import ts from 'typescript'
 
 // Execute a real App handler with injected dependencies to cover its wiring.
-export function appHandler(name, context) {
-  const source = fs.readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
+export function appHandler(name, context, sourceUrl = new URL('../src/App.tsx', import.meta.url)) {
+  const source = fs.readFileSync(sourceUrl, 'utf8')
   const file = ts.createSourceFile('App.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
   let initializer
   function visit(node) {
     if (ts.isVariableDeclaration(node) && node.name.getText(file) === name) initializer = node.initializer.getText(file)
+    if (ts.isFunctionDeclaration(node) && node.name?.getText(file) === name) initializer = node.getText(file).replace(`function ${name}`, 'function')
     ts.forEachChild(node, visit)
   }
   visit(file)

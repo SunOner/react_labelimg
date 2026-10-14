@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -105,6 +106,93 @@ class NativeBackendTests(unittest.TestCase):
                     self.assertAlmostEqual(annotation["width"], 30, places=2)
                 self.assertTrue(sidecar.is_file())
                 self.assertFalse(list(path.parent.glob("*.tmp")))
+
+    def frame_fixture(self, directory, annotation_format="yolo"):
+        dataset = self.root / directory
+        dataset.mkdir()
+        original = self.make_image(dataset / "images" / "original.png")
+        labels = dataset / "labels"
+        labels.mkdir()
+        original_labels = labels / ("original.xml" if annotation_format == "voc" else "original.txt")
+        original_labels.write_text("<annotation/>" if annotation_format == "voc" else "", encoding="utf-8")
+        (labels / "classes.txt").write_text("existing\n", encoding="utf-8")
+        response = self.client.post("/api/local/sessions/open-directory-path", json={"path": str(dataset)})
+        self.assertEqual(response.status_code, 200, response.text)
+        session_id = response.json()["sessionId"]
+        return dataset, session_id, original
+
+    def post_frame(self, session_id, name="video_t000001000000us.png", boxes=None, classes=None, content=None):
+        if content is None:
+            image_bytes = io.BytesIO()
+            Image.new("RGB", (100, 80), "blue").save(image_bytes, format="PNG")
+            content = image_bytes.getvalue()
+        return self.client.post(
+            f"/api/local/sessions/{session_id}/video-frames",
+            files={"file": (name, content, "image/png")},
+            data={"annotations": json.dumps({"annotations": boxes or [], "projectClasses": classes or ["existing", "cat"]})},
+        )
+
+    def test_video_frame_annotation_roundtrip_and_no_overwrite(self):
+        for annotation_format in ("yolo", "voc"):
+            with self.subTest(annotation_format=annotation_format):
+                dataset, session_id, _ = self.frame_fixture(f"video-{annotation_format}", annotation_format)
+                boxes = [{"label": "cat", "x": 10, "y": 12, "width": 30, "height": 20, "difficult": True}]
+                response = self.post_frame(session_id, boxes=boxes)
+                self.assertEqual(response.status_code, 200, response.text)
+                entry = response.json()["image"]
+                self.assertEqual(entry["annotationFormat"], annotation_format)
+                self.assertEqual(entry["annotationCount"], 1)
+                self.assertEqual(entry["relativePath"], "images/video_t000001000000us.png")
+                path = dataset / entry["relativePath"]
+                with Image.open(path) as image:
+                    self.assertEqual(image.size, (100, 80))
+                loaded = self.client.get(f"/api/local/sessions/{session_id}/annotations/{entry['id']}").json()
+                self.assertEqual(loaded["annotations"][0]["label"], "cat")
+                self.assertAlmostEqual(loaded["annotations"][0]["x"], 10)
+                original_bytes = path.read_bytes()
+                duplicate = self.post_frame(session_id, boxes=[])
+                self.assertEqual(duplicate.status_code, 409, duplicate.text)
+                self.assertEqual(path.read_bytes(), original_bytes)
+                self.assertEqual(self.backend.LOCAL_SESSIONS[session_id].images_by_id[entry["id"]].annotation_count, 1)
+                negative = self.post_frame(session_id, name="negative.png")
+                self.assertEqual(negative.status_code, 200, negative.text)
+                self.assertEqual(negative.json()["image"]["annotationCount"], 0)
+                suffix = ".xml" if annotation_format == "voc" else ".txt"
+                self.assertTrue((dataset / "labels" / f"negative{suffix}").exists())
+                self.assertFalse(list((dataset / "images").glob(".video-frame-*")))
+
+    def test_video_frame_failed_annotation_write_rolls_back_image_and_classes(self):
+        dataset, session_id, _ = self.frame_fixture("video-rollback")
+        class_path = dataset / "labels" / "classes.txt"
+        original = class_path.read_bytes()
+        with patch.object(self.backend, "write_yolo_annotations", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.post_frame(session_id, boxes=[{"label": "cat", "x": 1, "y": 2, "width": 10, "height": 15}])
+        self.assertEqual(class_path.read_bytes(), original)
+        self.assertEqual(len(self.backend.LOCAL_SESSIONS[session_id].images), 1)
+        self.assertFalse((dataset / "images" / "video_t000001000000us.png").exists())
+        self.assertFalse((dataset / "labels" / "video_t000001000000us.txt").exists())
+        retry = self.post_frame(session_id)
+        self.assertEqual(retry.status_code, 200, retry.text)
+
+    def test_video_frame_rejects_invalid_image_geometry_and_orphan_sidecars(self):
+        dataset, session_id, _ = self.frame_fixture("video-invalid")
+        response = self.post_frame(session_id, content=b"not an image")
+        self.assertEqual(response.status_code, 400, response.text)
+        for box in (
+            {"x": 0, "y": 0, "width": 101, "height": 1},
+            {"x": -1, "y": 0, "width": 10, "height": 1},
+            {"x": 1, "y": 0, "width": 0, "height": 1},
+        ):
+            response = self.post_frame(session_id, boxes=[box])
+            self.assertEqual(response.status_code, 422, response.text)
+        orphan = dataset / "labels" / "orphan.txt"
+        orphan.write_text("keep this", encoding="utf-8")
+        response = self.post_frame(session_id, name="orphan.png")
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(orphan.read_text(encoding="utf-8"), "keep this")
+        self.assertEqual(len(self.backend.LOCAL_SESSIONS[session_id].images), 1)
+        self.assertEqual(len(list((dataset / "images").iterdir())), 1)
 
     def test_upload_reserved_name_then_delete(self):
         dataset = self.root / "загрузка"

@@ -126,6 +126,8 @@ test('failed annotation load blocks drawing and explicit retry preserves existin
     sessionVersionRef: { current: 0 },
     imageIdSetRef: { current: new Set(['image']) },
     annotationsByImageRef: { current: {} },
+    annotationHistory: { clear() {} },
+    refreshAnnotationHistory() {},
     projectClasses: ['cat'],
     errors: {},
     attempts: 0,

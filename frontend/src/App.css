@@ -274,6 +274,24 @@
   min-width: 0;
 }
 
+.annotation-history-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px solid var(--border-soft);
+}
+
+.annotation-history-controls .ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 26px;
+  padding: 4px;
+}
+
 .menu-root {
   position: relative;
 }
@@ -379,6 +397,12 @@
     inset 0 -2px 0 rgba(0, 0, 0, 0.18),
     0 0 0 1px rgba(255, 255, 255, 0.18),
     0 12px 24px rgba(0, 0, 0, 0.34);
+}
+
+.ui-button--primary.is-active:hover:not(:disabled),
+.ui-button--primary.is-active:focus-visible:not(:disabled) {
+  background: var(--accent-strong);
+  color: #040404;
 }
 
 .menu-item-copy {
@@ -2383,14 +2407,14 @@
     rgba(255, 255, 255, 0.14) 0%,
     rgba(255, 255, 255, 0.05) 100%
   );
-  color: #050505;
+  color: var(--ink-strong);
   box-shadow:
     inset 3px 0 0 rgba(255, 255, 255, 0.92),
     inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .ui-button--list-row.is-active .current-box-index {
-  color: rgba(5, 5, 5, 0.72);
+  color: var(--ink-soft);
 }
 
 .ui-button--ghost,

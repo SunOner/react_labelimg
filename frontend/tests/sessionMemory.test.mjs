@@ -179,7 +179,7 @@ test('restore errors remain visible after its own loading state causes an effect
     persistedSessionState: { sourceKind: 'image', sourcePath: '/missing.jpg' },
     hasSession: false, isOpeningSession: false, isMountedRef: ref(true), error: null,
     setSessionError(error) { context.error = error },
-    setOpeningTarget() {}, setSessionLoadProgress() {},
+    setOpeningTarget() {}, setSessionLoadProgress() {}, setLoadingSessionId() {},
     setIsOpeningSession(value) { context.isOpeningSession = value },
     openLocalImagePath: () => request,
     commitPersistedSessionState(value) { context.persistedSessionState = value },

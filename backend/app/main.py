@@ -32,12 +32,13 @@ from urllib.request import Request as UrlRequest, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from .cache_store import CacheStore
+from .video_metadata import VIDEO_EXTENSIONS, VIDEO_METADATA_LOCK, VideoMetadataStore, identify_video_path
 
 APP_VERSION = "0.1.0"
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 PREDEFINED_CLASSES_FILE = ROOT_DIR / "data" / "predefined_classes.txt"
 FRONTEND_DIST_DIR = ROOT_DIR / "frontend" / "dist"
 CACHE_DB_PATH = ROOT_DIR / "data" / "labelimg-cache.sqlite3"
+VIDEO_METADATA_DIR = ROOT_DIR / "data" / "video-metadata"
 PLUGIN_MODELS_DIR = ROOT_DIR / "models" / "plugins"
 PLUGIN_RUNTIME_SOURCES_DIR = ROOT_DIR / "data" / "plugin-runtime-sources"
 HF_OAUTH_DEFAULT_SCOPES = "openid profile gated-repos"
@@ -338,6 +340,23 @@ class LocalAnnotationPayload(BaseModel):
 class SaveLocalAnnotationsPayload(BaseModel):
     annotations: list[LocalAnnotationPayload]
     projectClasses: list[str] | None = None
+
+
+class VideoSourcePayload(BaseModel):
+    id: str = Field(pattern=r"^[a-f0-9]{16}$")
+    name: str = Field(min_length=1, max_length=255)
+    sizeBytes: int = Field(gt=0)
+
+
+class VideoStatePayload(BaseModel):
+    positionSeconds: float | None = Field(default=None, ge=0, le=1_000_000_000, allow_inf_nan=False)
+    durationSeconds: float | None = Field(default=None, gt=0, le=1_000_000_000, allow_inf_nan=False)
+    width: int | None = Field(default=None, gt=0, le=100000)
+    height: int | None = Field(default=None, gt=0, le=100000)
+    stepFps: float | None = Field(default=None, ge=1, le=240, allow_inf_nan=False)
+    sampleIntervalSeconds: float | None = Field(default=None, ge=0.001, le=86400, allow_inf_nan=False)
+    imageFormat: Literal["png", "jpg"] | None = None
+    playbackRate: float | None = Field(default=None, ge=0.25, le=4, allow_inf_nan=False)
 
 
 class RenameLocalClassPayload(BaseModel):
@@ -1293,6 +1312,170 @@ async def upload_local_session_images(
         "session": serialize_session(session),
         "skippedExistingFilenames": skipped_existing_filenames,
     }
+
+
+def video_session(session_id: str):
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@app.get("/api/local/sessions/{session_id}/videos")
+def list_video_metadata(session_id: str):
+    session = video_session(session_id)
+    return VideoMetadataStore(VIDEO_METADATA_DIR).list_for_dataset(session.root_path)
+
+
+@app.post("/api/local/sessions/{session_id}/videos/register")
+def register_browser_video(session_id: str, payload: VideoSourcePayload):
+    session = video_session(session_id)
+    return VideoMetadataStore(VIDEO_METADATA_DIR).register(
+        payload.id, payload.name, payload.sizeBytes, session.root_path,
+        [serialize_session_image(image) for image in session.images],
+    )
+
+
+def register_original_video_path(session: LocalSession, path: Path):
+    if not path.is_file() or path.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Select an existing video file")
+    if path.stat().st_size == 0:
+        raise HTTPException(status_code=400, detail="The video file is empty")
+    return VideoMetadataStore(VIDEO_METADATA_DIR).register(
+        identify_video_path(path), path.name, path.stat().st_size, session.root_path,
+        [serialize_session_image(image) for image in session.images], source_path=path,
+    )
+
+
+@app.post("/api/local/sessions/{session_id}/videos/open-path")
+def open_original_video_path(session_id: str, payload: PathRequest):
+    return register_original_video_path(video_session(session_id), resolve_local_request_path(payload.path))
+
+
+@app.post("/api/local/sessions/{session_id}/videos/open-file")
+def open_original_video_file(session_id: str):
+    session = video_session(session_id)
+    if file_dialogs_disabled():
+        raise HTTPException(status_code=400, detail="Native dialogs are unavailable. Choose a browser file or enter the original video's backend path.")
+    dialog = load_tkinter_dialogs()
+    root = dialog["root_factory"]()
+    try:
+        path = dialog["filedialog"].askopenfilename(parent=root, filetypes=[("Videos", " ".join(f"*{extension}" for extension in sorted(VIDEO_EXTENSIONS)))])
+    finally:
+        root.destroy()
+    if not path:
+        return {"cancelled": True}
+    return {"cancelled": False, "video": register_original_video_path(session, Path(path).resolve())}
+
+
+@app.patch("/api/local/sessions/{session_id}/videos/{video_id}/state")
+@app.post("/api/local/sessions/{session_id}/videos/{video_id}/state")
+def save_video_state(session_id: str, video_id: str, payload: VideoStatePayload):
+    session = video_session(session_id)
+    return VideoMetadataStore(VIDEO_METADATA_DIR).save_state(video_id, session.root_path, payload.model_dump(exclude_none=True))
+
+
+@app.get("/api/local/sessions/{session_id}/videos/{video_id}/file")
+def stream_original_video(session_id: str, video_id: str):
+    video_session(session_id)
+    path = VideoMetadataStore(VIDEO_METADATA_DIR).original_path(video_id)
+    return FileResponse(path, filename=path.name, content_disposition_type="inline", headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/local/sessions/{session_id}/video-frames")
+async def save_local_video_frame(
+    session_id: str,
+    file: UploadFile = File(...),
+    annotations: str = Form(...),
+    video_id: str | None = Form(default=None),
+    time_seconds: float | None = Form(default=None),
+):
+    """Publish a captured image only after its annotation sidecar is saved."""
+    session = LOCAL_SESSIONS.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        payload = SaveLocalAnnotationsPayload.model_validate_json(annotations)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Invalid frame annotations") from exc
+
+    upload_dir = ensure_local_session_upload_dir(session)
+    target_path = resolve_upload_target_path(upload_dir, file.filename or "")
+    if target_path.suffix not in {".png", ".jpg", ".jpeg"}:
+        raise HTTPException(status_code=400, detail="Video frames must be PNG or JPEG images")
+    metadata = VideoMetadataStore(VIDEO_METADATA_DIR)
+    if (video_id is None) != (time_seconds is None):
+        raise HTTPException(status_code=422, detail="Provide both source video and frame timestamp")
+    if video_id is not None:
+        metadata.validate_frame(video_id, session.root_path, target_path.name, time_seconds)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=".video-frame-", dir=upload_dir) as staging:
+            staged_path = await save_local_session_upload(
+                Path(staging), target_path.name, iter_upload_file_chunks(file),
+            )
+            width, height = read_image_size(staged_path)
+            for box in payload.annotations:
+                coordinates = (box.x, box.y, box.width, box.height)
+                if (
+                    not all(math.isfinite(value) for value in coordinates)
+                    or box.x < 0 or box.y < 0 or box.width <= 0 or box.height <= 0
+                    or box.x + box.width > width + 0.01
+                    or box.y + box.height > height + 0.01
+                    or box.hasUnknownClass
+                ):
+                    raise HTTPException(status_code=422, detail="Frame boxes must be inside the image and have a known class")
+            normalized, _ = deduplicate_annotation_payloads(normalize_annotation_payloads(payload.annotations))
+            with ANNOTATION_WRITE_LOCK, VIDEO_METADATA_LOCK:
+                # A different image extension can share a sidecar. Never adopt or overwrite it.
+                for base in iter_annotation_bases(target_path, session.root_path):
+                    if any((base.parent / f"{base.name}{suffix}").exists() for suffix in (".txt", ".xml")):
+                        raise HTTPException(status_code=409, detail=f"Frame annotations already exist: {target_path.stem}")
+                if target_path.exists() or any(Path(image.name).stem.casefold() == target_path.stem.casefold() for image in session.images):
+                    raise HTTPException(status_code=409, detail=f"Frame already exists: {target_path.name}. Open it in the dataset to edit it.")
+
+                image_created = False
+                annotation_path = None
+                classes_path = None
+                original_classes = None
+                classes_may_change = False
+                try:
+                    with target_path.open("xb") as output, staged_path.open("rb") as source:
+                        image_created = True
+                        shutil.copyfileobj(source, output)
+                    image = build_session_image(target_path, session.root_path)
+                    annotation_format = infer_session_annotation_format(session)
+                    annotation_path = resolve_annotation_output_path(session, image, annotation_format)
+                    if annotation_format == "yolo":
+                        class_source = load_yolo_classes(annotation_path.parent, session.root_path)
+                        classes_path = resolve_yolo_classes_output_path(session, annotation_path, class_source)
+                        original_classes = classes_path.read_bytes().decode("utf-8") if classes_path.exists() else None
+                        classes_may_change = True
+                    save_image_annotations_locked(session, image, normalized, preferred_classes=payload.projectClasses or [])
+                    if video_id is not None:
+                        metadata.record_frame(video_id, session.root_path, serialize_session_image(image), time_seconds)
+                except Exception as exc:
+                    if image_created:
+                        target_path.unlink(missing_ok=True)
+                        if annotation_path is not None:
+                            annotation_path.unlink(missing_ok=True)
+                        if classes_path is not None and classes_may_change:
+                            if original_classes is None:
+                                classes_path.unlink(missing_ok=True)
+                            else:
+                                write_text_atomically(classes_path, original_classes)
+                    if isinstance(exc, FileExistsError):
+                        raise HTTPException(status_code=409, detail=f"Frame already exists: {target_path.name}") from exc
+                    raise
+                upsert_image_in_matching_sessions(session.root_path, image)
+                try:
+                    CACHE_STORE.save_dataset_manifest(session.root_path, session.label, serialize_manifest_images(session.images))
+                except sqlite3.Error as exc:
+                    log_cache_operation_warning("Video frame saved; manifest cache update failed", exc)
+        schedule_session_fingerprint_warmup(session)
+        return {"image": serialize_session_image(image), "annotations": normalized}
+    finally:
+        await file.close()
 
 
 @app.delete("/api/local/sessions/{session_id}/images/{image_id}")
@@ -3347,22 +3530,28 @@ def build_cached_directory_session(root_path: Path, progress_callback: Callable[
     session = create_local_session(root_path, manifest["label"])
     last_publish_at = time.monotonic()
     for index, image in enumerate(images, start=1):
-        previous = (image.annotation_path, image.annotation_format, image.annotation_count)
-        image.annotation_path, image.annotation_format, image.annotation_count = find_annotation_sidecar(image.full_path, root_path)
-        changed_annotations |= previous != (image.annotation_path, image.annotation_format, image.annotation_count)
-        session.images.append(image)
-        session.images_by_id[image.id] = image
-        register_session_image(image)
         should_publish = index in (1, 4, 12) or time.monotonic() - last_publish_at >= SESSION_PROGRESS_PUBLISH_INTERVAL_SECONDS
+        with ANNOTATION_WRITE_LOCK:
+            previous = (image.annotation_path, image.annotation_format, image.annotation_count)
+            image.annotation_path, image.annotation_format, image.annotation_count = find_annotation_sidecar(image.full_path, root_path)
+            changed_annotations |= previous != (image.annotation_path, image.annotation_format, image.annotation_count)
+            if image.id not in session.images_by_id:
+                session.images.append(image)
+                session.images_by_id[image.id] = image
+                register_session_image(image)
+            # Frame imports can arrive between successive cached entries.
+            snapshot = serialize_session(session) if should_publish else None
         if progress_callback is not None and (should_publish or index % 128 == 0 or index == len(images)):
             progress_callback(
                 phase="loading", processed=index, total=len(images),
-                session=serialize_session(session) if should_publish else None,
+                session=snapshot if should_publish else None,
             )
         if should_publish:
             last_publish_at = time.monotonic()
-    if changed_annotations:
-        CACHE_STORE.save_dataset_manifest(root_path, manifest["label"], serialize_manifest_images(images))
+    with ANNOTATION_WRITE_LOCK:
+        session.images.sort(key=lambda item: natural_sort_key(item.relative_path))
+        if changed_annotations or len(session.images) != len(images):
+            CACHE_STORE.save_dataset_manifest(root_path, manifest["label"], serialize_manifest_images(session.images))
 
     schedule_session_fingerprint_warmup(session)
     return session
@@ -3500,6 +3689,9 @@ def scan_directory_session(
     progress_callback: Callable[..., None] | None = None,
     publish_intermediate: bool,
 ):
+    with ANNOTATION_WRITE_LOCK:
+        session.images = []
+        session.images_by_id = {}
     next_images: list[SessionImage] = []
     last_publish_at = time.monotonic()
 
@@ -3515,8 +3707,9 @@ def scan_directory_session(
         )
 
         if should_publish_session:
-            session.images = list(next_images)
-            session.images_by_id = {image.id: image for image in next_images}
+            with ANNOTATION_WRITE_LOCK:
+                merge_scanned_session_images(session, next_images)
+                snapshot = serialize_session(session)
             last_publish_at = time.monotonic()
 
         if progress_callback is not None:
@@ -3525,19 +3718,27 @@ def scan_directory_session(
                 processed=processed_images,
                 total=processed_images,
                 session=(
-                    serialize_session(session) if should_publish_session else None
+                    snapshot if should_publish_session else None
                 ),
             )
 
-    session.images = next_images
-    session.images_by_id = {image.id: image for image in next_images}
-    CACHE_STORE.save_dataset_manifest(
-        session.root_path,
-        session.label,
-        serialize_manifest_images(next_images),
-    )
+    with ANNOTATION_WRITE_LOCK:
+        merge_scanned_session_images(session, next_images)
+        CACHE_STORE.save_dataset_manifest(
+            session.root_path,
+            session.label,
+            serialize_manifest_images(session.images),
+        )
     schedule_session_fingerprint_warmup(session)
     return serialize_session(session)
+
+
+def merge_scanned_session_images(session: LocalSession, scanned: list[SessionImage]):
+    """Called under the annotation lock; retain imports and newer saved sidecars."""
+    entries = {image.id: image for image in scanned}
+    entries.update(session.images_by_id)
+    session.images = sorted(entries.values(), key=lambda item: natural_sort_key(item.relative_path))
+    session.images_by_id = entries
 
 
 def serialize_session(session: LocalSession):

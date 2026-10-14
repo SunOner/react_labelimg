@@ -645,6 +645,80 @@ export async function uploadLocalSessionImages(sessionId: string, files: File[])
   )
 }
 
+export async function saveLocalVideoFrame(
+  sessionId: string,
+  file: File,
+  annotations: LocalAnnotation[],
+  projectClasses: string[],
+  source?: { videoId: string; timeSeconds: number },
+) {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  form.append('annotations', JSON.stringify({ annotations, projectClasses }))
+  if (source) {
+    form.append('video_id', source.videoId)
+    form.append('time_seconds', String(source.timeSeconds))
+  }
+  return requestJson<{ image: LocalSessionImage; annotations: LocalAnnotation[] }>(
+    `/api/local/sessions/${sessionId}/video-frames`,
+    { method: 'POST', body: form, timeoutMs: 120_000 },
+  )
+}
+
+export type VideoProgress = {
+  positionSeconds: number
+  durationSeconds: number
+  width: number
+  height: number
+  stepFps: number
+  sampleIntervalSeconds: number
+  imageFormat: 'png' | 'jpg'
+  playbackRate: number
+}
+
+export type VideoMetadata = {
+  id: string
+  name: string
+  sizeBytes: number
+  sourcePath: string | null
+  sourceMissing: boolean
+  state: VideoProgress
+  frameCount: number
+  updatedAt: string
+}
+
+export function fetchDatasetVideos(sessionId: string, signal?: AbortSignal) {
+  return requestJson<VideoMetadata[]>(`/api/local/sessions/${sessionId}/videos`, { signal })
+}
+
+export function registerBrowserVideo(sessionId: string, file: File, id: string) {
+  return requestJson<VideoMetadata>(`/api/local/sessions/${sessionId}/videos/register`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, name: file.name, sizeBytes: file.size }),
+  })
+}
+
+export function openOriginalVideoPath(sessionId: string, path: string) {
+  return requestJson<VideoMetadata>(`/api/local/sessions/${sessionId}/videos/open-path`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }),
+  })
+}
+
+export function openOriginalVideoFile(sessionId: string) {
+  return requestJson<{ cancelled: boolean; video?: VideoMetadata }>(`/api/local/sessions/${sessionId}/videos/open-file`, { method: 'POST' })
+}
+
+export function buildOriginalVideoUrl(sessionId: string, videoId: string) {
+  return `${API_BASE_URL}/api/local/sessions/${sessionId}/videos/${videoId}/file`
+}
+
+export function saveVideoProgress(sessionId: string, videoId: string, state: VideoProgress, keepalive = false) {
+  return requestJson<VideoMetadata>(`/api/local/sessions/${sessionId}/videos/${videoId}/state`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(state), keepalive,
+  })
+}
+
 export async function startLocalDuplicateSearch(
   sessionId: string,
   minimumSimilarityPercent: number,

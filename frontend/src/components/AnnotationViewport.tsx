@@ -49,6 +49,8 @@ type AnnotationViewportProps = {
   onFinishDrawing: (point: Point) => void
   onSelectAnnotation: (annotationId: string) => void
   onUpdateAnnotationRect: (annotationId: string, rect: Rect) => void
+  onAnnotationInteractionStart?: () => void
+  onAnnotationInteractionEnd?: () => void
   onChangeAnnotationLabel: (annotationId: string, nextLabel: string) => void
   onDuplicateAnnotation: (annotationId: string) => void
   onDeleteAnnotation: (annotationId: string) => void
@@ -135,6 +137,8 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   onFinishDrawing,
   onSelectAnnotation,
   onUpdateAnnotationRect,
+  onAnnotationInteractionStart,
+  onAnnotationInteractionEnd,
   onChangeAnnotationLabel,
   onDuplicateAnnotation,
   onDeleteAnnotation,
@@ -240,6 +244,9 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   }, [contextMenu])
 
   useEffect(() => {
+    if (interactionRef.current?.kind === 'move' || interactionRef.current?.kind === 'resize') {
+      onWindowPointerUp()
+    }
     if (!image) {
       return
     }
@@ -321,6 +328,9 @@ export const AnnotationViewport = memo(function AnnotationViewport({
   })
 
   const onWindowPointerUp = useEffectEvent(() => {
+    if (interactionRef.current?.kind === 'move' || interactionRef.current?.kind === 'resize') {
+      onAnnotationInteractionEnd?.()
+    }
     interactionRef.current = null
     setIsPanning(false)
   })
@@ -686,6 +696,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
 
       if (hitAnnotation.id === selectedId) {
         onSelectAnnotation(hitAnnotation.id)
+        onAnnotationInteractionStart?.()
         interactionRef.current = {
           kind: 'move',
           annotationId: hitAnnotation.id,
@@ -1153,6 +1164,7 @@ export const AnnotationViewport = memo(function AnnotationViewport({
                               event.stopPropagation()
                               setContextMenu(null)
                               onSelectAnnotation(annotation.id)
+                              onAnnotationInteractionStart?.()
                               interactionRef.current = {
                                 kind: 'resize',
                                 annotationId: annotation.id,
@@ -2430,6 +2442,8 @@ function areAnnotationViewportPropsEqual(
     areStringArraysEqual(previousProps.classOptions, nextProps.classOptions) &&
     previousProps.onSelectAnnotation === nextProps.onSelectAnnotation &&
     previousProps.onUpdateAnnotationRect === nextProps.onUpdateAnnotationRect &&
+    previousProps.onAnnotationInteractionStart === nextProps.onAnnotationInteractionStart &&
+    previousProps.onAnnotationInteractionEnd === nextProps.onAnnotationInteractionEnd &&
     previousProps.onChangeAnnotationLabel === nextProps.onChangeAnnotationLabel &&
     previousProps.onDuplicateAnnotation === nextProps.onDuplicateAnnotation &&
     previousProps.onDeleteAnnotation === nextProps.onDeleteAnnotation &&

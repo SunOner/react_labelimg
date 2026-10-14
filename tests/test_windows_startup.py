@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -96,6 +97,16 @@ class WindowsBatchTests(unittest.TestCase):
         )
         (cls.root / "main.py").write_text(
             "import os, sys\nprint(os.getcwd())\nprint(repr(sys.argv[1:]))\n"
+            "if os.environ.get('LABELIMG_TEST_CTRL_C'):\n"
+            " import signal, time\n"
+            " from pathlib import Path\n"
+            " def stopped(*_):\n"
+            "  print('SHUTDOWN_COMPLETE', flush=True)\n"
+            "  print('SERVER_STDERR', file=sys.stderr, flush=True)\n"
+            "  sys.exit(0)\n"
+            " signal.signal(signal.SIGINT, stopped)\n"
+            " Path(os.environ['LABELIMG_TEST_READY']).touch()\n"
+            " while True: time.sleep(.05)\n"
             "sys.exit(7 if '--fail' in sys.argv else 0)\n",
             encoding="ascii",
         )
@@ -132,6 +143,52 @@ class WindowsBatchTests(unittest.TestCase):
                 result = self.run_batch(filename)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(expected, result.stdout)
+
+    def test_start_ctrl_c_exits_without_waiting_for_console_confirmation(self):
+        ready = self.root / "ctrl-c.ready"
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
+        command = f'cmd.exe /d /s /c ""{self.root / "start.bat"}""'
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(
+                command, cwd=ROOT_DIR, stdin=subprocess.PIPE, stdout=output,
+                stderr=subprocess.STDOUT, startupinfo=startup,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+                env={**os.environ, "PYTHONUTF8": "1", "LABELIMG_TEST_CTRL_C": "1",
+                     "LABELIMG_TEST_READY": str(ready)},
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertTrue(ready.exists(), "Launcher did not reach the server")
+                # Signal only this test's private console, never the test runner
+                # or a user's running server. Keep stdin open to detect a prompt.
+                sender = (
+                    "import ctypes,sys,time; "
+                    "k=ctypes.WinDLL('kernel32',use_last_error=True); "
+                    "k.FreeConsole(); assert k.AttachConsole(int(sys.argv[1])); "
+                    "k.SetConsoleCtrlHandler(None,True); "
+                    "assert k.GenerateConsoleCtrlEvent(0,0); "
+                    "time.sleep(.25); k.FreeConsole()"
+                )
+                subprocess.run(
+                    [sys.executable, "-c", sender, str(process.pid)], check=True,
+                    creationflags=subprocess.DETACHED_PROCESS, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                )
+                self.assertEqual(process.wait(timeout=5), 0)
+                output.seek(0)
+                captured = output.read()
+                self.assertIn(b"SHUTDOWN_COMPLETE", captured)
+                self.assertIn(b"SERVER_STDERR", captured)
+                self.assertNotIn(b"[Y", captured)
+            finally:
+                if process.poll() is None:
+                    subprocess.run(["taskkill", "/pid", str(process.pid), "/t", "/f"], capture_output=True)
+                    process.wait(timeout=5)
+                process.stdin.close()
 
 
 if __name__ == "__main__":

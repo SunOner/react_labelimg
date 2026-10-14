@@ -1,5 +1,6 @@
 import {
   startTransition,
+  useCallback,
   useEffect,
   useEffectEvent,
   useMemo,
@@ -9,8 +10,10 @@ import {
 } from 'react'
 import './App.css'
 import { AnnotationViewport } from './components/AnnotationViewport'
+import { VideoWorkbench } from './components/VideoWorkbench'
 import { VirtualFileList } from './components/VirtualFileList'
 import { AppButton } from './components/ui/AppButton'
+import { HistoryButtons } from './components/ui/HistoryButtons'
 import { ConfirmDialog } from './components/ui/ConfirmDialog'
 import { MenuItemButton } from './components/ui/MenuItemButton'
 import {
@@ -40,6 +43,7 @@ import {
   runPluginAutoAnnotate,
   runCacheDbAction,
   saveLocalAnnotations,
+  saveLocalVideoFrame,
   renameLocalClass,
   startLocalDuplicateSearch,
   startHuggingFaceAuth,
@@ -55,6 +59,7 @@ import {
   type LocalSessionInfoResponse,
   type LocalSessionJobResponse,
   type LocalSessionResponse,
+  type LocalSessionImage,
   type PluginAutoAnnotateResult,
   type PluginDownloadState,
   type PluginInfo,
@@ -72,6 +77,7 @@ import {
   serializeSession,
   serializeYolo,
 } from './lib/annotations'
+import { AnnotationHistory, type HistoryAvailability } from './lib/annotationHistory'
 import {
   canEditAnnotations,
   flushQueuedAnnotationSave,
@@ -208,6 +214,20 @@ const HOTKEY_ACTIONS = [
     title: 'Delete selected box',
     description: 'Remove the currently selected annotation',
     defaultBindings: ['Delete', 'Backspace'],
+  },
+  {
+    id: 'undoAnnotation',
+    section: 'Annotation',
+    title: 'Undo annotation change',
+    description: 'Undo the last annotation edit on this image',
+    defaultBindings: ['Ctrl+Z', 'Meta+Z'],
+  },
+  {
+    id: 'redoAnnotation',
+    section: 'Annotation',
+    title: 'Redo annotation change',
+    description: 'Restore an annotation edit that was undone',
+    defaultBindings: ['Ctrl+Y', 'Ctrl+Shift+Z', 'Meta+Shift+Z'],
   },
   {
     id: 'startNewBox',
@@ -485,6 +505,11 @@ function App() {
     PersistedSessionState | null
   >(readStoredPersistedSessionState)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [annotationHistory] = useState(() => new AnnotationHistory())
+  const [historyAvailability, setHistoryAvailability] = useState<HistoryAvailability>({ canUndo: false, canRedo: false })
+  const [annotationHistoryRequest, setAnnotationHistoryRequest] = useState<{
+    direction: 'undo' | 'redo'; key: string; sequence: number
+  } | null>(null)
   const [draftRect, setDraftRect] = useState<Rect | null>(null)
   const [activeLabel, setActiveLabel] = useState('object')
   const [openMenu, setOpenMenu] = useState<
@@ -512,6 +537,8 @@ function App() {
   const [isCacheDbOpen, setIsCacheDbOpen] = useState(false)
   const [isPluginsOpen, setIsPluginsOpen] = useState(false)
   const [isDuplicateSearchOpen, setIsDuplicateSearchOpen] = useState(false)
+  const [isVideoWorkbenchOpen, setIsVideoWorkbenchOpen] = useState(false)
+  const [videoInitialFile, setVideoInitialFile] = useState<File | null>(null)
   const [duplicateSearchPreviewImage, setDuplicateSearchPreviewImage] =
     useState<DuplicateSearchPreviewImage | null>(null)
   const [duplicateSearchHoverPreview, setDuplicateSearchHoverPreview] =
@@ -564,6 +591,7 @@ function App() {
   const [viewportTool, setViewportTool] = useState<ViewportTool>('draw')
   const [isViewportCrosshairEnabled, setIsViewportCrosshairEnabled] = useState(true)
   const [isOpeningSession, setIsOpeningSession] = useState(false)
+  const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null)
   const [openingTarget, setOpeningTarget] = useState<'image' | 'dataset' | null>(
     null,
   )
@@ -711,6 +739,7 @@ function App() {
   const currentAnnotationLoadState = currentEntry ? annotationLoadStates[currentEntry.id] : undefined
   const currentAnnotationLoadError = currentEntry ? annotationLoadErrors[currentEntry.id] : undefined
   const annotationEditingReady = canEditAnnotations(currentAnnotationLoadState) && !isRenamingClass
+  const currentHistoryKey = currentEntry ? `${currentSessionId ?? 'local'}:${currentEntry.id}` : ''
   const annotationSaveError = Object.values(annotationSaveErrors)[0]
   const selectedAnnotation =
     selectedId !== null
@@ -754,6 +783,10 @@ function App() {
   })
   const isDatasetSession = persistedSessionState?.sourceKind === 'dataset'
   const isDropUploadBusy = dropUploadProgress !== null
+  const canOpenVideo = Boolean(
+    isDatasetSession && currentSessionId && backendStatus === 'online' &&
+    !isDropUploadBusy && (!isOpeningSession || loadingSessionId === currentSessionId),
+  )
   const canDropUploadImages =
     backendStatus === 'online' &&
     currentSessionId !== null &&
@@ -766,12 +799,12 @@ function App() {
   const imageDropOverlayTitle = isDropUploadBusy
     ? `Adding images ${dropUploadProgressText ?? ''}`.trim()
     : canDropUploadImages
-      ? 'Drop images to add'
+      ? 'Drop images or a video'
       : 'Open a dataset first'
   const imageDropOverlayDescription = isDropUploadBusy
     ? 'Saving dropped images into the dataset.'
     : canDropUploadImages
-      ? 'Images will be copied into the dataset image folder.'
+      ? 'Images are added to the dataset. A video opens the frame annotation workspace.'
       : 'Drag and drop works when a dataset session is active.'
   const isDeleteImageArmed =
     currentEntry !== null && armedDeleteImageId === currentEntry.id
@@ -1264,6 +1297,10 @@ function App() {
     }
 
     const nextProjectClasses = sanitizeClassList(updater(projectClasses))
+    if (projectClasses.some((label) => !nextProjectClasses.includes(label))) {
+      annotationHistory.clear()
+      refreshAnnotationHistory()
+    }
 
     setProjectClassesByRootPath((current) => ({
       ...current,
@@ -1773,6 +1810,7 @@ function App() {
     options: {
       projectClassesOverride?: string[]
       selectedAnnotationId?: string | null
+      recordHistory?: boolean
     } = {},
   ) => {
     if (!canEditAnnotations(annotationLoadStateRef.current[imageId]) || isRenamingClass) {
@@ -1780,6 +1818,16 @@ function App() {
       return
     }
     const effectiveProjectClasses = options.projectClassesOverride ?? projectClasses
+    if (options.recordHistory !== false) {
+      const previousSelection = currentEntry?.id === imageId ? selectedId : null
+      annotationHistory.record(`${currentSessionId ?? 'local'}:${imageId}`, {
+        annotations: annotationsByImageRef.current[imageId] ?? [],
+        selectedId: previousSelection,
+      }, {
+        annotations: nextAnnotations,
+        selectedId: options.selectedAnnotationId === undefined ? previousSelection : options.selectedAnnotationId,
+      })
+    }
     commitAnnotationsByImage((current) => ({
       ...current,
       [imageId]: nextAnnotations,
@@ -1798,7 +1846,59 @@ function App() {
       nextAnnotations,
       options.projectClassesOverride,
     )
+    refreshAnnotationHistory()
   })
+
+  const refreshAnnotationHistory = useCallback(() => {
+    setHistoryAvailability(annotationHistory.state(currentHistoryKey))
+  }, [annotationHistory, currentHistoryKey])
+
+  useEffect(() => {
+    annotationHistory.clear()
+    setHistoryAvailability({ canUndo: false, canRedo: false })
+  }, [annotationHistory, currentSessionId])
+
+  useEffect(() => {
+    annotationHistory.endGroup()
+    refreshAnnotationHistory()
+  }, [annotationHistory, refreshAnnotationHistory])
+
+  const beginAnnotationInteraction = useCallback(() => {
+    if (!currentHistoryKey) return
+    annotationHistory.beginGroup(currentHistoryKey)
+    refreshAnnotationHistory()
+  }, [annotationHistory, currentHistoryKey, refreshAnnotationHistory])
+
+  const endAnnotationInteraction = useCallback(() => {
+    annotationHistory.endGroup()
+    refreshAnnotationHistory()
+  }, [annotationHistory, refreshAnnotationHistory])
+
+  const restoreAnnotationHistory = useEffectEvent((direction: 'undo' | 'redo', expectedKey?: string) => {
+    if (expectedKey !== undefined && expectedKey !== currentHistoryKey) return
+    if (!currentEntry || !annotationEditingReady || isRunningSamAction) return
+    if (drawStartRef.current) {
+      updateDrawStart(null)
+      setDraftRect(null)
+      setViewportTool('draw')
+      return
+    }
+    const snapshot = annotationHistory[direction](`${currentSessionId ?? 'local'}:${currentEntry.id}`)
+    if (!snapshot) return
+    replaceImageAnnotations(currentEntry.id, buildDisplayAnnotations(snapshot.annotations, projectClasses), {
+      selectedAnnotationId: snapshot.selectedId,
+      recordHistory: false,
+    })
+    setOpenMenu(null)
+  })
+
+  // Button requests are applied in an effect against the latest session state.
+  const requestAnnotationHistory = (direction: 'undo' | 'redo') => {
+    setAnnotationHistoryRequest((current) => ({ direction, key: currentHistoryKey, sequence: (current?.sequence ?? 0) + 1 }))
+  }
+  useEffect(() => {
+    if (annotationHistoryRequest) restoreAnnotationHistory(annotationHistoryRequest.direction, annotationHistoryRequest.key)
+  }, [annotationHistoryRequest])
 
   const resetSessionState = (nextImages: ImageEntry[], nextSessionLabel: string) => {
     sessionVersionRef.current += 1
@@ -2055,6 +2155,8 @@ function App() {
           }
         })
         if (!hasExistingLocalAnnotations) {
+          annotationHistory.clear(`${currentSessionId ?? 'local'}:${entry.id}`)
+          refreshAnnotationHistory()
           applyAutomaticAnnotationDeduplication(
             entry.id,
             payload.annotations,
@@ -2190,6 +2292,7 @@ function App() {
           }
         : null,
     )
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     const restoreSession = async () => {
@@ -3726,6 +3829,8 @@ function App() {
       )
       setAnnotationLoadStates({ ...annotationLoadStateRef.current })
       renameAnnotationSummaries(annotationSummariesRef.current, sourceLabel, nextLabel)
+      annotationHistory.clear()
+      refreshAnnotationHistory()
       updateCurrentProjectClasses((current) => renameProjectClass(current, sourceLabel, nextLabel))
       commitAnnotationsByImage((current) =>
         Object.fromEntries(
@@ -3970,6 +4075,8 @@ function App() {
     }
 
     const deletedImageEntries = images.filter((entry) => deletedImageIds.has(entry.id))
+    for (const imageId of deletedImageIds) annotationHistory.clear(`${currentSessionId}:${imageId}`)
+    refreshAnnotationHistory()
     const deletedImageRelativePaths = new Set(
       deletedImageEntries.map((entry) => entry.relativePath),
     )
@@ -4333,12 +4440,19 @@ function App() {
       isHotkeysOpen ||
       isCacheDbOpen ||
       isPluginsOpen ||
+      isVideoWorkbenchOpen ||
       isDuplicateSearchOpen
     ) {
       return
     }
 
     if (isEditableTarget(event.target)) {
+      return
+    }
+
+    if (matchesHotkeyAction(event, 'undoAnnotation') || matchesHotkeyAction(event, 'redoAnnotation')) {
+      event.preventDefault()
+      restoreAnnotationHistory(matchesHotkeyAction(event, 'undoAnnotation') ? 'undo' : 'redo')
       return
     }
 
@@ -4434,12 +4548,16 @@ function App() {
     options: ApplyLocalSessionOptions = {},
   ) => {
     const sessionId = session.sessionId
-    const sessionImages = session.images
+    const sessionImages = session.images && currentSessionId === sessionId && isOpeningSession
+      ? mergeLoadingSessionImages(session.images, images)
+      : session.images
     const nextSessionLabel = session.sessionLabel
 
     if (!sessionId || !sessionImages || !nextSessionLabel) {
       return
     }
+
+    if (isOpeningSession) setLoadingSessionId(sessionId)
 
     const nextImages = sessionImages.map((entry) => ({
       ...entry,
@@ -4933,7 +5051,61 @@ function App() {
     event.stopPropagation()
     imageDropDragDepthRef.current = 0
     setIsImageDropActive(false)
-    void handleDroppedImageFiles(Array.from(event.dataTransfer.files))
+    const files = Array.from(event.dataTransfer.files)
+    const videos = files.filter((file) => file.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|mkv|avi)$/i.test(file.name))
+    if (videos.length) {
+      if (files.length !== 1) setSessionError('Drop one video at a time to open the video workspace.')
+      else void handleOpenVideoWorkspace(videos[0])
+    } else void handleDroppedImageFiles(files)
+  }
+
+  const handleOpenVideoWorkspace = async (file: File | null = null) => {
+    setOpenMenu(null)
+    if (!currentSessionId || !isDatasetSession) {
+      setSessionError('Open a dataset directory before annotating video frames.')
+      return
+    }
+    if (!canOpenVideo) {
+      setSessionError('Wait for the dataset session to become available and the backend to be online before opening video.')
+      return
+    }
+    try {
+      await flushPendingAnnotationSaves()
+      setSessionError(null)
+      setVideoInitialFile(file)
+      setIsVideoWorkbenchOpen(true)
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Could not save current annotations.')
+    }
+  }
+
+  const handleSaveVideoFrame = async (file: File, boxes: Annotation[], existing: LocalSessionImage | null, source?: { videoId: string; timeSeconds: number }): Promise<{ image: LocalSessionImage; annotations: Annotation[] }> => {
+    const sessionId = currentSessionId
+    if (!sessionId || !isDatasetSession) throw new Error('Open a dataset before saving video frames.')
+    const preferredClasses = sanitizeClassList([...projectClasses, ...boxes.map((box) => box.label)])
+    let entry: LocalSessionImage
+    let savedBoxes = boxes
+    if (existing) {
+      const result = await saveLocalAnnotations(sessionId, existing.id, boxes, preferredClasses)
+      entry = { ...existing, annotationCount: result.count, annotationFormat: result.format }
+      if (result.annotations) savedBoxes = result.annotations.map((box) => ({ ...box, color: labelToColor(box.label) }))
+    } else {
+      const result = await saveLocalVideoFrame(sessionId, file, boxes, preferredClasses, source)
+      entry = result.image
+      savedBoxes = result.annotations.map((box) => ({ ...box, color: labelToColor(box.label) }))
+    }
+    if (currentSessionIdRef.current !== sessionId) throw new Error('Dataset changed while saving the frame.')
+    if (currentSessionRootPath) {
+      setProjectClassesByRootPath((current) => ({ ...current, [currentSessionRootPath]: preferredClasses }))
+    }
+    imageIdSetRef.current.add(entry.id)
+    setImages((current) => [...current.filter((image) => image.id !== entry.id), { ...entry, url: buildLocalImageUrl(sessionId, entry.id) }].sort((a, b) => a.relativePath.localeCompare(b.relativePath, undefined, { numeric: true })))
+    commitAnnotationsByImage((current) => ({ ...current, [entry.id]: savedBoxes }))
+    if (annotationsByImageRef.current[entry.id]) setAnnotationLoadState(entry.id, 'ready')
+    setCurrentImageEntry((current) => current ?? { ...entry, url: buildLocalImageUrl(sessionId, entry.id) })
+    setProjectInfo(null)
+    setProjectInfoStatus('idle')
+    return { image: entry, annotations: savedBoxes }
   }
 
   const handleOpenLocalImage = async () => {
@@ -4945,6 +5117,7 @@ function App() {
     setSessionError(null)
     setOpeningTarget('image')
     setSessionLoadProgress(null)
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     try {
@@ -4975,6 +5148,7 @@ function App() {
       processed: 0,
       total: 0,
     })
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     try {
@@ -5017,6 +5191,7 @@ function App() {
     setSessionError(null)
     setOpeningTarget('image')
     setSessionLoadProgress(null)
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     try {
@@ -5053,6 +5228,7 @@ function App() {
       processed: 0,
       total: 0,
     })
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     try {
@@ -5092,6 +5268,7 @@ function App() {
       processed: 0,
       total: 0,
     })
+    setLoadingSessionId(null)
     setIsOpeningSession(true)
 
     try {
@@ -5334,7 +5511,6 @@ function App() {
               onClick={() =>
                 setOpenMenu((current) => (current === 'file' ? null : 'file'))
               }
-              disabled={isOpeningSession}
             >
               File
             </AppButton>
@@ -5353,6 +5529,12 @@ function App() {
                   shortcut="Ctrl+U"
                   onClick={() => void handleOpenLocalDirectory()}
                   disabled={isOpeningSession || backendStatus !== 'online'}
+                />
+                <MenuItemButton
+                  title="Open Video"
+                  description="Browse a video and save annotated frames to the open dataset"
+                  onClick={() => void handleOpenVideoWorkspace()}
+                  disabled={!canOpenVideo}
                 />
                 <div className="path-open-panel" role="group" aria-label="Open by path">
                   <label className="path-open-label" htmlFor="path-open-input">
@@ -5396,7 +5578,7 @@ function App() {
                   title="Close Session"
                   description="Clear the current dataset from the browser"
                   onClick={() => void clearSession()}
-                  disabled={!hasSession}
+                  disabled={!hasSession || isOpeningSession}
                 />
               </div>
             ) : null}
@@ -5414,6 +5596,12 @@ function App() {
             </AppButton>
             {openMenu === 'annotation' ? (
               <div className="menu-popover" role="menu" aria-label="Annotation">
+                <MenuItemButton title="Undo" description="Undo the last annotation edit" shortcut={hotkeyBindings.undoAnnotation[0]}
+                  onClick={() => requestAnnotationHistory('undo')}
+                  disabled={!historyAvailability.canUndo || !annotationEditingReady || isRunningSamAction} />
+                <MenuItemButton title="Redo" description="Restore the undone annotation edit" shortcut={hotkeyBindings.redoAnnotation[0]}
+                  onClick={() => requestAnnotationHistory('redo')}
+                  disabled={!historyAvailability.canRedo || !annotationEditingReady || isRunningSamAction} />
                 <MenuItemButton
                   title="Delete Selected Box"
                   description="Remove the currently selected annotation"
@@ -5569,9 +5757,27 @@ function App() {
             </AppButton>
           </div>
 
+          <HistoryButtons {...historyAvailability} disabled={!annotationEditingReady || isRunningSamAction}
+            undoShortcut={hotkeyBindings.undoAnnotation.join(' / ')} redoShortcut={hotkeyBindings.redoAnnotation.join(' / ')}
+            onUndo={() => requestAnnotationHistory('undo')} onRedo={() => requestAnnotationHistory('redo')} />
+
+          <AppButton variant="menu-trigger" onClick={() => void handleOpenVideoWorkspace()}
+            disabled={!canOpenVideo}>
+            Video
+          </AppButton>
+
         </nav>
 
       </header>
+
+      {isVideoWorkbenchOpen && currentSessionId ? (
+        <VideoWorkbench key={currentSessionId} sessionId={currentSessionId} datasetLabel={currentSessionRootPath ?? sessionLabel}
+          classes={classList} datasetImages={images} initialLabel={effectiveActiveLabel} initialFile={videoInitialFile}
+          undoShortcut={hotkeyBindings.undoAnnotation.join(' / ')} redoShortcut={hotkeyBindings.redoAnnotation.join(' / ')}
+          matchesUndoHotkey={(event) => matchesHotkeyAction(event, 'undoAnnotation')}
+          matchesRedoHotkey={(event) => matchesHotkeyAction(event, 'redoAnnotation')}
+          onSave={handleSaveVideoFrame} onClose={() => { setIsVideoWorkbenchOpen(false); setVideoInitialFile(null) }} />
+      ) : null}
 
       <div
         className={
@@ -5633,6 +5839,8 @@ function App() {
               classOptions={classList}
               onSelectAnnotation={setSelectedId}
               onUpdateAnnotationRect={updateAnnotationRect}
+              onAnnotationInteractionStart={beginAnnotationInteraction}
+              onAnnotationInteractionEnd={endAnnotationInteraction}
               onChangeAnnotationLabel={changeAnnotationLabel}
               onDuplicateAnnotation={duplicateAnnotation}
               onDeleteAnnotation={removeAnnotation}
@@ -8288,6 +8496,16 @@ function App() {
 }
 
 export default App
+
+// A job response may have been captured before a frame was saved. Keep local
+// additions until the directory job publishes its complete, merged manifest.
+function mergeLoadingSessionImages(incoming: LocalSessionImage[], current: LocalSessionImage[]) {
+  const entries = new Map(current.map((image) => [image.id, image]))
+  for (const image of incoming) entries.set(image.id, image)
+  return [...entries.values()].sort((a, b) =>
+    a.relativePath.localeCompare(b.relativePath, undefined, { numeric: true }),
+  )
+}
 
 async function waitForSessionJob(
   jobId: string,
